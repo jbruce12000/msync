@@ -44,6 +44,12 @@ SERVER = os.environ.get("MSYNC_SERVER", "10.0.0.2")
 # Web UI / HTTP API port is the UDP port plus this offset.
 HTTP_PORT_OFFSET = 1000
 
+# How long (seconds) a room can go without a heartbeat before the server
+# forgets it: its row is deleted from the catalog DB and it disappears from
+# the Configure tab. Clients re-register every few seconds, so this only
+# affects rooms that have genuinely gone away.
+CLIENT_STALE_AFTER = int(os.environ.get("MSYNC_CLIENT_STALE_AFTER", "86400"))
+
 
 # --------------------------------------------------------------------------- #
 # Room tuning                                                                  #

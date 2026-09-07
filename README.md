@@ -342,6 +342,15 @@ There are several easy ways to add to the queue:
   `music/.queue/`. The server grabs it, files it into the music folder, and
   adds it to the queue.
 
+**Clearing**: `clear` (or the Queue panel's **clear** button) empties the
+whole queue. When something is playing, the current song keeps playing and
+the server simply has nothing queued afterward; when nothing is playing (a
+paused or stopped server), the clear also drops the stale now-playing slot so
+the queue panel truly empties. The ✕ on the now-playing row is the same: it
+skips to the next queued song while playing, but when the server isn't
+playing and the queue is empty it just removes the current song instead of
+starting an arbitrary one.
+
 ## Configuration
 
 All the "where things live" settings sit in one file, `config.py`, next to
@@ -361,6 +370,10 @@ the scripts — the server and every client read it:
   config.py or via `MSYNC_DEFAULT_PORT`; every client and server must agree.
 - **`HTTP_PORT_OFFSET`** — the HTTP port is the UDP port plus this offset
   (default **+1000** → HTTP **10770**), used for the web UI and downloads.
+- **`CLIENT_STALE_AFTER`** — how long (seconds) a room can go without a
+  heartbeat before the server deletes it from the catalog DB and the
+  Configure tab (default **86400** = 24 hours). Env override:
+  `MSYNC_CLIENT_STALE_AFTER`.
 - **`OUTPUT_LATENCY_MS`** — **local fallback** for this machine's
   audio-output latency, in milliseconds (default `0`). The normal way to set
   a room's offset is the web UI's Configure tab: the server stores each
@@ -385,7 +398,8 @@ about the digital side of the port); only an output-latency offset fixes it.
    Every connected room appears there automatically — hostname, IP, and a
    live online/offline status. Clients re-register and heartbeat every few
    seconds, so the list stays current even if you restart a room or the
-   server.
+   server. Rooms that haven't been heard from for over **24 hours** are
+   removed from the list (and the database), so dead rooms don't pile up.
 2. Each room has a slider spanning **−1000 ms to +1000 ms** in 1 ms steps,
    plus a **value box on the right** that you can drag along with the slider
    *or type into* for an exact offset (Enter or click away to apply). Rooms
@@ -443,7 +457,9 @@ If clients can't see the server, open these ports for the server's IP:
   from in ~15 seconds. The server marks a room online whenever its client
   sends a sync/timing packet, so make sure that room's client service is
   running and can reach the server (see the bullet above), then it should
-  turn green within a few seconds.
+  turn green within a few seconds. A room that stops reporting for over
+  **24 hours** is removed from the list entirely (configurable via
+  `MSYNC_CLIENT_STALE_AFTER`, in seconds).
 - **Clients sound out of sync** — wait ~10 seconds for the clock estimator
   to settle; then `err` should drop to a few ms.
 - **Music is only on one speaker or sounds thin** — that's expected for the

@@ -202,6 +202,15 @@ class Catalog:
         return [{"ip": r[0], "hostname": r[1], "latency_ms": r[2],
                  "err_ms": r[3], "last_seen": r[4]} for r in rows]
 
+    def prune_clients(self, stale_after):
+        """Delete rooms that haven't been seen for ``stale_after`` seconds
+        (their heartbeat/register timestamps in ``last_seen`` are older than
+        that) so dead rooms leave the catalog DB — and the Configure tab."""
+        cutoff = time.time() - stale_after
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM clients WHERE last_seen < ?", (cutoff,))
+
     def _album_of(self, relpath):
         parts = relpath.split("/")
         return parts[0] if len(parts) > 1 else None
@@ -521,6 +530,13 @@ class Catalog:
                     "INSERT OR REPLACE INTO playback (id, relpath, elapsed,"
                     " playing) VALUES (0, ?, ?, ?)",
                     (relpath, float(elapsed), 1 if playing else 0))
+
+    def clear_playback(self):
+        """Forget the persisted current track/position (used when the user
+        clears or removes everything while nothing is playing)."""
+        with self.lock:
+            with self._conn:
+                self._conn.execute("DELETE FROM playback WHERE id = 0")
 
     def load_playback(self):
         """The previously-playing track as {relpath, elapsed, playing}, or

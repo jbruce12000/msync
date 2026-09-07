@@ -255,6 +255,16 @@ class SyncedServer:
                 self._play(entry["path"], announce="queue")
                 self._persist_queue()
                 return {"source": "queue", "file": entry["relpath"]}
+            if not self.playing:
+                # Nothing is actively playing and the queue is empty: an
+                # advance (the web UI's ✕ on the now-playing slot, or 'next'
+                # while stopped) must leave the server idle rather than start
+                # an arbitrary playlist track the user didn't ask for.
+                if self.song is not None:
+                    self._clear_playback()
+                self.song = None
+                self.local_pos = 0.0
+                return {"source": "stopped", "file": None}
             self.index = (self.index + 1) % len(self.playlist)
             self._play(self.playlist[self.index], announce="playlist")
             return {"source": "playlist", "file": self.song.name}
@@ -401,6 +411,13 @@ class SyncedServer:
         with self.lock:
             n = len(self.queue_list())
             self.queue.clear()
+            if not self.playing:
+                # Nothing is actively playing: a clear empties the whole
+                # queue — including the stale now-playing slot — instead of
+                # leaving a paused/stopped song behind.
+                self.song = None
+                self.local_pos = 0.0
+                self._clear_playback()
             self._persist_queue()
             C.logger().info("queue cleared (%d removed)", n)
             return n
@@ -547,6 +564,22 @@ class SyncedServer:
         except Exception as exc:
             C.logger().warning("failed to persist playback: %s", exc)
 
+    def _clear_playback(self):
+        """Forget the persisted current track so a restart doesn't resurrect
+        a song the user explicitly removed (best-effort, never raises)."""
+        try:
+            self.catalog.clear_playback()
+        except Exception as exc:
+            C.logger().warning("failed to clear playback: %s", exc)
+
+    def _prune_clients(self):
+        """Drop rooms whose last heartbeat is older than
+        config.CLIENT_STALE_AFTER (best-effort, never raises)."""
+        try:
+            self.catalog.prune_clients(config.CLIENT_STALE_AFTER)
+        except Exception as exc:
+            C.logger().warning("failed to prune stale clients: %s", exc)
+
     # ------------------------------------------------------------------ #
     # Audio callback: server plays so it also matches its own timeline.   #
     # ------------------------------------------------------------------ #
@@ -689,6 +722,7 @@ class SyncedServer:
     def monitor_loop(self):
         last_catalog = time.time()
         last_playback = 0.0
+        last_client_prune = 0.0
         while not self._stop.is_set():
             with self.lock:
                 if (self.playing and self.song is not None
@@ -717,6 +751,11 @@ class SyncedServer:
                 self.catalog.scan()
                 self._refresh_playlist()
                 last_catalog = time.time()
+            # Forget rooms that haven't been heard from in a long time (see
+            # config.CLIENT_STALE_AFTER) so dead rooms don't pile up.
+            if time.time() - last_client_prune >= 60.0:
+                self._prune_clients()
+                last_client_prune = time.time()
             time.sleep(0.25)
 
     # ------------------------------------------------------------------ #
@@ -1011,6 +1050,10 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
                 self._json({"queue": srv.queue_list(),
                             "now_playing": srv.song.name if srv.song else ""})
             elif path == "/api/clients":
+                # Forget rooms unseen for config.CLIENT_STALE_AFTER so the
+                # Configure tab only ever shows rooms that are still around
+                # (the periodic monitor-loop sweep does the same cleanup).
+                srv._prune_clients()
                 self._json({"clients": srv.catalog.list_clients()})
             else:
                 super().do_GET()

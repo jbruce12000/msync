@@ -253,6 +253,51 @@ def test_queue_clear(server, client):
     wait_until(lambda: client.client.queue_size == 0)
 
 
+def test_clear_queue_while_paused_totally_clears(server):
+    """Clearing the queue while nothing is actively playing (paused/stopped)
+    must empty the whole queue — including the stale now-playing slot — not
+    leave a paused song behind."""
+    server.play_pause()           # pause the auto-played track -> "nothing playing"
+    server.add_to_queue(["track_02_B494.wav"])   # queued while paused (no auto-start)
+    assert server.song is not None
+    assert server.queue_list() == ["track_02_B494.wav"]
+    n = server.clear_queue()
+    assert n == 1
+    assert server.queue_list() == []
+    assert server.song is None    # now-playing slot cleared too
+    assert server.playing is False
+
+
+def test_next_while_stopped_does_not_start_playlist_song(server):
+    """The web UI's ✕ on the now-playing slot posts to /api/control/next.
+    When nothing is actively playing and the queue is empty, that must
+    remove the current song and leave the server idle — not start the next
+    playlist track."""
+    server.play_pause()           # pause -> nothing actively playing
+    assert server.song is not None
+    assert server.queue_list() == []
+    res = server.next()
+    assert res["source"] == "stopped"
+    assert server.song is None
+    assert server.playing is False
+    assert server.queue_list() == []
+    # And a subsequent advance stays idle.
+    res = server.next()
+    assert res["source"] == "stopped"
+    assert server.song is None
+
+
+def test_next_while_playing_still_advances_playlist(server):
+    """Pressing next during active playback with an empty queue still
+    advances the alphabetically-ordered playlist — only a paused/stopped
+    advance goes idle."""
+    assert server.playing
+    assert server.queue_list() == []
+    res = server.next()
+    assert res["source"] == "playlist"
+    assert server.song.name == "track_02_B494.wav"
+
+
 def test_queue_case_insensitive_lookup(server):
     added = server.add_to_queue(["TRACK_02_B494.WAV"])
     assert added == ["track_02_B494.wav"]
@@ -461,6 +506,23 @@ def test_catalog_client_err_ms_roundtrip(tmp_path):
     assert row["err_ms"] == -0.6
 
 
+def test_catalog_prune_clients(tmp_path):
+    # Rooms that haven't been seen within the stale window are removed from
+    # the catalog DB (and therefore the web UI's Configure tab); rooms that
+    # are still heartbeating stay.
+    c = Catalog(str(tmp_path), str(tmp_path / "c.db"))
+    c.upsert_client("10.0.0.1", "fresh",
+                    last_seen=time.time() - 10)         # still around
+    c.upsert_client("10.0.0.2", "stale",
+                    last_seen=time.time() - 2 * 86400)  # gone 2 days
+    c.prune_clients(stale_after=86400)
+    ips = {r["ip"] for r in c.list_clients()}
+    assert ips == {"10.0.0.1"}
+    # A second sweep is harmless (nothing left to delete).
+    c.prune_clients(stale_after=86400)
+    assert {r["ip"] for r in c.list_clients()} == {"10.0.0.1"}
+
+
 def test_catalog_migrates_clients_err_ms(tmp_path):
     # Databases created before err_ms reporting must gain the column on open.
     import sqlite3
@@ -516,6 +578,24 @@ def test_server_register_reports_client_err(server):
     c = next(c for c in d["clients"] if c["ip"] == "127.0.0.1")
     assert c["err_ms"] == -3.4
     assert c["hostname"] == "errroom"
+
+
+def test_api_clients_hides_stale_rooms(server):
+    # A room that hasn't been seen for over CLIENT_STALE_AFTER must not
+    # appear in the Configure tab's /api/clients list (and leaves the DB).
+    import config
+    stale = time.time() - config.CLIENT_STALE_AFTER - 3600   # well past 24h
+    server.catalog.upsert_client("10.99.0.1", "ghost", last_seen=stale)
+    server.catalog.upsert_client("10.99.0.2", "real", last_seen=time.time() - 5)
+    assert {r["ip"] for r in server.catalog.list_clients()} >= {
+        "10.99.0.1", "10.99.0.2"}
+    d = _http(server.port + 1000, "GET", "/api/clients")
+    ips = {c["ip"] for c in d["clients"]}
+    assert "10.99.0.1" not in ips
+    assert "10.99.0.2" in ips
+    # and the stale row is actually gone from the database
+    assert "10.99.0.1" not in {
+        r["ip"] for r in server.catalog.list_clients()}
 
 
 def test_http_clients_list_and_set_latency(server):
