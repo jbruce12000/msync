@@ -643,6 +643,7 @@ class SyncClient:
         last_ntp = time.time()
         last_state = time.time()
         last_status = time.time()
+        last_reg = time.time()   # re-register periodically (heartbeat)
 
         try:
             while not self._stop.is_set():
@@ -678,6 +679,14 @@ class SyncClient:
                         if abs(self.clock.drift) > 1.0:
                             pass  # debug optionally
                     last_ntp = now
+                if now - last_reg >= C.REGISTER_INTERVAL:
+                    # Re-register so the web UI's room list stays populated
+                    # (hostname fresh, last-seen fresh) even if the server
+                    # restarted or a registration packet was lost.
+                    sock.sendto(C.make_packet(
+                        C.TYPE_REGISTER, host=socket.gethostname()),
+                        (self.host, self.port))
+                    last_reg = now
                 if now - last_state > 4.0:
                     print(f"[client] no sync from server; drift={self.clock.drift:+.0f}ppm "
                           f"offset={self.clock.offset*1000:+.0f}ms")

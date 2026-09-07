@@ -56,7 +56,12 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 .slider-row input[type=range] { flex: 1; -webkit-appearance: none; height: 4px; border-radius: 2px; background: var(--border); outline: none; }
 .slider-row input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: var(--accent); cursor: pointer; border: none; }
 .slider-row input[type=range]::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: var(--accent); cursor: pointer; border: none; }
-.slider-row .lat-val { min-width: 70px; text-align: right; font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--accent); }
+.slider-row .lat-num { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
+.slider-row .lat-num input[type=number] { width: 74px; text-align: right; font: inherit; font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--accent); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; }
+.slider-row .lat-num input[type=number]:focus { outline: none; border-color: var(--accent); }
+.slider-row .lat-num input[type=number]::-webkit-outer-spin-button,
+.slider-row .lat-num input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.slider-row .lat-num input[type=number] { -moz-appearance: textfield; appearance: textfield; }
 .slider-row .lat-unit { font-size: 12px; color: var(--muted); }
 .slider-centre { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-top: 2px; }
 .empty-state { color: var(--muted); text-align: center; padding: 24px; font-size: 12px; }
@@ -211,16 +216,26 @@ function setTab(name) {
 
 // ── Configure: per-room latency ──────────────────────────────────────
 let clients = [];
+let currentLatency = {};          // ip -> last server-confirmed ms (Escape restores to this)
+let pendingLatency = {};          // ip -> {v, t}: locally-set value awaiting server echo
+
 async function fetchClients() {
     const d = await api('GET', '/api/clients');
     if (d.error) return;
-    // Preserve any in-progress drag values so polling doesn't reset them.
-    for (const c of d.clients || []) {
-        const el = document.getElementById('slider-' + c.ip.replace(/\./g, '_'));
-        if (el && el.dataset.dragging === '1') c.latency_ms = parseFloat(el.value);
+    const prev = clients;
+    const next = d.clients || [];
+    for (const c of next) {
+        currentLatency[c.ip] = Math.round(c.latency_ms || 0);
+        const p = pendingLatency[c.ip];
+        if (p && p.v === currentLatency[c.ip]) delete pendingLatency[c.ip];
     }
-    clients = d.clients || [];
-    renderClients();
+    // Full rebuild only when the room SET changes; otherwise update rows in
+    // place so an in-flight drag or a half-typed number is never interrupted.
+    const setChanged = next.length !== prev.length ||
+        next.some(c => !prev.some(o => o.ip === c.ip)) ||
+        prev.some(c => !next.some(o => o.ip === c.ip));
+    clients = next;
+    if (setChanged) renderClients(); else updateClientRows();
 }
 
 function clientStatus(c) {
@@ -238,9 +253,10 @@ function renderClients() {
     let html = '<h3>Rooms / output-latency offset</h3>' +
         '<div class="empty-state" style="padding:8px 0 16px;">' +
         'Set how many ms each room must play <b>ahead</b> of the sync timeline to ' +
-        'line up with the others (negative = behind). Applied live and saved to the database.</div>';
+        'line up with the others (negative = behind). Drag the slider or type an ' +
+        'exact value; applied live and saved to the database.</div>';
     for (const c of clients) {
-        const id = 'slider-' + c.ip.replace(/\./g, '_');
+        const key = c.ip.replace(/\./g, '_');
         const status = clientStatus(c);
         const name = c.hostname || c.ip;
         const lat = Math.round(c.latency_ms || 0);
@@ -249,34 +265,103 @@ function renderClients() {
             <div class="client-head">
                 <span class="client-name">${esc(name)}</span>
                 <span class="client-ip">${esc(c.ip)}</span>
-                <span class="client-status ${status}">● ${status === 'online' ? 'online' : 'offline'}</span>
+                <span class="client-status ${status}" id="status-${key}">● ${status}</span>
             </div>
             <div class="slider-row">
                 <span style="font-size:11px;color:var(--muted)">-1000</span>
-                <input type="range" id="${id}" min="-1000" max="1000" step="1" value="${lat}"
-                    oninput="latSliderInput('${esc(c.ip)}', this)"
-                    onchange="latSliderCommit('${esc(c.ip)}', this)"
-                    onmousedown="this.dataset.dragging='1'" onmouseup="this.dataset.dragging='0'" ontouchstart="this.dataset.dragging='1'" ontouchend="this.dataset.dragging='0'">
+                <input type="range" id="slider-${key}" min="-1000" max="1000" step="1" value="${lat}"
+                    oninput="sliderInput('${esc(c.ip)}', this)"
+                    onchange="sliderCommit('${esc(c.ip)}', this)"
+                    onmousedown="this.dataset.active='1'" ontouchstart="this.dataset.active='1'"
+                    onkeydown="this.dataset.active='1'" onblur="this.dataset.active='0'">
                 <span style="font-size:11px;color:var(--muted)">+1000</span>
-                <span class="lat-val" id="latval-${id}">${lat} ms</span>
+                <div class="lat-num">
+                    <input type="number" id="num-${key}" min="-1000" max="1000" step="1" value="${lat}"
+                        onchange="numCommit('${esc(c.ip)}', this)"
+                        onkeydown="numKey('${esc(c.ip)}', this, event)"
+                        title="Click and type an exact value (Enter or click away to apply)">
+                    <span>ms</span>
+                </div>
             </div>
             <div class="slider-centre"><span>← plays late · plays ahead →</span><span class="lat-unit">offset (ms)</span></div>
         </div>`;
     }
-    if (el.innerHTML !== html) el.innerHTML = html;
+    el.innerHTML = html;
+    updateClientRows();
 }
 
-// Update the displayed value live while dragging, without hammering the server.
-function latSliderInput(ip, el) {
-    const v = Math.round(parseFloat(el.value) || 0);
-    document.getElementById('latval-' + el.id).textContent = v + ' ms';
+// Refresh each row in place (status + values of idle controls) without
+// rebuilding the DOM, so an active drag or a half-typed number survives.
+function updateClientRows() {
+    const now = Date.now() / 1000;
+    for (const c of clients) {
+        const key = c.ip.replace(/\./g, '_');
+        const p = pendingLatency[c.ip];
+        const lat = (p && (Date.now() - p.t) < 4000)
+            ? p.v : Math.round(c.latency_ms || 0);
+        const sl = document.getElementById('slider-' + key);
+        if (sl && sl.dataset.active !== '1' && sl.value !== String(lat)) sl.value = lat;
+        const num = document.getElementById('num-' + key);
+        if (num && document.activeElement !== num &&
+            String(num.value || 0) !== String(lat)) num.value = lat;
+        const st = document.getElementById('status-' + key);
+        if (st) {
+            const fresh = (c.last_seen > 0) && (now - c.last_seen) < 15;
+            const cls = fresh ? 'online' : 'offline';
+            if (st.textContent !== '● ' + cls) {
+                st.className = 'client-status ' + cls;
+                st.textContent = '● ' + cls;
+            }
+        }
+    }
 }
 
-// Persist + apply on release (or keyboard change).
-async function latSliderCommit(ip, el) {
-    const ms = Math.round(parseFloat(el.value) || 0);
-    el.dataset.dragging = '0';
-    await api('POST', '/api/clients/latency', { ip, ms });
+// Slider: mirror into the number box live; persist only on release.
+function sliderInput(ip, el) {
+    el.dataset.active = '1';
+    const num = document.getElementById('num-' + ip.replace(/\./g, '_'));
+    if (num && document.activeElement !== num) num.value = el.value;
+}
+
+function sliderCommit(ip, el) {
+    el.dataset.active = '0';
+    const ms = clampLatency(Math.round(parseFloat(el.value) || 0));
+    el.value = ms;
+    const num = document.getElementById('num-' + ip.replace(/\./g, '_'));
+    if (num) num.value = ms;
+    commitLatency(ip, ms);
+}
+
+// Number box: exact 1 ms entry. Applies on Enter or focus loss.
+function numCommit(ip, el) {
+    const ms = clampLatency(Math.round(parseFloat(el.value) || 0));
+    el.value = ms;
+    const sl = document.getElementById('slider-' + ip.replace(/\./g, '_'));
+    if (sl) sl.value = ms;
+    commitLatency(ip, ms);
+}
+
+function numKey(ip, el, ev) {
+    if (ev.key === 'Enter') { el.blur(); }          // blur fires change -> commit
+    else if (ev.key === 'Escape') {
+        el.value = currentLatency[ip] || 0;         // discard, back to committed
+        el.blur();
+    }
+}
+
+function clampLatency(ms) {
+    return Math.max(-1000, Math.min(1000, ms));
+}
+
+// Debounced per-room push to the server (drag/keyboard chatter -> one send).
+const latencyTimers = {};
+function commitLatency(ip, ms) {
+    clearTimeout(latencyTimers[ip]);
+    latencyTimers[ip] = setTimeout(async () => {
+        currentLatency[ip] = ms;
+        pendingLatency[ip] = { v: ms, t: Date.now() };
+        await api('POST', '/api/clients/latency', { ip, ms });
+    }, 250);
 }
 
 async function fetchLibrary() {

@@ -888,6 +888,11 @@ class SyncedServer:
                     continue
                 ptype, body = p
                 if ptype == C.TYPE_NTP_REQ:
+                    # Any valid client packet is a heartbeat: refresh the
+                    # room's last-seen (and (re)create the row for a room still
+                    # running from before the server restarted) so the web UI's
+                    # online status stays accurate between registers.
+                    self.catalog.upsert_client(addr[0], "")
                     t2 = C.ts()
                     resp = C.make_packet(C.TYPE_NTP_RESP,
                                          t1=body["t1"], t2=t2, t3=C.ts())

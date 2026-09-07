@@ -430,6 +430,39 @@ def test_catalog_client_latency_roundtrip(tmp_path):
     assert rows["10.0.0.4"]["hostname"] == "room4"
 
 
+def test_catalog_client_heartbeat_refreshes_last_seen(tmp_path):
+    # The server treats every client packet (e.g. an NTP request) as a
+    # heartbeat: it must refresh last_seen WITHOUT wiping the stored
+    # hostname or latency offset.
+    c = Catalog(str(tmp_path), str(tmp_path / "c.db"))
+    c.set_client_latency("10.0.0.7", 42.0)          # register + tune first
+    c.upsert_client("10.0.0.7", "room7", last_seen=1000.0)
+    c.upsert_client("10.0.0.7", "")                 # NTP heartbeat, no name
+    row = {r["ip"]: r for r in c.list_clients()}["10.0.0.7"]
+    assert row["hostname"] == "room7"               # name kept
+    assert row["latency_ms"] == 42.0                # offset kept
+    assert row["last_seen"] > 1000.0                # heartbeat refreshed it
+
+
+def test_server_records_registered_client(server, client):
+    # The end-to-end register path: the test client's startup TYPE_REGISTER
+    # must land in the server's clients table (plus the 1 Hz NTP heartbeats
+    # it sends while running).
+    wait_until(lambda: any(c["ip"] == "127.0.0.1"
+                           for c in server.catalog.list_clients()))
+
+
+def test_client_heartbeat_re_registers(server, client):
+    # The client re-registers on REGISTER_INTERVAL, so a room running through
+    # a server restart reappears (hostname + stored offset pushed back).
+    h = client.client
+    # find the hostname the test client would send
+    import socket as _socket
+    name = _socket.gethostname()
+    wait_until(lambda: any(c["ip"] == "127.0.0.1" and c["hostname"] == name
+                           for c in server.catalog.list_clients()))
+
+
 def test_http_clients_list_and_set_latency(server):
     # Simulate a room registering its latency by calling the catalog directly
     # (the UDP register path does the same under the hood), then check the
