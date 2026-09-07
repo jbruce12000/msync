@@ -43,3 +43,19 @@ SERVER = os.environ.get("MSYNC_SERVER", "10.0.0.2")
 
 # Web UI / HTTP API port is the UDP port plus this offset.
 HTTP_PORT_OFFSET = 1000
+
+
+# --------------------------------------------------------------------------- #
+# Room tuning                                                                  #
+# --------------------------------------------------------------------------- #
+
+# Extra latency of THIS machine's audio output path, in milliseconds (0 =
+# none). Rooms whose sound reaches the speakers through a heavily-buffered
+# path (HDMI -> TV/AVR, Bluetooth, etc.) arrive late relative to rooms on
+# a low-latency path, so the sync must play that far AHEAD of the timeline
+# to line the sounds up.
+#
+# Measure it with tools/measure_latency.py (plug a USB mic into the room,
+# run the script, it prints the value), then set that value here. 0 means
+# the normal amount of buffering is fine for this room.
+OUTPUT_LATENCY_MS = float(os.environ.get("MSYNC_OUTPUT_LATENCY_MS", "0"))

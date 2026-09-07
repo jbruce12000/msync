@@ -26,6 +26,10 @@ few milliseconds even across Wi-Fi.
 - **Click-free drift correction** — each client keeps itself locked to the
   sync server by nudging its sample rate by an inaudible fraction of a
   percent, glitch-free — no pops, no cracks, no audio artifacts.
+- **Room-latency compensation** — rooms whose sound reaches the speakers
+  through a slow path (HDMI → TV/AVR, Bluetooth, …) are measured with a
+  microphone and played that far *ahead* of the sync timeline, so they line
+  up with the rooms on plain analog/USB outputs.
 - **Web UI** — browse your local music collection from any browser, search
   by song, artist, or album, and queue up selections with a click. Works on
   phones, tablets, laptops — any device on the same network.
@@ -201,6 +205,7 @@ Every client has a small console as well. While a client is running, type:
 | `pause` / `resume` | pause or resume everyone |
 | `next` / `prev` | skip forward / back |
 | `vol 0.7` | set volume (0.0 – 1.5) |
+| `latency 120` | tune this room's output-latency compensation live (ms); see "Matching rooms with a slow audio path" |
 | `queue` | show what's queued |
 | `clear` | empty the queue |
 | `q` | stop this client |
@@ -254,6 +259,45 @@ the scripts — the server and every client read it:
   config.py or via `MSYNC_DEFAULT_PORT`; every client and server must agree.
 - **`HTTP_PORT_OFFSET`** — the HTTP port is the UDP port plus this offset
   (default **+1000** → HTTP **10770**), used for the web UI and downloads.
+- **`OUTPUT_LATENCY_MS`** — extra latency of **this** machine's audio output,
+  in milliseconds (default `0`). Rooms whose sound goes through a slow path
+  (HDMI → TV/AVR, Bluetooth, …) arrive late; set this to the measured value
+  and the room plays that far ahead of the sync timeline. Measured with
+  `tools/measure_latency.py` (see below), or tweaked live from a client
+  console with `latency <ms>`. Env override: `MSYNC_OUTPUT_LATENCY_MS`.
+
+## Matching rooms with a slow audio path
+
+If one room sounds **late** even though every client reports `err` ≈ 0ms, its
+speakers are probably behind a high-latency output chain — most commonly
+HDMI into a TV or AVR, which buffers 100–300ms of audio for video sync. The
+sync loop can't see that (ALSA/PipeWire only know about the digital side of
+the port); only a real measurement reveals it.
+
+`tools/measure_latency.py` measures it for you:
+
+1. Plug a USB microphone into the affected machine so it can hear **both**
+   its target speakers (the TV/AVR) and the machine's low-latency analog/USB
+   output.
+2. Run:
+   ```bash
+   ./venv/bin/python tools/measure_latency.py --list     # check device names
+   ./venv/bin/python tools/measure_latency.py            # measure
+   ```
+   (Overrides if auto-detection picks wrong devices: `--sink`, `--ref`,
+   `--mic` each match a substring of the device name.)
+3. The script plays a chirp through each output, records both sink monitor
+   ports plus the microphone, cross-correlates them, and prints the value:
+   ```
+   ==> OUTPUT_LATENCY_MS = 140
+   ```
+4. Put that value in `config.py` (or run with `--write-config`) on that
+   machine and restart its client. Refine ±10ms by ear from the client
+   console with `latency <ms>`.
+
+The printed value is how much *slower* the target path is than the
+reference path — exactly the advance that makes this room line up with a
+room on the equivalent low-latency path.
 
 ## How the sync stays perfect
 

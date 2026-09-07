@@ -395,6 +395,17 @@ def test_config_env_override(monkeypatch, tmp_path):
     importlib.reload(config)
 
 
+def test_config_output_latency_env(monkeypatch):
+    import importlib
+    import config
+    monkeypatch.setenv("MSYNC_OUTPUT_LATENCY_MS", "120")
+    importlib.reload(config)
+    assert config.OUTPUT_LATENCY_MS == 120.0
+    monkeypatch.delenv("MSYNC_OUTPUT_LATENCY_MS", raising=False)
+    importlib.reload(config)
+    assert config.OUTPUT_LATENCY_MS == 0.0
+
+
 # --------------------------------------------------------------------------- #
 # Library / track selection                                                    #
 # --------------------------------------------------------------------------- #
@@ -503,6 +514,42 @@ def test_client_callback_fast_catchup(client):
     # contribute only ~0.4ms at the 0.2% cap)
     assert advance > block + C.CATCHUP_STEP * 0.9
     assert advance < block * 1.004 + C.CATCHUP_STEP * 1.1
+
+
+def test_client_callback_output_latency_compensation(client):
+    # A room on a slow output path (HDMI -> TV/AVR) must play that far ahead
+    # of the synced playhead so the sound reaching its speakers lines up with
+    # the other rooms — while the PLL itself keeps chasing the raw playhead
+    # (the offset changes what we emit, not how we sync).
+    h = client.client
+    wait_until(lambda: h.buffer.data is not None
+               and h.buffer.duration > 1.5 and h.stream is not None)
+    with C.stream_ops_lock:
+        h.stream.stop()          # silence the real callback: no measurement race
+    with h.lock:
+        h.playing = True
+        h._pitch_int = 0.0
+        h.err_f = 0.0
+        target = max(0.0, h.clock.server_now() - h.server_song_start)
+        h.local_pos = max(0.0, min(target, h.buffer.duration - 2.0))
+        before = h.local_pos
+        h._out_latency = 0.300
+    out = np.zeros((8192, 2), dtype=np.float32)
+    h._cb(out, 8192, None, None)
+    with h.lock:
+        advance = h.local_pos - before
+    block = 8192 / h.buffer.sr
+    # playhead advances by one physical block (pitch ~ 1; no catch-up nudge
+    # because the playhead starts on the target)
+    assert advance > block * 0.99
+    assert advance < block * 1.01 + C.CATCHUP_STEP * 2.0
+    # emitted audio starts 300 ms ahead of the raw playhead
+    i0_exp = int((before + 0.300) * h.buffer.sr)
+    assert i0_exp + 8 < len(h.buffer.data)
+    assert abs(float(out[0, 0]) - float(h.buffer.data[i0_exp, 0])) < 1e-6
+    assert abs(float(out[8, 0]) - float(h.buffer.data[i0_exp + 8, 0])) < 1e-6
+    # genuinely offset: 300 ms of samples (not the raw playhead position)
+    assert i0_exp - int(before * h.buffer.sr) > int(0.29 * h.buffer.sr)
 
 
 def test_resolve_server_config_priority(monkeypatch):

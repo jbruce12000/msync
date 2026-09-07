@@ -229,6 +229,11 @@ class SyncClient:
         self._stop = threading.Event()   # set to leave the run() loop
         self._loading_name = None        # track currently being downloaded
         self._fade_out = False           # set by close_audio -> callback fades
+        # If this room's audio path (HDMI -> TV/AVR, ...) delays the output
+        # by OUTPUT_LATENCY_MS, play that far ahead of the synced playhead
+        # so the sound reaching the listeners lines up with the server room.
+        # Tune live from the console with: latency <ms>
+        self._out_latency = config.OUTPUT_LATENCY_MS / 1000.0
 
     # ------------------------------------------------------------------ #
     # HTTP API to the server (state, library, queue, playback control)    #
@@ -360,7 +365,12 @@ class SyncClient:
             # perfectly aligned.
             self.err_smooth = 0.9 * self.err_smooth + 0.1 * err
 
-            idx = max(0.0, self.local_pos * buf.sr)
+            # Output index is the synced playhead plus this room's output
+            # latency: sound written now is heard OUTPUT_LATENCY_MS later,
+            # so pull the samples from that much further ahead on the timeline.
+            # (The PLL still chases the raw playhead; only what we emit is
+            # offset, so sync/control logic is unchanged.)
+            idx = max(0.0, (self.local_pos + self._out_latency) * buf.sr)
             n = len(buf.data)
             if idx >= n:
                 outdata.fill(0)
@@ -537,8 +547,8 @@ class SyncClient:
     # ------------------------------------------------------------------ #
     def _console(self):
         print("[client] console: tracks | play <name> | add <name> | "
-              "pause | resume | next | prev | vol <0..1.5> | queue | "
-              "clear | q")
+              "pause | resume | next | prev | vol <0..1.5> | latency <ms> | "
+              "queue | clear | q")
         while not self._stop.is_set():
             try:
                 line = input("> ").strip()
@@ -589,6 +599,19 @@ class SyncClient:
                         print("  volume =", self.set_volume(float(rest.split()[0])))
                     except ValueError:
                         print("  usage: vol <0.0..1.5>")
+                elif cmd == "latency":
+                    # live output-latency compensation for this room, in ms
+                    try:
+                        ms = float(rest.split()[0])
+                    except (ValueError, IndexError):
+                        print(f"  usage: latency <ms>  (current: "
+                              f"{self._out_latency * 1000:.0f} ms)")
+                    else:
+                        with self.lock:
+                            self._out_latency = ms / 1000.0
+                        print(f"  output latency compensation: {ms:.0f} ms"
+                              f" (set {ms:.0f} in config.OUTPUT_LATENCY_MS"
+                              f" to make it permanent)")
                 elif cmd == "queue":
                     print("  queue:", ", ".join(self.queue) if self.queue
                           else "(empty)")
