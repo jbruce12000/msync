@@ -1,0 +1,45 @@
+"""msync config — shared by server and clients; env vars override every value.
+
+Server holds the tracks; clients only need the network settings.
+Edit values here or override with the MSYNC_* env vars named below."""
+
+import os
+import tempfile
+
+
+def _here(name):
+    """Absolute path to a file next to this one."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+
+
+# --------------------------------------------------------------------------- #
+# Music library                                                               #
+# --------------------------------------------------------------------------- #
+
+# Server's music folder (audio files here get played and scanned).
+MUSIC_DIR = os.environ.get("MSYNC_MUSIC_DIR", _here("../../music"))
+
+# Sub-folder inside MUSIC_DIR: drop audio files here to queue them.
+QUEUE_SUBDIR = ".queue"
+
+# Client's local cache for downloaded tracks.
+CACHE_DIR = os.environ.get(
+    "MSYNC_CACHE_DIR", os.path.join(tempfile.gettempdir(), "msync-cache"))
+
+# Server's catalog DB (albums/tags/queue), SQLite.
+DB_PATH = os.environ.get("MSYNC_DB_PATH", _here("msync.db"))
+
+
+# --------------------------------------------------------------------------- #
+# Networking                                                                  #
+# --------------------------------------------------------------------------- #
+
+# UDP sync/state/clock port (server binds it, clients listen).
+DEFAULT_PORT = int(os.environ.get("MSYNC_DEFAULT_PORT", "9770"))
+
+# Server host/IP clients connect to. Takes priority over the client's
+# --server flag; empty = unconfigured (client falls back to localhost).
+SERVER = os.environ.get("MSYNC_SERVER", "10.0.0.2")
+
+# Web UI / HTTP API port is the UDP port plus this offset.
+HTTP_PORT_OFFSET = 1000

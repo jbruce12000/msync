@@ -1,0 +1,987 @@
+"""pytest test suite for msync: protocol, stereo, queue, HTTP, client sync."""
+import http.client
+import json
+import os
+import shutil
+import time
+
+import numpy as np
+import pytest
+
+import msync_common as C
+from conftest import (MUSIC, make_tagged_mp3, make_tagged_wav, wait_until)
+from msync_catalog import Catalog
+
+
+# --------------------------------------------------------------------------- #
+# Protocol                                                                     #
+# --------------------------------------------------------------------------- #
+def test_protocol_packet_roundtrip():
+    p = C.make_packet(C.TYPE_SYNC, index=3, name="song.wav", playing=True)
+    ptype, body = C.parse_packet(p)
+    assert ptype == C.TYPE_SYNC
+    assert body["name"] == "song.wav"
+    assert body["index"] == 3
+
+
+def test_protocol_rejects_garbage():
+    assert C.parse_packet(b"not a real packet") is None
+
+
+# --------------------------------------------------------------------------- #
+# Stereo playback (server + client)                                            #
+# --------------------------------------------------------------------------- #
+def test_server_decodes_stereo(server):
+    song = server.song
+    assert song is not None
+    assert song.data.ndim == 2
+    assert song.data.shape[1] == 2
+    # demo tracks have different L/R content
+    assert not np.allclose(song.data[:, 0], song.data[:, 1])
+
+
+def test_server_callback_writes_both_channels(server):
+    frames = 4096
+    out = np.zeros((frames, 2), dtype=np.float32)
+    server.local_pos = 0.3
+    server.song_start = time.time() - 0.3
+    server._audio_cb(out, frames, None, None)
+    assert out.shape == (frames, 2)
+    assert out.any()                                   # audio present
+    assert not np.allclose(out[:, 0], out[:, 1])       # L != R
+
+
+def test_client_buffer_is_stereo(client):
+    buf = client.client.buffer
+    assert buf.data is not None and buf.data.ndim == 2
+    assert buf.data.shape[1] == 2
+    assert not np.allclose(buf.data[:, 0], buf.data[:, 1])
+
+
+def test_client_callback_writes_both_channels(client):
+    buf = client.client.buffer
+    assert buf.data is not None
+    frames = 2048
+    out = np.zeros((frames, 2), dtype=np.float32)
+    client.client.playing = True
+    client.client.server_song_start = time.time() - 0.2
+    client.client.local_pos = 0.2
+    client.client._cb(out, frames, None, None)
+    assert out.shape == (frames, 2)
+    assert not np.allclose(out[:, 0], out[:, 1])
+
+
+# --------------------------------------------------------------------------- #
+# Clock sync / client follow                                                  #
+# --------------------------------------------------------------------------- #
+def test_client_follows_server_song(client):
+    assert client.client.buffer.name == "track_01_A440.wav"
+    assert client.client.playing
+
+
+def test_clock_sync_measures_localhost(server, client):
+    assert client.client.clock.offset is not None
+    assert abs(client.client.clock.offset) < 0.05      # < 50 ms offset
+
+
+def test_clock_sync_offset_stable_under_jitter():
+    """The NTP offset estimate must stay near the true offset (a few ms)
+    under normal network jitter. It must NOT blow up to seconds/minutes the
+    way a raw epoch-intercept regression does (slope * t_epoch ~ 1.8e9)."""
+    import random
+    from msync_client import ClockSync
+    cs = ClockSync("127.0.0.1", 1)
+    epoch = 1_790_000_000.0           # ~ time.time() magnitude
+    true_off = 0.003                  # 3 ms, client behind server
+    rnd = random.Random(7)
+    for i in range(40):
+        t4 = epoch + i
+        d1 = abs(rnd.gauss(0.001, 0.003))     # outbound one-way delay
+        d2 = abs(rnd.gauss(0.001, 0.003))     # return one-way delay
+        t2 = t4 - d2 + true_off
+        t3 = t2 + 0.0001
+        t1 = t3 - d1 - true_off
+        off = ((t2 - t1) + (t3 - t4)) / 2.0
+        cs.points.append((t4, off))
+        if len(cs.points) > cs.window:
+            cs.points.pop(0)
+        cs._recompute()
+    assert abs(cs.offset - true_off) < 0.01, cs.offset
+    assert abs(cs.drift) < 500, cs.drift      # ppm: sane, not amplifying epoch
+
+
+def test_client_download_does_not_hold_audio_lock(tmp_path, monkeypatch):
+    """A slow new-track download must NOT happen while holding self.lock,
+    otherwise the audio callback (which takes that lock every block) would
+    stall for the whole transfer whenever the server is busy -> gaps."""
+    import threading
+    from msync_client import SyncClient, SongBuffer
+    c = SyncClient("127.0.0.1", 1, str(tmp_path))
+    monkeypatch.setattr(c, "_ensure_stream", lambda: None)   # no real audio
+    gate = threading.Event()
+
+    def slow_load(self, host, port, name, duration=None):
+        gate.set()                              # "download" now in flight
+        time.sleep(0.3)
+        self.data = np.zeros((8000, 2), dtype=np.float32)
+        self.sr = 8000
+        self.name = name
+        self.duration = duration or 1.0
+        return True
+
+    monkeypatch.setattr(SongBuffer, "load", slow_load)
+    t = threading.Thread(target=c._apply_state, args=(
+        {"name": "t.wav", "playing": True,
+         "song_start": 100.0, "duration": 1.0},))
+    t.start()
+    assert gate.wait(5), "download never started"
+    got = c.lock.acquire(timeout=0.5)
+    assert got, "audio lock held during download -> music gaps on busy server"
+    c.lock.release()
+    t.join(5)
+    assert not t.is_alive()
+    assert c.buffer.name == "t.wav"
+    assert c.playing is True
+
+
+# --------------------------------------------------------------------------- #
+# Queue                                                                       #
+# --------------------------------------------------------------------------- #
+def test_queue_add(server, client):
+    added = server.add_to_queue(["track_02_B494.wav"])
+    assert added == ["track_02_B494.wav"]
+    assert len(server.queue_list()) == 1
+    # queue list propagates via 1 Hz TYPE_STATE; wait for the item itself
+    wait_until(lambda: "track_02_B494.wav" in client.client.queue)
+    assert client.client.queue_size == 1
+
+
+def test_queue_meta_tags(tmp_path):
+    """Queue entries carry display metadata (artist - album - title) so the
+    UI can render names instead of directory/file paths. Album entries
+    expand to their tracks; untagged songs fall back to folder + filename."""
+    root = str(tmp_path)
+    first = os.path.join(root, "Tagged Album", "01 First.mp3")
+    second = os.path.join(root, "Tagged Album", "02 Second.mp3")
+    os.makedirs(os.path.dirname(first), exist_ok=True)
+    make_tagged_mp3(first, title="First", artist="Artist One",
+                    album="Tagged Album", track="1")
+    make_tagged_mp3(second, title="Second", artist="Artist One",
+                    album="Tagged Album", track="2")
+    lone = os.path.join(root, "Orphan", "second-song.wav")
+    os.makedirs(os.path.dirname(lone), exist_ok=True)
+    make_tagged_wav(lone, title="Second Song", artist="Artist Two")  # no album tag
+    # ^ no IPRD album tag -> the folder name is the only album fallback
+
+    import msync_server as MS
+    db = str(tmp_path / "q.db")
+    srv = MS.SyncedServer(root, 9793, db)
+    try:
+        srv._scan_done.wait(timeout=15)
+        # Seed the queue directly: the stub MP3s are undecodable, so queuing
+        # through add_to_queue() would auto-start "playback" of a silence-less
+        # stub and pop the entries before we can inspect them. queue_meta() is
+        # purely a function of self.queue, so seeding under the lock is
+        # deterministic and exercises exactly the same code path.
+        with srv.lock:
+            srv.queue.append({"type": "album", "album": "Tagged Album",
+                              "paths": [first, second]})
+            srv.queue.append({"type": "song", "path": lone,
+                              "relpath": "Orphan/second-song.wav"})
+
+        meta = {m["relpath"]: m for m in srv.queue_meta()}
+        # Tagged track -> artist - album - title (track number is an int).
+        m = meta["Tagged Album/01 First.mp3"]
+        assert m["title"] == "First"
+        assert m["artist"] == "Artist One"
+        assert m["album"] == "Tagged Album"
+        assert m["track"] == 1
+        # Untagged-album file in a folder -> folder name + filename fallback.
+        m = meta["Orphan/second-song.wav"]
+        assert m["album"] == "Orphan"
+        assert m["title"] == "Second Song"
+        assert m["artist"] == "Artist Two"
+        # queue_meta order matches queue_list (album expands to its tracks).
+        assert [m["relpath"] for m in srv.queue_meta()] == srv.queue_list()
+        # Both tracks of the album entry are expanded, in order.
+        assert [m["relpath"] for m in srv.queue_meta()] == [
+            "Tagged Album/01 First.mp3",
+            "Tagged Album/02 Second.mp3",
+            "Orphan/second-song.wav",
+        ]
+        # The state payload exposes queue_meta alongside the relpath queue.
+        p = srv._state_payload()
+        assert [m["relpath"] for m in p["queue_meta"]] == p["queue"]
+        assert p["queue"] == ["Tagged Album/01 First.mp3",
+                              "Tagged Album/02 Second.mp3",
+                              "Orphan/second-song.wav"]
+    finally:
+        srv._stop.set()
+        srv.close_audio()
+        srv.catalog.close()
+        try:
+            os.remove(db)
+        except OSError:
+            pass
+
+
+def test_queue_next_plays_queued_song_on_all_clients(server, client):
+    server.add_to_queue(["track_02_B494.wav"])
+    wait_until(lambda: client.client.queue_size == 1)
+    res = server.next()
+    assert res["source"] == "queue"
+    assert res["file"] == "track_02_B494.wav"
+    assert server.song.name == "track_02_B494.wav"
+    assert len(server.queue_list()) == 0
+    wait_until(lambda: client.client.buffer.name == "track_02_B494.wav")
+    assert client.client.buffer.name == "track_02_B494.wav"
+
+
+def test_queue_clear(server, client):
+    server.add_to_queue(["track_02_B494.wav", "track_03_C554.wav"])
+    assert len(server.queue_list()) == 2
+    n = server.clear_queue()
+    assert n == 2
+    assert len(server.queue_list()) == 0
+    wait_until(lambda: client.client.queue_size == 0)
+
+
+def test_queue_case_insensitive_lookup(server):
+    added = server.add_to_queue(["TRACK_02_B494.WAV"])
+    assert added == ["track_02_B494.wav"]
+
+
+def test_queue_rejects_missing_file(server):
+    assert server.add_to_queue(["nope.mp3"]) == []
+
+
+def test_drop_folder_absorbs(server):
+    qdir = server.queue_dir
+    assert qdir and os.path.isdir(qdir)
+    shutil.copy(os.path.join(MUSIC, "track_03_C554.wav"),
+                os.path.join(qdir, "track_03_C554.wav"))
+    wait_until(lambda: any("track_03" in n for n in server.queue_list()),
+               timeout=6.0, label="drop folder absorbed")
+    try:
+        names = server.queue_list()
+        assert any("track_03" in n for n in names)
+        assert not os.listdir(qdir)                    # moved out of .queue
+    finally:
+        # Leave no trace in the shared music dir: the copied file already
+        # exists, so the server dedups our copy to "track_03_C554 (1).wav",
+        # which would otherwise pollute the library for later tests.
+        server.clear_queue()
+        for f in os.listdir(server.music_dir):
+            if f.startswith("track_03_C554") and f != "track_03_C554.wav":
+                try:
+                    os.remove(os.path.join(server.music_dir, f))
+                except OSError:
+                    pass
+
+
+# --------------------------------------------------------------------------- #
+# HTTP API                                                                     #
+# --------------------------------------------------------------------------- #
+def _http(port, method, path):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request(method, path)
+    r = conn.getresponse()
+    data = r.read()
+    conn.close()
+    assert r.status == 200, f"{method} {path} -> {r.status}: {data}"
+    return json.loads(data)
+
+
+def test_http_state(server):
+    d = _http(server.port + 1000, "GET", "/api/state")
+    assert d["name"] == "track_01_A440.wav"
+    assert "queue" in d
+    assert "queue_size" in d
+    # The web UI's header depends on these fields to show the current track
+    # name/album, the play state, and the progress bar.
+    assert d["now_playing"]["name"] == "track_01_A440.wav"
+    assert d["now_playing"]["relpath"] == "track_01_A440.wav"
+    assert d["now_playing"]["album"] in ("", None)
+    assert d["paused"] is False
+    assert isinstance(d["elapsed"], (int, float))
+    assert d["elapsed"] >= 0
+
+
+def test_http_queue_add_and_clear(server):
+    from urllib.parse import quote
+    d = _http(server.port + 1000, "POST",
+              "/api/queue/add?name=" + quote("track_02_B494.wav"))
+    assert d["added"] == ["track_02_B494.wav"]
+    assert len(server.queue_list()) == 1
+    d = _http(server.port + 1000, "POST", "/api/queue/clear")
+    assert d["removed"] == 1
+    assert len(server.queue_list()) == 0
+
+
+def test_http_queue_remove_del(server):
+    """DELETE /api/queue/remove removes a queued track by index — this is
+    the exact request the web UI's queueRemove() sends."""
+    server.add_to_queue(["track_02_B494.wav", "track_03_C554.wav"])
+    assert len(server.queue_list()) == 2
+    d = _http(server.port + 1000, "DELETE", "/api/queue/remove?index=0")
+    assert d["removed"] == "track_02_B494.wav"
+    assert server.queue_list() == ["track_03_C554.wav"]
+    d = _http(server.port + 1000, "DELETE", "/api/queue/remove?index=0")
+    assert d["removed"] == "track_03_C554.wav"
+    assert server.queue_list() == []
+
+
+def test_http_queue_list(server):
+    server.add_to_queue(["track_02_B494.wav"])
+    d = _http(server.port + 1000, "GET", "/api/queue")
+    assert d["queue"] == ["track_02_B494.wav"]
+    assert d["now_playing"] == "track_01_A440.wav"
+
+
+def test_http_remove_current_starts_next_queue_song(server):
+    """Removing the currently playing song from the queue — the web UI's
+    now-playing ✕ button — posts to /api/control/next and starts the next
+    queued song.  The current track is never stored in the pending queue
+    (it's popped before playback), so removing it is an advance/skip."""
+    server.add_to_queue(["track_02_B494.wav", "track_03_C554.wav"])
+    wait_until(lambda: server.queue_list() == ["track_02_B494.wav",
+                                               "track_03_C554.wav"])
+    # Remove now-playing (track_01) → next queued song (track_02) starts
+    d = _http(server.port + 1000, "POST", "/api/control/next")
+    assert d["source"] == "queue"
+    assert d["file"] == "track_02_B494.wav"
+    assert server.song.name == "track_02_B494.wav"
+    assert server.queue_list() == ["track_03_C554.wav"]
+    # Remove track_02 → track_03 starts
+    d = _http(server.port + 1000, "POST", "/api/control/next")
+    assert d["source"] == "queue"
+    assert d["file"] == "track_03_C554.wav"
+    assert server.song.name == "track_03_C554.wav"
+    assert server.queue_list() == []
+
+
+def _http_status(port, method, path):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request(method, path)
+    r = conn.getresponse()
+    data = r.read()
+    conn.close()
+    return r.status, data
+
+
+# --------------------------------------------------------------------------- #
+# config.py                                                                    #
+# --------------------------------------------------------------------------- #
+def test_config_music_dir_default(monkeypatch):
+    monkeypatch.delenv("MSYNC_MUSIC_DIR", raising=False)
+    import importlib
+    import config
+    importlib.reload(config)
+    # The default should be a real, absolute directory (the configured
+    # library) — not a mangled/relative path from a bad `_here` computation.
+    assert config.MUSIC_DIR
+    assert os.path.isabs(config.MUSIC_DIR)
+    assert os.path.isdir(config.MUSIC_DIR)
+
+
+def test_config_env_override(monkeypatch, tmp_path):
+    import importlib
+    import config
+    monkeypatch.setenv("MSYNC_MUSIC_DIR", str(tmp_path / "my-library"))
+    importlib.reload(config)
+    assert config.MUSIC_DIR == str(tmp_path / "my-library")
+    # restore the default so the rest of the suite sees the standard layout
+    monkeypatch.delenv("MSYNC_MUSIC_DIR", raising=False)
+    importlib.reload(config)
+
+
+# --------------------------------------------------------------------------- #
+# Library / track selection                                                    #
+# --------------------------------------------------------------------------- #
+def test_http_library(server):
+    d = _http(server.port + 1000, "GET", "/api/library")
+    for t in ("track_01_A440.wav", "track_02_B494.wav",
+              "track_03_C554.wav"):
+        assert t in d["songs"]
+    # sorted case-insensitively
+    assert d["songs"] == sorted(d["songs"], key=str.lower)
+
+
+def test_http_control_play_switches_song(server, client):
+    d = _http(server.port + 1000, "POST",
+              "/api/control/play?name=track_02_B494.wav")
+    assert d["now_playing"] == "track_02_B494.wav"
+    assert server.song.name == "track_02_B494.wav"
+    # the sync broadcast should pull the client to the new song too
+    wait_until(lambda: client.client.buffer.name == "track_02_B494.wav")
+
+
+def test_http_control_play_unknown(server):
+    status, data = _http_status(server.port + 1000, "POST",
+                                "/api/control/play?name=nope.mp3")
+    assert status == 404
+    assert b"not found" in data
+
+
+def test_http_control_volume(server):
+    d = _http(server.port + 1000, "POST", "/api/control/volume?level=0.5")
+    assert d["volume"] == 0.5
+    assert server.volume == 0.5
+    d = _http(server.port + 1000, "POST", "/api/control/volume?level=9")
+    assert d["volume"] == 1.5          # clamped
+
+
+def test_http_control_pause_resume(server):
+    d = _http(server.port + 1000, "POST", "/api/control/toggle?state=0")
+    assert d["playing"] is False
+    assert server.playing is False
+    d = _http(server.port + 1000, "POST", "/api/control/toggle?state=1")
+    assert d["playing"] is True
+
+
+def test_http_control_stop(server):
+    # Stop halts playback and rewinds to the start of the current track; a
+    # later play/pause resumes the same track from the top.
+    with server.lock:
+        server.local_pos = 4.0
+    d = _http(server.port + 1000, "POST", "/api/control/stop")
+    assert d["playing"] is False
+    assert server.playing is False
+    # rewound to the start (a lock-free audio callback may nudge it by at
+    # most one block before seeing playing=False)
+    assert server.local_pos < 1.0
+    d = _http(server.port + 1000, "POST", "/api/control/toggle?state=1")
+    assert d["playing"] is True
+    assert server.local_pos < 2.0
+
+
+def test_http_pause_keeps_client_stream_open(server, client):
+    # Pause must NOT stop the client's PortAudio stream: restarting the
+    # stream re-primes the device buffer, pushing this client audibly behind
+    # the (continuously-running) server by ~one buffer depth — a constant
+    # offset a rate-only PLL removes only very slowly. The callback fills
+    # silence while paused, exactly like the server does.
+    h = client.client
+    wait_until(lambda: h.stream is not None and h.stream.active
+               and h.buffer.data is not None)
+    _http(server.port + 1000, "POST", "/api/control/toggle?state=0")
+    wait_until(lambda: h.playing is False)        # mirror applied
+    assert h.stream.active                        # still open, just silent
+    _http(server.port + 1000, "POST", "/api/control/toggle?state=1")
+    wait_until(lambda: h.playing is True)
+    assert h.stream.active
+
+    # The playhead must track the server firmly right after resume (no
+    # stream-restart re-prime gap pushing the client behind).
+    def gap():
+        with h.lock:
+            return (h.clock.server_now() - h.server_song_start
+                    - h.local_pos)
+    wait_until(lambda: abs(gap()) < 0.25, timeout=3.0)
+
+
+def test_client_callback_fast_catchup(client):
+    # A large playhead gap (post-resume / GIL stall) is closed by the bounded
+    # per-block nudge, not by waiting for a slow MAX_PITCH-limited slew.
+    h = client.client
+    wait_until(lambda: h.buffer.data is not None
+               and h.buffer.duration > 1.0 and h.stream is not None)
+    with C.stream_ops_lock:
+        h.stream.stop()          # silence the real callback: no measurement race
+    with h.lock:
+        h.playing = True
+        h._pitch_int = 0.0
+        target = max(0.0, h.clock.server_now() - h.server_song_start)
+        h.local_pos = max(0.0, min(target - 0.5, h.buffer.duration - 2.0))
+        before = h.local_pos
+    out = np.zeros((8192, 2), dtype=np.float32)
+    h._cb(out, 8192, None, None)
+    with h.lock:
+        advance = h.local_pos - before
+    block = 8192 / h.buffer.sr
+    # one normal block plus the bounded catch-up nudge (a plain PLL would
+    # contribute only ~0.4ms at the 0.2% cap)
+    assert advance > block + C.CATCHUP_STEP * 0.9
+    assert advance < block * 1.004 + C.CATCHUP_STEP * 1.1
+
+
+def test_resolve_server_config_priority(monkeypatch):
+    """config.py's SERVER takes priority over an explicit --server; the CLI
+    flag only takes effect when config is unconfigured (blank), and the
+    loopback address is the last-resort fallback."""
+    import config
+    import msync_client as MC
+    monkeypatch.setattr(config, "SERVER", "10.0.0.5")
+    assert MC.resolve_server("192.168.0.99") == "10.0.0.5"
+    monkeypatch.setattr(config, "SERVER", "")
+    assert MC.resolve_server("192.168.0.99") == "192.168.0.99"
+    assert MC.resolve_server(None) == "127.0.0.1"
+
+
+def test_client_fetch_tracks(client):
+    tracks = client.client.fetch_tracks()
+    assert "track_01_A440.wav" in tracks
+    assert "track_02_B494.wav" in tracks
+    assert "track_03_C554.wav" in tracks
+
+
+def test_client_select_track(client):
+    now = client.client.select_track("track_03_C554.wav")
+    assert now == "track_03_C554.wav"
+    wait_until(lambda: client.client.buffer.name == "track_03_C554.wav")
+
+
+def test_client_queue_add(client):
+    added = client.client.queue_add("track_02_B494.wav")
+    assert added == ["track_02_B494.wav"]
+
+
+def test_client_next_song(client):
+    name = client.client.next_song()
+    assert name == "track_02_B494.wav"
+
+
+def test_client_set_volume(client):
+    assert client.client.set_volume(0.3) == 0.3
+    assert client.client.set_volume(3.0) == 1.5   # clamped server-side
+
+
+# --------------------------------------------------------------------------- #
+# Web UI                                                                       #
+# --------------------------------------------------------------------------- #
+def test_web_ui_served(server):
+    status, data = _http_status(server.port + 1000, "GET", "/")
+    assert status == 200
+    assert b"msync" in data
+    assert b"/api/state" in data
+    # The library list must come from an endpoint the server actually serves,
+    # otherwise the UI's search would see an empty library.
+    assert b"/api/library" in data
+    assert b"/api/songlist" not in data
+    # The now-playing queue slot must be removable (starts the next song).
+    assert b"removeNowPlaying" in data
+    assert b"/api/control/next" in data
+    status, data = _http_status(server.port + 1000, "GET", "/index.html")
+    assert status == 200
+
+
+def test_web_ui_static_traversal_blocked(server):
+    status, _ = _http_status(server.port + 1000, "GET",
+                             "/static/../../etc/passwd")
+    assert status in (400, 404)   # must never escape the web dir
+
+
+# --------------------------------------------------------------------------- #
+# Albums (use album_server on a separate port/music dir)                       #
+# --------------------------------------------------------------------------- #
+def _alb_http(port, method, path):
+    return _http(port + 1000, method, path)
+
+
+def test_album_library(album_server):
+    d = _alb_http(album_server.port, "GET", "/api/library")
+    assert "Demo Album/01 Intro.wav" in d["songs"]
+    assert "Demo Album/02 Bridge.wav" in d["songs"]
+    assert "solo_single.wav" in d["songs"]
+    albums = {a["album"]: a for a in d["albums"]}
+    assert "Demo Album" in albums
+    assert albums["Demo Album"]["track_count"] == 2
+    # Each album includes its track list so the UI can search within albums.
+    assert len(albums["Demo Album"]["tracks"]) == 2
+    tr = {t["relpath"]: t["title"] for t in albums["Demo Album"]["tracks"]}
+    assert "Demo Album/01 Intro.wav" in tr
+    # Untagged files fall back to their filename as the display title.
+    assert tr["Demo Album/01 Intro.wav"] == "01 Intro.wav"
+
+
+def test_album_tracks(album_server):
+    d = _alb_http(album_server.port, "GET",
+                  "/api/albums/Demo%20Album/tracks")
+    assert d["album"] == "Demo Album"
+    assert len(d["tracks"]) == 2
+    assert any("01 Intro" in t for t in d["tracks"])
+
+
+def test_album_add(album_server):
+    d = _alb_http(album_server.port, "POST",
+                  "/api/queue/add-album?album=Demo%20Album")
+    assert len(d["added"]) == 2
+    assert len(album_server.queue_list()) == 2
+
+
+def test_album_play(album_server):
+    d = _alb_http(album_server.port, "POST",
+                  "/api/control/play?album=Demo%20Album")
+    assert d["now_playing"] == "Demo Album/01 Intro.wav"
+    assert album_server.song.name == "Demo Album/01 Intro.wav"
+    # one track queued (the second), the first is now playing
+    assert len(album_server.queue_list()) == 1
+    assert any("02 Bridge" in t for t in album_server.queue_list())
+
+
+def test_add_name_resolves_album(album_server):
+    d = _alb_http(album_server.port, "POST",
+                  "/api/queue/add?name=Demo%20Album")
+    assert len(d["added"]) == 2
+
+
+def test_play_name_resolves_album(album_server):
+    d = _alb_http(album_server.port, "POST",
+                  "/api/control/play?name=Demo%20Album")
+    assert d["now_playing"] == "Demo Album/01 Intro.wav"
+
+
+def test_http_state_queue_relpaths(album_server):
+    """Queue in /api/state should use relative paths for album tracks."""
+    album_server.clear_queue()
+    d = _alb_http(album_server.port, "GET", "/api/state")
+    assert isinstance(d["queue"], list)
+
+
+def test_db_created(album_server):
+    """The SQLite catalog database should exist on disk."""
+    import os
+    assert os.path.isfile(album_server.db_path)
+
+
+def test_catalog_tracks(album_server):
+    """Direct catalog API: albums(), singles(), album_tracks()."""
+    cat = album_server.catalog
+    alb = {a["album"]: a for a in cat.albums()}
+    assert "Demo Album" in alb
+    assert alb["Demo Album"]["track_count"] == 2
+    assert len(cat.singles()) == 1
+    assert len(cat.album_tracks("Demo Album")) == 2
+    assert cat.album_name("demo album") == "Demo Album"
+    assert cat.album_name("no such album") is None
+
+
+# --------------------------------------------------------------------------- #
+# Audio tags (tinytag)                                                         #
+# --------------------------------------------------------------------------- #
+def test_catalog_reads_tags_with_fallbacks(tmp_path):
+    """scan() pulls album/artist/title/track from file tags, and falls back
+    to the folder/filename when a file has no (readable) tags."""
+    lib = tmp_path / "lib"
+    album_dir = lib / "FolderName"
+    album_dir.mkdir(parents=True)
+    # Tagged MP3s: filenames are deliberately reversed from their tags.
+    make_tagged_mp3(album_dir / "z_later.mp3", title="Second Song",
+                    artist="Some Artist", album="Real Album Name", track=2)
+    make_tagged_mp3(album_dir / "a_first.mp3", title="First Song",
+                    artist="Some Artist", album="Real Album Name", track=1)
+    # Tagged WAV uses the RIFF LIST/INFO chunk for its tags.
+    other_dir = lib / "OtherDir"
+    other_dir.mkdir()
+    make_tagged_wav(other_dir / "tagged.wav", title="Wav Title",
+                    artist="Wav Artist", album="Wav Album")
+    # Untagged WAV (no tag data, no INFO chunk).
+    make_tagged_wav(album_dir / "Plain.wav")
+    # Root-level file = single.
+    make_tagged_wav(lib / "Single.wav")
+
+    cat = Catalog(str(lib), str(tmp_path / "cat.db"))
+    assert cat.scan() == 5
+
+    # Tagged file: everything comes from the tags.
+    r = cat.track("OtherDir/tagged.wav")
+    assert r["album"] == "Wav Album"
+    assert r["artist"] == "Wav Artist"
+    assert r["title"] == "Wav Title"
+    assert r["name"] == "tagged.wav"   # name stays the filename
+
+    # Untagged file: folder + filename fallbacks.
+    plain = cat.track("FolderName/Plain.wav")
+    assert plain["album"] == "FolderName"
+    assert plain["title"] == "Plain.wav"
+    assert plain["artist"] == ""
+
+    # Track numbers from tags order album playback (a_first is track 1).
+    assert cat.album_tracks("Real Album Name") == [
+        "FolderName/a_first.mp3", "FolderName/z_later.mp3"]
+    # Only the untagged file belongs to the folder-name album.
+    assert cat.album_tracks("FolderName") == ["FolderName/Plain.wav"]
+
+    # The web payload carries display titles and the author.
+    albums = {a["album"]: a for a in cat.albums_with_tracks()}
+    info = albums["Real Album Name"]
+    assert info["artist"] == "Some Artist"
+    assert [(t["relpath"], t["title"]) for t in info["tracks"]] == [
+        ("FolderName/a_first.mp3", "First Song"),
+        ("FolderName/z_later.mp3", "Second Song")]
+
+    # Singles expose their (fallback) title and artist for display/search.
+    assert cat.singles() == [{"relpath": "Single.wav", "title": "Single.wav",
+                              "artist": ""}]
+
+    # Playlist order: singles, then albums by name + track number.
+    rels = cat.relpaths()
+    assert rels.index("Single.wav") == 0 or "Single.wav" in rels
+    assert rels.index("FolderName/a_first.mp3") < \
+        rels.index("FolderName/z_later.mp3")
+
+
+def test_artist_searchable(tmp_path):
+    """Searching an artist finds albums whose folder/album name doesn't
+    contain it (e.g. 'Green Day' -> albums like 'Dookie'). The library
+    payload carries artist on albums and singles, and the UI's search
+    matches it so the whole album's tracks show up."""
+    lib = tmp_path / "lib"
+    (lib / "Dookie").mkdir(parents=True)
+    make_tagged_mp3(lib / "Dookie" / "basket_case.mp3",
+                    title="Basket Case", artist="Green Day", album="Dookie")
+    make_tagged_mp3(lib / "Dookie" / "when_i_come_around.mp3",
+                    title="When I Come Around", artist="Green Day",
+                    album="Dookie")
+    make_tagged_mp3(lib / "boulevard.mp3", title="Boulevard",
+                    artist="Green Day")
+    cat = Catalog(str(lib), str(tmp_path / "lib.db"))
+    cat.scan()
+    try:
+        albums = {a["album"]: a for a in cat.albums_with_tracks()}
+        assert albums["Dookie"]["artist"] == "Green Day"
+
+        # Reproduce the web UI's search filter: 'green day' must match the
+        # album via its artist, making every track of that album visible.
+        q = "green day"
+        alb = albums["Dookie"]
+        visible = [t for t in alb["tracks"]
+                   if q in alb["album"].lower() or q in alb["artist"].lower()
+                   or q in t["title"].lower() or q in t["relpath"].lower()]
+        assert len(visible) == 2
+
+        # Singles carry artist so the same query surfaces them too.
+        singles = cat.singles()
+        assert all("Green Day" in s["artist"] for s in singles)
+        assert any(q in s["title"].lower() or q in s["relpath"].lower()
+                   or q in s["artist"].lower() for s in singles)
+    finally:
+        cat.close()
+
+
+def test_catalog_migrates_old_db_and_rereads(tmp_path):
+    """A database created before tag support is migrated (new columns) and
+    its existing files re-read once so tags populate the whole library."""
+    import sqlite3
+    lib = tmp_path / "lib"
+    (lib / "Migrated Album").mkdir(parents=True)
+    make_tagged_mp3(lib / "Migrated Album" / "s1.mp3", title="Titled Song",
+                    artist="Some Artist", album="Migrated Album", track=3)
+    db = str(tmp_path / "old.db")
+    conn = sqlite3.connect(db)
+    conn.execute("""CREATE TABLE tracks (
+        relpath TEXT PRIMARY KEY, name TEXT NOT NULL, album TEXT,
+        artist TEXT DEFAULT '', duration REAL DEFAULT 0,
+        sample_rate INTEGER DEFAULT 0, channels INTEGER DEFAULT 0,
+        size INTEGER DEFAULT 0, mtime REAL DEFAULT 0,
+        added_at REAL DEFAULT 0)""")
+    conn.execute("""CREATE TABLE queue (
+        position INTEGER PRIMARY KEY, entry TEXT NOT NULL)""")
+    conn.execute("""CREATE TABLE playback (
+        id INTEGER PRIMARY KEY CHECK (id = 0), relpath TEXT NOT NULL,
+        elapsed REAL NOT NULL DEFAULT 0, playing INTEGER NOT NULL DEFAULT 1)""")
+    path = str(lib / "Migrated Album" / "s1.mp3")
+    st = os.stat(path)
+    conn.execute(
+        "INSERT INTO tracks (relpath, name, album, artist, duration,"
+        " sample_rate, channels, size, mtime, added_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("Migrated Album/s1.mp3", "s1.mp3", "Migrated Album", "",
+         2.0, 44100, 2, st.st_size, st.st_mtime, 0.0))
+    conn.commit()
+    conn.close()
+
+    cat = Catalog(str(lib), db)
+    # First scan re-reads the pre-tag row (title was NULL) and fills tags.
+    assert cat.scan() == 1
+    r = cat.track("Migrated Album/s1.mp3")
+    assert r["title"] == "Titled Song"
+    assert r["artist"] == "Some Artist"
+    assert r["track"] == 3
+    # A second scan finds everything unchanged and does no metadata reads.
+    assert cat.scan() == 0
+
+
+def test_refresh_playlist_keeps_current_song(album_server):
+    """Reordering the playlist — as a background scan does when tagged
+    track numbers order an album differently from its filenames — must
+    not move the 'next' cursor off the currently playing song."""
+    album_server.clear_queue()
+    album_server.play_song("Demo Album/02 Bridge.wav")
+    cur = album_server.song.name
+    assert cur == "Demo Album/02 Bridge.wav"
+    cur_abs = album_server._abs(cur)
+    # Simulate a scan that would order the album with the current track
+    # first (a different order than the catalog currently has).
+    reordered = [cur_abs] + [p for p in album_server.playlist
+                             if p != cur_abs]
+    album_server._refresh_playlist(reordered)
+    assert album_server.song.name == cur            # still playing
+    assert album_server.playlist == reordered        # new order honored
+    assert album_server.index == 0                   # cursor re-anchored
+    assert album_server.playlist[album_server.index] == cur_abs
+
+
+# --------------------------------------------------------------------------- #
+# Queue persistence                                                            #
+# --------------------------------------------------------------------------- #
+def test_catalog_queue_roundtrip(album_server):
+    """save_queue/load_queue round-trips songs and albums through the DB."""
+    import os
+    cat = album_server.catalog
+    lib = album_server.music_dir
+    entries = [
+        {"type": "song", "path": os.path.join(lib, "solo_single.wav"),
+         "relpath": "solo_single.wav"},
+        {"type": "album", "album": "Demo Album",
+         "paths": [os.path.join(lib, "Demo Album", "01 Intro.wav"),
+                   os.path.join(lib, "Demo Album", "02 Bridge.wav")]},
+    ]
+    cat.save_queue(entries)
+    assert cat.load_queue() == entries
+
+
+def test_catalog_queue_drops_missing(album_server):
+    """load_queue drops entries whose files no longer exist on disk."""
+    cat = album_server.catalog
+    cat.save_queue([{"type": "song", "path": "/does/not/exist.wav",
+                     "relpath": "does/not/exist.wav"}])
+    assert cat.load_queue() == []
+    # a partially-missing album keeps only the tracks that still exist
+    import os
+    lib = album_server.music_dir
+    good = os.path.join(lib, "Demo Album", "01 Intro.wav")
+    cat.save_queue([{"type": "album", "album": "Demo Album",
+                     "paths": [good, "/gone.wav"]}])
+    loaded = cat.load_queue()
+    assert len(loaded) == 1 and loaded[0]["type"] == "album"
+    assert loaded[0]["paths"] == [good]
+
+
+def test_queue_songs_and_album_stored_as_entries(album_server):
+    """Adding songs and an album creates distinct song/album DB entries."""
+    album_server.clear_queue()
+    added = album_server.add_to_queue(["solo_single.wav"])
+    assert added == ["solo_single.wav"]
+    album_server.add_album("Demo Album")
+    entries = album_server.catalog.load_queue()
+    assert [e["type"] for e in entries] == ["song", "album"]
+    assert entries[0]["relpath"] == "solo_single.wav"
+    assert entries[1]["album"] == "Demo Album"
+    assert len(entries[1]["paths"]) == 2
+    assert album_server.queue_list() == [
+        "solo_single.wav", "Demo Album/01 Intro.wav", "Demo Album/02 Bridge.wav"]
+
+
+def test_startup_does_not_auto_play_when_queue_empty(tmp_path):
+    """A fresh server (empty persisted queue) starts idle — it must not
+    auto-play an arbitrary track, only items in the queue. This is the
+    behavior behind "don't play the sweep that isn't queued after a restart"."""
+    import os
+    from msync_server import SyncedServer
+
+    db = str(tmp_path / "restart-empty.db")
+    # No UDP loop / HTTP is started here, so the port only needs to be free.
+    srv = SyncedServer(MUSIC, 9798, db)
+    try:
+        srv._scan_done.wait(timeout=15)
+        assert srv.queue == []
+        assert srv.song is None
+        assert srv.playing is False
+        # Queuing something when idle starts it.
+        added = srv.add_to_queue(["track_02_B494.wav"])
+        assert added == ["track_02_B494.wav"]
+        assert srv.song.name == "track_02_B494.wav"
+        assert srv.queue_list() == []  # it's playing, so popped from queue
+    finally:
+        srv._stop.set()
+        if srv.stream is not None:
+            try:
+                srv.stream.stop()
+                srv.stream.close()
+            except Exception:
+                pass
+        srv.catalog.close()
+        try:
+            os.remove(db)
+        except OSError:
+            pass
+
+
+def test_queue_restored_on_restart(server):
+    """The queue is reloaded from the DB when a new server starts on the
+    same database file — and playback resumes the song that was playing."""
+    db = server.db_path
+    server.clear_queue()
+    added = server.add_to_queue(["track_02_B494.wav", "track_03_C554.wav"])
+    assert added == ["track_02_B494.wav", "track_03_C554.wav"]
+    # Pin a deterministic current track so the restarted server resumes it.
+    # (The demo tracks are ~2s, so without pinning, natural advancement would
+    # have moved on before the restart.)
+    server.play_song("track_01_A440.wav")
+    server.play_pause()                 # freeze the playhead mid-run
+
+    from msync_server import SyncedServer
+
+    # Stop the original server's audio stream so a second instance can
+    # open the device, then simulate a restart with a fresh server.
+    if server.stream is not None:
+        try:
+            server.stream.stop()
+            server.stream.close()
+        except Exception:
+            pass
+    srv2 = SyncedServer(server.music_dir, server.port + 7, db)
+    try:
+        srv2._scan_done.wait(timeout=15)
+        # The same song that was playing resumes, and the rest of the queue
+        # is intact.
+        assert srv2.song.name == "track_01_A440.wav"
+        assert srv2.queue_list() == ["track_02_B494.wav", "track_03_C554.wav"]
+        assert [e["type"] for e in srv2.queue] == ["song", "song"]
+    finally:
+        srv2._stop.set()
+        if srv2.stream is not None:
+            try:
+                srv2.stream.stop()
+                srv2.stream.close()
+            except Exception:
+                pass
+        srv2.catalog.close()
+
+
+def test_restart_resumes_same_song(server):
+    """A restart comes back to the same song that was playing, even though
+    that song is no longer in the queue (it was popped before playback),
+    keeps its approximate position, and preserves the pause state."""
+    db = server.db_path
+    # Switch to a specific track and mark a mid-song position.
+    server.play_song("track_02_B494.wav")
+    assert server.song.name == "track_02_B494.wav"
+    assert server.queue_list() == []          # track_02 is playing, not queued
+    server.play_pause()                       # freeze, and pause is persisted
+    server.local_pos = 1.25
+    server._persist_playback()
+
+    from msync_server import SyncedServer
+    if server.stream is not None:
+        try:
+            server.stream.stop()
+            server.stream.close()
+        except Exception:
+            pass
+    srv2 = SyncedServer(server.music_dir, server.port + 7, db)
+    try:
+        srv2._scan_done.wait(timeout=15)
+        assert srv2.song.name == "track_02_B494.wav"
+        assert srv2.seek == pytest.approx(1.25, abs=0.05)
+        assert srv2.playing is False          # pause state survives restart
+    finally:
+        srv2._stop.set()
+        if srv2.stream is not None:
+            try:
+                srv2.stream.stop()
+                srv2.stream.close()
+            except Exception:
+                pass
+        srv2.catalog.close()

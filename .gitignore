@@ -1,0 +1,18 @@
+# SQLite database
+msync.db
+msync.db-shm
+msync.db-wal
+msync.db.bak
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Test cache
+.pytest_cache/
+
+# Virtual environment
+venv/
+
+# Music files (large binaries)
+music/*.wav
