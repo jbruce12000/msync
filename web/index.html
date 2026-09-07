@@ -478,7 +478,21 @@ async function fetchLibrary() {
     const d = await api('GET', '/api/library');
     if (d.error) return;
     library = d;
+    precomputeSearchKeys();
     renderLibrary();
+}
+
+// Precompute lowercase search keys once per library fetch so each keystroke's
+// filter is a plain substring check instead of lowercasing every field of
+// every row. '\n' separates fields so a match can't span a field boundary.
+function precomputeSearchKeys() {
+    for (const s of library.singles || [])
+        s._l = ((s.title || '') + '\n' + (s.relpath || '') + '\n' + (s.artist || '')).toLowerCase();
+    for (const alb of library.albums || []) {
+        alb._al = ((alb.album || '') + '\n' + (alb.artist || '')).toLowerCase();
+        for (const t of alb.tracks || [])
+            t._l = ((t.title || '') + '\n' + (t.relpath || '')).toLowerCase();
+    }
 }
 
 async function fetchState() {
@@ -620,9 +634,7 @@ function renderLibrary() {
 
     // Singles
     const singles = (library.singles || []).filter(s =>
-        !q || s.title.toLowerCase().includes(q)
-            || s.relpath.toLowerCase().includes(q)
-            || (s.artist || '').toLowerCase().includes(q));
+        !q || (s._l || '').includes(q));
     if (singles.length) {
         for (const s of singles) {
             const playing = s.relpath === np ? ' playing' : '';
@@ -638,9 +650,7 @@ function renderLibrary() {
     for (const alb of albums) {
         const tracks = alb.tracks || [];
         const visible = tracks.filter(t =>
-            !q || t.title.toLowerCase().includes(q) || t.relpath.toLowerCase().includes(q)
-                || alb.album.toLowerCase().includes(q)
-                || (alb.artist || '').toLowerCase().includes(q));
+            !q || (t._l || '').includes(q) || (alb._al || '').includes(q));
         if (q && !visible.length) continue;
         const isOpen = openAlbums[alb.album] || !!q;
         const arrowCls = isOpen ? ' open' : '';
@@ -757,9 +767,13 @@ function clearSearch() {
     box.focus();
 }
 
+let searchTimer = null;
 document.getElementById('search').addEventListener('input', () => {
     updateClearBtn();
-    renderLibrary();
+    // Debounce: wait for a pause in typing before re-scanning the library,
+    // so a fast-typed word doesn't run the filter once per keystroke.
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(renderLibrary, 120);
 });
 
 // ── Polling ──────────────────────────────────────────────────────────
