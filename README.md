@@ -120,10 +120,33 @@ apply.)
   systemctl status msync-client        # or msync-server
   sudo systemctl stop msync-client     # / start / enable / disable
   ```
-- Watch what's happening (state, sync quality, errors):
-  ```bash
-  journalctl -u msync-client -f        # or msync-server; -f follows live
-  ```
+
+### Logs
+
+Both services write their output (what's playing, sync quality, errors) to
+the system journal. The quickest way to see what a service is doing:
+
+```bash
+# follow live (like `tail -f`)
+journalctl -u msync-client -f        # or msync-server
+
+# last 50 lines, once
+journalctl -u msync-client -n 50
+
+# only recent activity
+journalctl -u msync-server --since "10 minutes ago"
+
+# everything since the service was last started
+journalctl -u msync-server -b
+
+# warnings and errors only
+journalctl -u msync-client -p warning
+```
+
+You can also read both services at once:
+`journalctl -u msync-server -u msync-client -f`. If you need to
+troubleshoot, `sudo journalctl -u msync-client --since today` covers a whole
+day in one go.
 
 ## Playing music — 3 steps
 
