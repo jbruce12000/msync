@@ -16,3 +16,6 @@ venv/
 
 # Music files (large binaries)
 music/*.wav
+
+# Editor swap files
+*.swp

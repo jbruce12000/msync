@@ -67,12 +67,23 @@ NTP_INTERVAL  = 1.0         # client NTP resync period (s)
 # Playback tuning
 LATENCY_SEC   = 0.20        # client start latency per song (schedule ahead)
 MAX_PITCH     = 0.002       # max drift correction pitch (0.2%)
-PITCH_GAIN    = 0.15        # proportional gain for drift correction (1/s)
+PITCH_GAIN    = 0.06        # proportional gain for drift correction (1/s)
 PITCH_INT     = 0.02        # integral gain (accumulated error -> pitch)
-INT_LEAK      = 0.95        # per-callback leak of the integrator (anti-windup)
 DRIFT_HYSTERESIS = 0.0005   # only pitch-correct if error > this (seconds)
-CATCHUP_THRESHOLD = 0.03    # bounded playhead nudge only when gap exceeds this (s)
+CATCHUP_THRESHOLD = 0.06    # bounded playhead nudge only when gap exceeds this (s)
 CATCHUP_STEP      = 0.005   # max nudge per audio block while catching up (s)
+
+# PLL error smoothing. The error seen by the rate controller is the raw
+# difference between the (block-quantized) local playhead and the
+# NTP-derived reference, which carries tens of ms of reference jitter and a
+# +-half-block sawtooth. Fed straight into the PI, that noise saturates the
+# +-0.2% pitch clamp on almost every block and the loop limit-cycles at
+# +-MAX_PITCH (audible as a slow, constant speed wobble). So the pitch
+# controller runs on a low-passed error instead; the EMA weight is per
+# callback (~tau 0.6s at 5 Hz blocks).
+PLL_ALPHA     = 0.3         # PLL error EMA weight (0..1, higher = faster)
+INT_UNWIND    = 0.85        # per-callback integrator unwind when error is tiny
+INT_LIMIT     = 0.02        # integrator state clip (x PITCH_INT = <=400ppm)
 
 
 def ts():

@@ -122,6 +122,7 @@ class SyncedServer:
         self.stream = None          # PortAudio stream (opened in _play)
         self.local_pos = 0.0        # local playhead (seconds) in current song
         self._pitch_int = 0.0       # drift PI integrator state
+        self.err_f = 0.0            # low-passed PLL error (EMA of callback err)
         self._fade_out = False      # set by close_audio -> callback fades to silence
 
         # Startup playback: resume exactly where the previous run left off —
@@ -216,6 +217,7 @@ class SyncedServer:
         self.local_pos = self.seek
         self.playing = True
         self._pitch_int = 0.0      # fresh track: fresh alignment state
+        self.err_f = 0.0
         # Publish the song ref LAST: the audio callback reads it without the
         # lock, so it either sees the fully-updated old state or the fully-
         # updated new state (at most one torn block at a track swap).
@@ -562,20 +564,32 @@ class SyncedServer:
             return
         target = C.ts() - self.song_start
         err = target - self.local_pos
+        # Low-pass the error (same as the client): the raw err carries the
+        # half-block sawtooth from local_pos stepping once per block and, on
+        # a client, reference jitter — enough to slam the ±0.2% pitch clamp
+        # every block and start a limit cycle. Drive the controller from the
+        # smoothed error.
+        self.err_f += C.PLL_ALPHA * (err - self.err_f)
+        ef = self.err_f
         # Bounded fast catch-up (same as the client): recovers from a server
         # stall or a fresh resume in a few blocks instead of a slow pitch
-        # slew that would take tens of seconds.
-        if abs(err) > C.CATCHUP_THRESHOLD:
-            self.local_pos += C.CATCHUP_STEP if err > 0 else -C.CATCHUP_STEP
+        # slew that would take tens of seconds. Gated on the smoothed error.
+        if abs(ef) > C.CATCHUP_THRESHOLD:
+            self.local_pos += C.CATCHUP_STEP if ef > 0 else -C.CATCHUP_STEP
             err = target - self.local_pos
-        # gentle PI drift controller (server is its own clock, so no FF)
-        if abs(err) > C.DRIFT_HYSTERESIS:
-            self._pitch_int += err
+        # gentle PI drift controller on the smoothed error (server is its own
+        # clock, so no FF); tight integrator clip + fast unwind so a stale
+        # windup can't keep the pitch pinned at ±MAX_PITCH
+        if abs(ef) > C.DRIFT_HYSTERESIS:
+            self._pitch_int += max(-C.INT_LIMIT, min(C.INT_LIMIT, ef))
+            # integral pulling against the error: unwind it now
+            if self._pitch_int * ef < 0.0:
+                self._pitch_int *= 0.5
         else:
-            self._pitch_int *= C.INT_LEAK
-        self._pitch_int = max(-0.05, min(0.05, self._pitch_int))
+            self._pitch_int *= C.INT_UNWIND
+        self._pitch_int = max(-C.INT_LIMIT, min(C.INT_LIMIT, self._pitch_int))
         pitch = max(-C.MAX_PITCH, min(C.MAX_PITCH,
-                    err * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT))
+                    ef * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT))
         rate = 1.0 + pitch
         idx = max(0.0, self.local_pos * song.sr)
         n = len(song.data)
@@ -712,6 +726,7 @@ class SyncedServer:
             if self.playing:
                 self.song_start = C.ts() - self.local_pos
             self._pitch_int = 0.0      # pause/resume invalidates old windup
+            self.err_f = 0.0           # (and the smoothed PLL error)
             self._persist_playback()
         return self.playing
 
@@ -724,6 +739,7 @@ class SyncedServer:
             self.song_start = C.ts()
             self.playing = False
             self._pitch_int = 0.0      # fresh alignment on the next play
+            self.err_f = 0.0
             self._persist_playback()
         return self.playing
 

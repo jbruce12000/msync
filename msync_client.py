@@ -218,7 +218,8 @@ class SyncClient:
         self.server_song_start = 0.0   # server wall time song started
         self.local_pos = 0.0           # local playhead (seconds)
         self.drift_pitch = 0.0         # current applied pitch from PLL
-        self._pitch_int = 0.0          # PI integrator state (anti-windup leak)
+        self._pitch_int = 0.0          # PI integrator state (tight clip + fast unwind)
+        self.err_f = 0.0               # low-passed PLL error (EMA of callback err)
         self.err_smooth = 0.0          # rolling avg of callback-boundary error
         self.queue = []                # server queue (names), from TYPE_STATE
         self.queue_size = 0            # from TYPE_SYNC (cheap field)
@@ -314,28 +315,46 @@ class SyncClient:
             # target position per estimated server clock
             target = max(0.0, self.clock.server_now() - self.server_song_start)
             err = target - self.local_pos
+            # Low-pass the error for the rate controller: the raw error
+            # carries tens of ms of NTP reference jitter plus a half-block
+            # sawtooth from local_pos stepping once per block. Fed straight
+            # into the PI, that noise saturates the ±0.2% pitch clamp on
+            # nearly every block and the actuator limit-cycles at ±MAX_PITCH
+            # (an audible slow speed wobble). Drive the loop from the
+            # smoothed error instead.
+            self.err_f += C.PLL_ALPHA * (err - self.err_f)
+            ef = self.err_f
             # Bounded fast re-alignment: right after a pause/resume, a busy
             # server stall, or a seek, a rate-only PLL capped at MAX_PITCH
             # would take tens of seconds to close a large gap. Nudge the
             # playhead toward the target by a few ms per block instead (a
-            # sub-block skip/repeat that is effectively inaudible).
-            if abs(err) > C.CATCHUP_THRESHOLD:
-                self.local_pos += C.CATCHUP_STEP if err > 0 else -C.CATCHUP_STEP
+            # sub-block skip/repeat that is effectively inaudible). Gated on
+            # the smoothed error so reference jitter can't trip it.
+            if abs(ef) > C.CATCHUP_THRESHOLD:
+                self.local_pos += C.CATCHUP_STEP if ef > 0 else -C.CATCHUP_STEP
                 err = target - self.local_pos
-            # PI drift controller: feedforward from NTP-measured clock drift,
-            # plus small proportional+integral correction for residual error.
-            if abs(err) > C.DRIFT_HYSTERESIS:
-                self._pitch_int += err
+            # PI drift controller on the smoothed error: feedforward from
+            # NTP-measured clock drift, plus small proportional+integral
+            # correction for residual error. The integrator clip is tight
+            # (INT_LIMIT ≈ 400ppm authority) and it unwinds quickly
+            # (INT_UNWIND), so a stale windup cannot keep the pitch pinned
+            # at ±MAX_PITCH.
+            if abs(ef) > C.DRIFT_HYSTERESIS:
+                self._pitch_int += np.clip(ef, -C.INT_LIMIT, C.INT_LIMIT)
+                # integral pulling against the error: unwind it now, not
+                # slowly over the next several seconds
+                if self._pitch_int * ef < 0.0:
+                    self._pitch_int *= 0.5
             else:
-                self._pitch_int *= C.INT_LEAK
-            self._pitch_int = np.clip(self._pitch_int, -0.05, 0.05)
+                self._pitch_int *= C.INT_UNWIND
+            self._pitch_int = np.clip(self._pitch_int, -C.INT_LIMIT, C.INT_LIMIT)
             ff = self.clock.drift * 1e-6                      # s/s from NTP
             self.drift_pitch = float(np.clip(
-                ff + err * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT,
+                ff + ef * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT,
                 -C.MAX_PITCH, C.MAX_PITCH))
             rate = 1.0 + self.drift_pitch
             # Status metric: smooth the CALLBACK-boundary error (the quantity
-            # the PLL drives to zero). An instantaneous sample taken between
+            # the PLL chases). An instantaneous sample taken between
             # callbacks is meaningless — local_pos only steps once per block,
             # so it reads up to ±one block of sawtooth even when the music is
             # perfectly aligned.
@@ -440,8 +459,11 @@ class SyncClient:
                                              self.clock.server_now() - song_start)
                     # A fresh rebase (or a long pause) invalidates the old
                     # integral: stale windup keeps drift_pitch pinned at
-                    # ±MAX_PITCH for the wrong direction.
+                    # ±MAX_PITCH for the wrong direction. Same for the
+                    # smoothed PLL error — it must restart from the new
+                    # reference, not decay toward it.
                     self._pitch_int = 0.0
+                    self.err_f = 0.0
                     # The stream STAYS OPEN through pauses — the callback
                     # just fills silence. Restarting PortAudio re-primes the
                     # device buffer, pushing this client audibly behind the
@@ -491,6 +513,7 @@ class SyncClient:
             self.server_song_start = song_start
             self.local_pos = max(0.0, self.clock.server_now() - song_start)
             self._pitch_int = 0.0          # fresh rebase: drop stale windup
+            self.err_f = 0.0               # ... and the smoothed PLL error
             self.playing = playing
             # Publish the new buffer LAST so the callback either sees the old
             # or the new track fully initialised, never a partial one.
