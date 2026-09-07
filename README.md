@@ -40,6 +40,8 @@ few milliseconds even across Wi-Fi.
   same network.
 - **Play queue** — build a custom set on the fly; queue individual tracks or
   whole albums from the web UI, any client console, or the HTTP API.
+- **Party mode** — one click in the web UI shuffles your whole collection and
+  drops 50 random tracks into the queue — hours of music, zero decisions.
 - **Album & tag support** — reads audio tags (artist, album, track number,
   title) automatically; groups tracks into albums for easy browsing.
 - **Auto-discovery** — new or removed files are picked up while the server
@@ -269,7 +271,9 @@ The page shows:
 - **Now Playing** — current track, progress bar, and playback controls.
 - **Library** — your entire local music collection, grouped by album, with
   a search box to filter by song title, artist, or album name.
-- **Queue** — the upcoming play queue with reorder and remove controls.
+- **Queue** — the upcoming play queue with reorder, remove, clear, and
+  **Party** controls. Party mode shuffles your entire collection and queues 50
+  random tracks with one click.
 - **Configure** — every room running a client, with a per-room slider (and a
   typed value box) for how far that room plays ahead of or behind the sync
   timeline — applied instantly and saved in the server's database. Most
@@ -321,6 +325,10 @@ There are several easy ways to add to the queue:
   `add *.wav`) or `add "Album Name"` to queue a whole album.
 - **In the web UI**: click **+ queue** on any track or album, or remove
   items with the ✕ button.
+- **Party mode**: click the **🎉 Party** button in the web UI's Queue panel
+  to shuffle your entire collection and queue 50 random tracks — perfect when
+  you just want non-stop music. If your library has fewer than 50 tracks,
+  everything gets queued; tracks already in the queue are skipped.
 - **From a client console**: `add "my song.mp3"` or `add "Album Name"`.
 - **Over the network from any machine** (great for guests!):
   ```

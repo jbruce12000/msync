@@ -71,9 +71,17 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 .panel-header h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); flex-shrink: 0; }
 .panel-header .count { font-size: 11px; color: var(--muted); }
 .search-box { flex: 1; position: relative; }
-.search-box input { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 4px 8px 4px 24px; border-radius: 4px; font-size: 12px; outline: none; font-family: inherit; }
+.search-box input { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 4px 28px 4px 24px; border-radius: 4px; font-size: 12px; outline: none; font-family: inherit; }
 .search-box input:focus { border-color: var(--accent); }
-.search-box svg { position: absolute; left: 6px; top: 50%; transform: translateY(-50%); color: var(--muted); }
+.search-box .search-icon { position: absolute; left: 6px; top: 50%; transform: translateY(-50%); color: var(--muted); pointer-events: none; }
+.search-clear { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--muted); font-size: 12px; line-height: 1; padding: 3px 6px; border-radius: 4px; cursor: pointer; opacity: 0; pointer-events: none; transition: opacity 0.15s; }
+.search-clear:hover { color: var(--text); background: var(--border); }
+.search-clear.show { opacity: 1; pointer-events: auto; }
+.head-btn { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 11px; font-family: inherit; padding: 4px 6px; border-radius: 4px; flex-shrink: 0; transition: all 0.15s; }
+.head-btn:hover { color: var(--text); background: var(--border); }
+.head-btn.accent { color: var(--accent); }
+.head-btn.accent:hover { color: var(--accent); }
+.head-btn[disabled] { opacity: 0.5; cursor: default; }
 
 .scroll { flex: 1; overflow-y: auto; padding: 4px 0; }
 .scroll::-webkit-scrollbar { width: 6px; }
@@ -86,7 +94,11 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 .track-item .num { color: var(--muted); font-size: 11px; min-width: 20px; text-align: right; font-variant-numeric: tabular-nums; }
 .track-item .name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .track-item .name .album-label { color: var(--muted); font-size: 11px; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.track-item .badge { font-size: 10px; padding: 1px 5px; border-radius: 3px; background: var(--border); color: var(--muted); }
+/* Play / queue action buttons on tracks and album headers */
+.track-item .badge,
+.album-group-header .badge { font-size: 10px; padding: 1px 5px; border-radius: 3px; background: var(--border); color: var(--muted); cursor: pointer; user-select: none; flex-shrink: 0; }
+.track-item .badge:hover,
+.album-group-header .badge:hover { background: var(--accent); color: #fff; }
 
 /* Album groups */
 .album-group { margin-bottom: 2px; }
@@ -128,6 +140,37 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
     .panel-right { flex: 1 1 42%; }
     .now-playing .progress { max-width: none; }
 }
+
+/* ── Touch devices (phones & tablets): larger, always-visible targets ─ */
+@media (hover: none) and (pointer: coarse) {
+    .track-item,
+    .album-group-header,
+    .queue-item { padding-top: 12px; padding-bottom: 12px; }
+    .track-item .badge,
+    .album-group-header .badge {
+        min-width: 44px; min-height: 40px;
+        font-size: 17px;
+        padding: 6px 10px;
+        display: inline-flex; align-items: center; justify-content: center;
+        border-radius: 8px;
+    }
+    .queue-item .remove {
+        opacity: 1;   /* touch screens have no hover to reveal the button */
+        font-size: 18px;
+        padding: 6px 12px;
+        border-radius: 8px;
+        background: var(--border);
+    }
+    .search-clear {
+        font-size: 18px;
+        padding: 6px 10px;
+        border-radius: 8px;
+    }
+    .head-btn {
+        font-size: 16px;
+        padding: 8px 12px;
+    }
+}
 </style>
 </head>
 <body>
@@ -167,8 +210,9 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
             <h2>Library</h2>
             <span class="count" id="lib-count"></span>
             <div class="search-box">
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M11.5 7a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0Zm-.82 4.74a6 6 0 1 1 1.06-1.06l3.04 3.04a.75.75 0 1 1-1.06 1.06l-3.04-3.04Z"/></svg>
+                <svg class="search-icon" width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M11.5 7a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0Zm-.82 4.74a6 6 0 1 1 1.06-1.06l3.04 3.04a.75.75 0 1 1-1.06 1.06l-3.04-3.04Z"/></svg>
                 <input type="text" id="search" placeholder="Search songs or albums…" autocomplete="off">
+                <button class="search-clear" id="search-clear" type="button" onclick="clearSearch()" title="Clear search" aria-label="Clear search">✕</button>
             </div>
         </div>
         <div class="scroll" id="library"></div>
@@ -177,7 +221,8 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
         <div class="panel-header">
             <h2>Queue</h2>
             <span class="count" id="queue-count"></span>
-            <button class="controls" onclick="queueClear()" style="margin-left:auto;border:none;background:none;color:var(--muted);cursor:pointer;font-size:11px;" title="Clear queue">clear</button>
+            <button class="head-btn accent" id="btn-party" onclick="partyMode()" title="Add 50 random songs to the queue" style="margin-left:auto;">🎉 Party</button>
+            <button class="head-btn" onclick="queueClear()" title="Clear queue">clear</button>
         </div>
         <div class="scroll" id="queue"></div>
     </div>
@@ -402,6 +447,34 @@ function volumeAdjust(delta) { api('POST', `/api/control/volume?delta=${delta}`)
 function playSong(name) { api('POST', `/api/control/play`, { name }); }
 function queueAdd(name) { api('POST', '/api/queue/add', { name }); }
 function queueClear() { api('POST', '/api/queue/clear'); }
+
+// Party mode: shuffle the whole collection and dump 50 random tracks (or all,
+// if the library is smaller) into the queue in one request.
+async function partyMode() {
+    const all = library.songs || [];
+    if (!all.length) return;
+    const btn = document.getElementById('btn-party');
+    btn.disabled = true;
+    btn.textContent = 'Adding…';
+    try {
+        const names = pickRandom(all, 50);
+        const d = await api('POST', '/api/queue/add', { names });
+        if (!d.error) await fetchState();   // refresh the queue list
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '🎉 Party';
+    }
+}
+
+// Fisher–Yates shuffle, then take the first n (picks without replacement).
+function pickRandom(arr, n) {
+    const a = arr.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a.length <= n ? a : a.slice(0, n);
+}
 async function queueRemove(index) {
     const d = await api('DELETE', `/api/queue/remove?index=${index}`);
     if (d.error || d.removed === undefined) return;
@@ -623,7 +696,24 @@ function renderQueue() {
 }
 
 // ── Search ───────────────────────────────────────────────────────────
-document.getElementById('search').addEventListener('input', renderLibrary);
+// Show the ✕ clear button only while the box has text.
+function updateClearBtn() {
+    const box = document.getElementById('search');
+    document.getElementById('search-clear').classList.toggle('show', box.value.length > 0);
+}
+
+function clearSearch() {
+    const box = document.getElementById('search');
+    box.value = '';
+    updateClearBtn();
+    renderLibrary();
+    box.focus();
+}
+
+document.getElementById('search').addEventListener('input', () => {
+    updateClearBtn();
+    renderLibrary();
+});
 
 // ── Polling ──────────────────────────────────────────────────────────
 async function tick() {
