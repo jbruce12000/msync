@@ -141,15 +141,21 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
     .now-playing .progress { max-width: none; }
 }
 
-/* ── Touch devices (phones & tablets): larger, always-visible targets ─ */
-@media (hover: none) and (pointer: coarse) {
+/* ── Touch/tablet (phone & tablet): larger, spaced, always-visible targets ─ */
+@media (max-width: 1024px), (hover: none) and (pointer: coarse) {
     .track-item,
     .album-group-header,
     .queue-item { padding-top: 12px; padding-bottom: 12px; }
+    .track-item,
+    .queue-item { gap: 12px; }
+    .album-group-header { gap: 10px; }
+    .album-group-header .badge + .badge { margin-left: 6px; }
+    .controls button,
+    .controls button.play-btn { width: 44px; height: 44px; font-size: 20px; }
     .track-item .badge,
     .album-group-header .badge {
-        min-width: 44px; min-height: 40px;
-        font-size: 17px;
+        min-width: 48px; min-height: 44px;
+        font-size: 19px;
         padding: 6px 10px;
         display: inline-flex; align-items: center; justify-content: center;
         border-radius: 8px;
@@ -170,6 +176,47 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
         font-size: 16px;
         padding: 8px 12px;
     }
+}
+
+/* ── Embiggen: bigger text on tablets & phones ─────────────────────── */
+@media (max-width: 820px), (hover: none) and (pointer: coarse) {
+    .now-playing .title { font-size: 17px; }
+    .now-playing .album { font-size: 13px; }
+    .now-playing .time { font-size: 12px; }
+    .volume span { font-size: 13px; }
+    .tab { font-size: 13px; }
+    .panel-header h2 { font-size: 13px; }
+    .panel-header .count { font-size: 12px; }
+    .search-box input { font-size: 14px; }
+    .track-item { font-size: 17px; }
+    .track-item .num { font-size: 13px; }
+    .track-item .name .album-label { font-size: 13px; }
+    .album-group-header { font-size: 16px; }
+    .album-group-header .arrow { font-size: 13px; }
+    .album-group-header .album-count { font-size: 13px; }
+    .queue-item { font-size: 17px; }
+    .queue-item .idx { font-size: 13px; }
+    .queue-item .remove { font-size: 18px; }
+    .empty { font-size: 14px; }
+    .empty-state { font-size: 14px; }
+    .configure h3 { font-size: 14px; }
+    .client-row .client-name { font-size: 16px; }
+    .client-row .client-ip { font-size: 13px; }
+    .client-row .client-status { font-size: 12px; }
+    .client-row .client-err { font-size: 12px; }
+    .slider-row .lat-num { font-size: 13px; }
+    .slider-row .lat-num input[type=number] { font-size: 15px; }
+    .slider-centre { font-size: 12px; }
+    .slider-row .lat-unit { font-size: 13px; }
+    .head-btn { font-size: 16px; }
+}
+/* Extra legibility on phones */
+@media (max-width: 640px) {
+    .search-box input { font-size: 16px; }   /* ≥16px stops iOS auto-zoom on focus */
+    .track-item { font-size: 18px; }
+    .track-item .num { font-size: 14px; }
+    .queue-item { font-size: 18px; }
+    .album-group-header { font-size: 17px; }
 }
 </style>
 </head>
