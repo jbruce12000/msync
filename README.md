@@ -57,27 +57,73 @@ few milliseconds even across Wi-Fi.
 - The machines on the same network (Wi-Fi is fine).
 - Some music (mp3, ogg, wav, flac, m4a, aac, opus, wma).
 
-## One-time install (only once, on each machine)
+## One-time install (once, on each machine)
 
-```bash
-cd msync
+msync runs as auto-starting **systemd services**: `msync-server` on the DJ
+machine, `msync-client` on every other machine. Two installer scripts do the
+whole job — they create `./venv`, install the dependencies
+(`pip install -r requirements.txt`), register the service, and start it:
 
-# 1. Create an environment and install the dependencies
-python3 -m venv venv
-./venv/bin/pip install -r requirements.txt
+- **On the server (the DJ machine, where the music lives):**
+  ```bash
+  cd msync
+  sudo ./install-msync-server-service.sh
+  ```
+- **On each client machine:**
+  ```bash
+  cd msync
+  sudo ./install-msync-client-service.sh
+  ```
 
-# if python3 -m venv fails on your system, use:
-#   virtualenv -p python3 venv && ./venv/bin/pip install -r requirements.txt
-```
+The scripts are safe to re-run — they update the service in place and
+restart it, which is also how you apply later changes to `config.py`.
 
-Then activate the environment in every terminal you'll use:
+### config.py — set your values first
 
-```bash
-source venv/bin/activate
-```
+Open `config.py` (next to the scripts) and make sure the values match your
+setup **before** installing. The installer reads it; every machine must
+agree on the sync port, and each client must know the server's IP:
+
+- **`MUSIC_DIR`** — where the music lives (default `./music`); set on the
+  **server**.
+- **`SERVER`** — the **server's** IP address, e.g. `10.0.0.2`; set on
+  **every client**.
+- **`DEFAULT_PORT`** — the UDP sync port (default **9770**); must be the
+  same on every machine. The web UI port is `DEFAULT_PORT + HTTP_PORT_OFFSET`
+  (default **10770**).
+- **`DB_PATH`** — where the server stores its catalog and each room's
+  latency settings (default `./msync.db`).
+- **`OUTPUT_LATENCY_MS`** — optional fallback for a client whose audio path
+  is slow (default `0`); you normally set each room's offset from the web
+  UI's Configure tab instead.
+
+(Alternatively set the matching `MSYNC_*` environment variables —
+`MSYNC_SERVER`, `MSYNC_MUSIC_DIR`, `MSYNC_DEFAULT_PORT`, `MSYNC_DB_PATH` —
+which override config.py. After changing anything, re-run the installer to
+apply.)
 
 > Ubuntu/Debian may also need `sudo apt install libportaudio2` (the sound
 > library the client/server use).
+
+### Starting / stopping / restarting
+
+- **Restart the server** (e.g. after pulling updated code):
+  ```bash
+  sudo systemctl restart msync-server
+  ```
+- **Restart a client**:
+  ```bash
+  sudo systemctl restart msync-client
+  ```
+- Check status, or start/stop manually:
+  ```bash
+  systemctl status msync-client        # or msync-server
+  sudo systemctl stop msync-client     # / start / enable / disable
+  ```
+- Watch what's happening (state, sync quality, errors):
+  ```bash
+  journalctl -u msync-client -f        # or msync-server; -f follows live
+  ```
 
 ## Playing music — 3 steps
 
@@ -112,19 +158,20 @@ python3 make_test_music.py          # 3 demo singles
 python3 make_test_music.py --with-albums   # add 2 sample albums too
 ```
 
-### 2. Start the server (the DJ machine)
+### 2. Install the server service (the DJ machine)
+
+With your music in place and `config.py` set (`MUSIC_DIR`, `DEFAULT_PORT`),
+run:
 
 ```bash
-python3 msync_server.py
+cd msync
+sudo ./install-msync-server-service.sh
 ```
 
-(It defaults to the `music` folder; point it elsewhere with
-`python3 msync_server.py /path/to/music` or `MSYNC_MUSIC_DIR=/path` — see
-"Configuration" below.)
-
-You'll see it start playing the first song and print its ports. That machine
-is now the DJ — it plays out loud itself, coordinates everyone else, and
-serves the web UI:
+The installer creates `./venv`, installs the dependencies, and registers and
+starts the `msync-server` service. That machine is now the DJ — it plays out
+loud itself, coordinates everyone else, and serves the web UI. Its startup
+looks like this (view it with `journalctl -u msync-server -f`):
 
 ```
 [server] UDP sync on port 9770
@@ -132,30 +179,42 @@ serves the web UI:
 [server] web UI: http://<server-ip>:10770/
 ```
 
-### 3. Start a client on every other machine
+### 3. Install the client service on every other machine
+
+On each other machine, make sure `config.py`'s `SERVER` is set to the DJ
+machine's IP (e.g. `10.0.0.2`), then run:
 
 ```bash
-python3 msync_client.py --server 192.168.1.50
+cd msync
+sudo ./install-msync-client-service.sh
 ```
 
-(Use the IP address of the DJ machine.) Each client downloads the current
-song and joins the party. Start more clients on more machines — there's no
-limit. The client prints a status line every couple of seconds showing the
-sync quality:
+The installer creates `./venv`, installs the dependencies, and registers and
+starts the `msync-client` service. Each client downloads the current song
+and joins the party — there's no limit on how many. Its logs
+(`journalctl -u msync-client -f`) show a status line every couple of seconds
+with the sync quality:
 
 ```
 [client] playing  song=track_01_A440.wav  pos=  7.71s  target=  7.77s  err=    +0ms ...
 ```
 
 `err` is how far off the machine is from the DJ — a handful of milliseconds
-or less is excellent. Clients can also pick tracks themselves (see below).
+or less is excellent.
+
+> Prefer a quick manual run for development/testing (no systemd, output on
+> your terminal)? Install the deps once with `python3 -m venv venv &&
+> ./venv/bin/pip install -r requirements.txt`, then run
+> `./venv/bin/python msync_server.py` on the DJ machine and
+> `./venv/bin/python msync_client.py --server 192.168.1.50` on a client.
 
 ---
 
 ## Controlling playback
 
 Everything is controlled from the **server** and everyone follows — from the
-server console, from any client's console, from any browser, or over HTTP.
+browser, from the server/client consoles when run in a terminal, or over
+HTTP.
 
 | Key / command | What it does |
 |---|---|
@@ -202,7 +261,9 @@ controls are right on the page, and it updates itself every second.
 
 ## Choosing tracks from a client
 
-Every client has a small console as well. While a client is running, type:
+Clients also have a small text console — use it when you launch a client
+manually in a terminal (as a systemd service it has no keyboard, so drive it
+from the web UI instead). While a client is running in a terminal, type:
 
 | command | what it does |
 |---|---|
