@@ -635,9 +635,12 @@ class SyncClient:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         print(f"[client] listening on UDP {self.port}")
 
-        # register with server (send our hostname so the web UI can name us)
-        sock.sendto(C.make_packet(C.TYPE_REGISTER, host=socket.gethostname()),
-                    (self.host, self.port))
+        # register with server (send our hostname so the web UI can name us,
+        # plus our current sync error so the Configure tab can display it)
+        sock.sendto(C.make_packet(
+            C.TYPE_REGISTER, host=socket.gethostname(),
+            err_ms=round(self.err_smooth * 1000, 1)),
+            (self.host, self.port))
 
         self.clock.exchange(sock)
         last_ntp = time.time()
@@ -681,10 +684,11 @@ class SyncClient:
                     last_ntp = now
                 if now - last_reg >= C.REGISTER_INTERVAL:
                     # Re-register so the web UI's room list stays populated
-                    # (hostname fresh, last-seen fresh) even if the server
-                    # restarted or a registration packet was lost.
+                    # (hostname fresh, last-seen fresh, sync error fresh) even
+                    # if the server restarted or a packet was lost.
                     sock.sendto(C.make_packet(
-                        C.TYPE_REGISTER, host=socket.gethostname()),
+                        C.TYPE_REGISTER, host=socket.gethostname(),
+                        err_ms=round(self.err_smooth * 1000, 1)),
                         (self.host, self.port))
                     last_reg = now
                 if now - last_state > 4.0:

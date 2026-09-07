@@ -444,6 +444,43 @@ def test_catalog_client_heartbeat_refreshes_last_seen(tmp_path):
     assert row["last_seen"] > 1000.0                # heartbeat refreshed it
 
 
+def test_catalog_client_err_ms_roundtrip(tmp_path):
+    # The Configure tab shows each room's sync error: registers carry it in,
+    # plain heartbeats must not wipe it, and a newer register replaces it.
+    c = Catalog(str(tmp_path), str(tmp_path / "c.db"))
+    c.upsert_client("10.0.0.4", "room4", err_ms=12.3)
+    row = {r["ip"]: r for r in c.list_clients()}["10.0.0.4"]
+    assert row["err_ms"] == 12.3
+    assert row["hostname"] == "room4"
+    c.upsert_client("10.0.0.4", "")                 # NTP heartbeat, no err
+    row = {r["ip"]: r for r in c.list_clients()}["10.0.0.4"]
+    assert row["err_ms"] == 12.3                     # last value preserved
+    assert row["hostname"] == "room4"                # name kept too
+    c.upsert_client("10.0.0.4", "room4", err_ms=-0.6)
+    row = {r["ip"]: r for r in c.list_clients()}["10.0.0.4"]
+    assert row["err_ms"] == -0.6
+
+
+def test_catalog_migrates_clients_err_ms(tmp_path):
+    # Databases created before err_ms reporting must gain the column on open.
+    import sqlite3
+    db = str(tmp_path / "old.db")
+    conn = sqlite3.connect(db)
+    conn.execute("""
+        CREATE TABLE clients (
+            ip TEXT PRIMARY KEY, hostname TEXT NOT NULL DEFAULT '',
+            latency_ms REAL NOT NULL DEFAULT 0, last_seen REAL NOT NULL DEFAULT 0)
+        """)
+    conn.execute("INSERT INTO clients (ip, hostname) VALUES ('10.0.0.9', 'old')")
+    conn.commit()
+    conn.close()
+    c = Catalog(str(tmp_path), db)
+    row = {r["ip"]: r for r in c.list_clients()}["10.0.0.9"]
+    assert row["err_ms"] == 0.0                      # default after migration
+    c.upsert_client("10.0.0.9", "old", err_ms=5.0)  # writable afterwards
+    assert {r["ip"]: r for r in c.list_clients()}["10.0.0.9"]["err_ms"] == 5.0
+
+
 def test_server_records_registered_client(server, client):
     # The end-to-end register path: the test client's startup TYPE_REGISTER
     # must land in the server's clients table (plus the 1 Hz NTP heartbeats
@@ -461,6 +498,24 @@ def test_client_heartbeat_re_registers(server, client):
     name = _socket.gethostname()
     wait_until(lambda: any(c["ip"] == "127.0.0.1" and c["hostname"] == name
                            for c in server.catalog.list_clients()))
+
+
+def test_server_register_reports_client_err(server):
+    # The register packet the client now sends carries its sync error; the
+    # server must store it (and hand it to the web UI via /api/clients).
+    import socket as _socket
+    for _ in range(3):
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.sendto(C.make_packet(C.TYPE_REGISTER, host="errroom", err_ms=-3.4),
+                 ("127.0.0.1", server.port))
+        s.close()
+        time.sleep(0.2)   # retries in case the server thread is mid-sleep
+    wait_until(lambda: any(c["ip"] == "127.0.0.1" and c["err_ms"] == -3.4
+                           for c in server.catalog.list_clients()))
+    d = _http(server.port + 1000, "GET", "/api/clients")
+    c = next(c for c in d["clients"] if c["ip"] == "127.0.0.1")
+    assert c["err_ms"] == -3.4
+    assert c["hostname"] == "errroom"
 
 
 def test_http_clients_list_and_set_latency(server):

@@ -899,10 +899,19 @@ class SyncedServer:
                     sock.sendto(resp, addr)
                 elif ptype == C.TYPE_REGISTER:
                     # Record the room (IP + best-effort hostname) so the web
-                    # UI can list it and store per-room latency settings.
+                    # UI can list it and store per-room latency settings. The
+                    # packet also carries the room's current sync error (the
+                    # same `err` the client prints) for the Configure tab.
                     ip = addr[0]
                     hostname = str(body.get("host") or "").strip()[:64]
-                    self.catalog.upsert_client(ip, hostname)
+                    err = None
+                    raw_err = body.get("err_ms")
+                    if raw_err is not None:
+                        try:
+                            err = float(raw_err)
+                        except (TypeError, ValueError):
+                            err = None
+                    self.catalog.upsert_client(ip, hostname, err_ms=err)
                     sock.sendto(C.make_packet(C.TYPE_WELCOME,
                                               **self._sync_payload()), addr)
                     # Push this room's stored output-latency offset (0 if

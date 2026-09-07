@@ -52,6 +52,7 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 .client-row .client-status { margin-left: auto; font-size: 11px; color: var(--muted); }
 .client-row .client-status.online { color: var(--green); }
 .client-row .client-status.offline { color: var(--red); }
+.client-row .client-err { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; cursor: help; }
 .slider-row { display: flex; align-items: center; gap: 14px; }
 .slider-row input[type=range] { flex: 1; -webkit-appearance: none; height: 4px; border-radius: 2px; background: var(--border); outline: none; }
 .slider-row input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: var(--accent); cursor: pointer; border: none; }
@@ -244,6 +245,16 @@ function clientStatus(c) {
     return fresh ? 'online' : 'offline';
 }
 
+// Live sync-error badge: the same `err` the client prints, in ms. Hidden
+// (dashed) when the room is offline so a stale number isn't misleading.
+function errText(c, status) {
+    if (status === 'offline') return 'err –';
+    const v = c.err_ms;
+    if (typeof v !== 'number' || !isFinite(v)) return 'err –';
+    const sign = v >= 0 ? '+' : '';
+    return 'err ' + sign + (Math.round(Math.abs(v) * 10) / 10).toFixed(1) + ' ms';
+}
+
 function renderClients() {
     const el = document.getElementById('configure');
     if (!clients.length) {
@@ -265,6 +276,8 @@ function renderClients() {
             <div class="client-head">
                 <span class="client-name">${esc(name)}</span>
                 <span class="client-ip">${esc(c.ip)}</span>
+                <span class="client-err" id="err-${key}"
+                    title="Sync error: how far this room's playback is from the server timeline (updates on each 10 s re-register)">${errText(c, status)}</span>
                 <span class="client-status ${status}" id="status-${key}">● ${status}</span>
             </div>
             <div class="slider-row">
@@ -305,13 +318,18 @@ function updateClientRows() {
         if (num && document.activeElement !== num &&
             String(num.value || 0) !== String(lat)) num.value = lat;
         const st = document.getElementById('status-' + key);
+        const fresh = (c.last_seen > 0) && (now - c.last_seen) < 15;
+        const cls = fresh ? 'online' : 'offline';
         if (st) {
-            const fresh = (c.last_seen > 0) && (now - c.last_seen) < 15;
-            const cls = fresh ? 'online' : 'offline';
             if (st.textContent !== '● ' + cls) {
                 st.className = 'client-status ' + cls;
                 st.textContent = '● ' + cls;
             }
+        }
+        const er = document.getElementById('err-' + key);
+        if (er) {
+            const txt = errText(c, cls);
+            if (er.textContent !== txt) er.textContent = txt;
         }
     }
 }

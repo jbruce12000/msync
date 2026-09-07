@@ -138,23 +138,43 @@ class Catalog:
                     ip          TEXT PRIMARY KEY,   -- 10.0.0.4
                     hostname    TEXT NOT NULL DEFAULT '',
                     latency_ms  REAL NOT NULL DEFAULT 0,  -- output offset
+                    err_ms      REAL NOT NULL DEFAULT 0,  -- sync error reported
                     last_seen   REAL NOT NULL DEFAULT 0
                 )""")
+            # Migrate databases created before per-client sync-error reporting.
+            cols = {r[1] for r in
+                    self._conn.execute("PRAGMA table_info(clients)")}
+            if "err_ms" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE clients ADD COLUMN err_ms REAL NOT NULL "
+                    "DEFAULT 0")
 
     # ------------------------------------------------------------------ #
     # Clients (rooms)                                                     #
     # ------------------------------------------------------------------ #
-    def upsert_client(self, ip, hostname, last_seen=None):
+    def upsert_client(self, ip, hostname, last_seen=None, err_ms=None):
         """Record a client heartbeat (hostname is best-effort - a client may
-        not send one), keeping any latency setting already stored."""
+        not send one), keeping any latency setting already stored. err_ms is
+        the room's just-reported playback sync error; None (e.g. plain NTP
+        heartbeats) keeps the last reported value."""
+        at = last_seen if last_seen is not None else time.time()
         with self._conn:
-            self._conn.execute("""
-                INSERT INTO clients (ip, hostname, latency_ms, last_seen)
-                VALUES (?, ?, 0, ?)
-                ON CONFLICT(ip) DO UPDATE SET
-                    last_seen = excluded.last_seen
-                """, (ip, hostname, last_seen if last_seen is not None
-                      else time.time()))
+            if err_ms is None:
+                self._conn.execute("""
+                    INSERT INTO clients (ip, hostname, latency_ms, last_seen)
+                    VALUES (?, ?, 0, ?)
+                    ON CONFLICT(ip) DO UPDATE SET
+                        last_seen = excluded.last_seen
+                    """, (ip, hostname, at))
+            else:
+                self._conn.execute("""
+                    INSERT INTO clients (ip, hostname, latency_ms, err_ms,
+                                         last_seen)
+                    VALUES (?, ?, 0, ?, ?)
+                    ON CONFLICT(ip) DO UPDATE SET
+                        last_seen = excluded.last_seen,
+                        err_ms    = excluded.err_ms
+                    """, (ip, hostname, err_ms, at))
             if hostname:
                 self._conn.execute("""
                     UPDATE clients SET hostname = ? WHERE ip = ?
@@ -175,12 +195,12 @@ class Catalog:
                 """, (ip, ms, time.time()))
 
     def list_clients(self):
-        """Every known client: ip, hostname, latency_ms, last_seen."""
+        """Every known client: ip, hostname, latency_ms, err_ms, last_seen."""
         rows = self._conn.execute("""
-            SELECT ip, hostname, latency_ms, last_seen FROM clients
+            SELECT ip, hostname, latency_ms, err_ms, last_seen FROM clients
             ORDER BY hostname, ip""").fetchall()
         return [{"ip": r[0], "hostname": r[1], "latency_ms": r[2],
-                 "last_seen": r[3]} for r in rows]
+                 "err_ms": r[3], "last_seen": r[4]} for r in rows]
 
     def _album_of(self, relpath):
         parts = relpath.split("/")
