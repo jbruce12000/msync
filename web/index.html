@@ -36,6 +36,31 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 .panel-left { flex: 1; border-right: 1px solid var(--border); }
 .panel-right { width: 300px; }
 
+/* Tabs */
+.tabbar { display: flex; gap: 4px; padding: 6px 12px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.tab { background: none; border: 1px solid transparent; color: var(--muted); padding: 4px 12px; border-radius: 5px; cursor: pointer; font-size: 12px; font-family: inherit; }
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent); border-color: var(--border); background: var(--bg); font-weight: 600; }
+
+/* Configure tab content */
+.configure { padding: 16px; overflow-y: auto; }
+.configure h3 { font-size: 13px; margin: 12px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.client-row { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; }
+.client-row .client-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+.client-row .client-name { font-size: 15px; font-weight: 600; }
+.client-row .client-ip { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.client-row .client-status { margin-left: auto; font-size: 11px; color: var(--muted); }
+.client-row .client-status.online { color: var(--green); }
+.client-row .client-status.offline { color: var(--red); }
+.slider-row { display: flex; align-items: center; gap: 14px; }
+.slider-row input[type=range] { flex: 1; -webkit-appearance: none; height: 4px; border-radius: 2px; background: var(--border); outline: none; }
+.slider-row input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: var(--accent); cursor: pointer; border: none; }
+.slider-row input[type=range]::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: var(--accent); cursor: pointer; border: none; }
+.slider-row .lat-val { min-width: 70px; text-align: right; font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--accent); }
+.slider-row .lat-unit { font-size: 12px; color: var(--muted); }
+.slider-centre { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-top: 2px; }
+.empty-state { color: var(--muted); text-align: center; padding: 24px; font-size: 12px; }
+
 .panel-header { padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .panel-header h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); flex-shrink: 0; }
 .panel-header .count { font-size: 11px; color: var(--muted); }
@@ -123,8 +148,14 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
     </div>
 </div>
 
-<!-- Library + Queue -->
-<div class="main">
+<!-- Tab bar -->
+<div class="tabbar">
+    <button class="tab active" data-tab="play" onclick="setTab('play')">Play</button>
+    <button class="tab" data-tab="config" onclick="setTab('config')">Configure</button>
+</div>
+
+<!-- Play view: Library + Queue -->
+<div class="main" id="view-play">
     <div class="panel panel-left">
         <div class="panel-header">
             <h2>Library</h2>
@@ -146,6 +177,11 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
     </div>
 </div>
 
+<!-- Configure view: per-room latency -->
+<div class="main" id="view-config" style="display:none;">
+    <div class="configure" id="configure"></div>
+</div>
+
 <script>
 let state = { queue: [], now_playing: null, paused: false, volume: 100, elapsed: 0, duration: 0 };
 let library = { songs: [], albums: [], singles: [] };
@@ -160,6 +196,87 @@ async function api(method, path, body) {
         const r = await fetch(path, opts);
         return await r.json();
     } catch(e) { return { error: e.message }; }
+}
+
+// ── Tabs ─────────────────────────────────────────────────────────────
+let currentTab = 'play';
+function setTab(name) {
+    currentTab = name;
+    document.querySelectorAll('.tab').forEach(b =>
+        b.classList.toggle('active', b.dataset.tab === name));
+    document.getElementById('view-play').style.display = name === 'play' ? '' : 'none';
+    document.getElementById('view-config').style.display = name === 'config' ? '' : 'none';
+    if (name === 'config') fetchClients();
+}
+
+// ── Configure: per-room latency ──────────────────────────────────────
+let clients = [];
+async function fetchClients() {
+    const d = await api('GET', '/api/clients');
+    if (d.error) return;
+    // Preserve any in-progress drag values so polling doesn't reset them.
+    for (const c of d.clients || []) {
+        const el = document.getElementById('slider-' + c.ip.replace(/\./g, '_'));
+        if (el && el.dataset.dragging === '1') c.latency_ms = parseFloat(el.value);
+    }
+    clients = d.clients || [];
+    renderClients();
+}
+
+function clientStatus(c) {
+    const now = Date.now() / 1000;
+    const fresh = (c.last_seen > 0) && (now - c.last_seen) < 15;
+    return fresh ? 'online' : 'offline';
+}
+
+function renderClients() {
+    const el = document.getElementById('configure');
+    if (!clients.length) {
+        el.innerHTML = '<div class="empty-state">No clients have connected yet. Start the msync client on a room and it will appear here.</div>';
+        return;
+    }
+    let html = '<h3>Rooms / output-latency offset</h3>' +
+        '<div class="empty-state" style="padding:8px 0 16px;">' +
+        'Set how many ms each room must play <b>ahead</b> of the sync timeline to ' +
+        'line up with the others (negative = behind). Applied live and saved to the database.</div>';
+    for (const c of clients) {
+        const id = 'slider-' + c.ip.replace(/\./g, '_');
+        const status = clientStatus(c);
+        const name = c.hostname || c.ip;
+        const lat = Math.round(c.latency_ms || 0);
+        html += `
+        <div class="client-row">
+            <div class="client-head">
+                <span class="client-name">${esc(name)}</span>
+                <span class="client-ip">${esc(c.ip)}</span>
+                <span class="client-status ${status}">● ${status === 'online' ? 'online' : 'offline'}</span>
+            </div>
+            <div class="slider-row">
+                <span style="font-size:11px;color:var(--muted)">-1000</span>
+                <input type="range" id="${id}" min="-1000" max="1000" step="1" value="${lat}"
+                    oninput="latSliderInput('${esc(c.ip)}', this)"
+                    onchange="latSliderCommit('${esc(c.ip)}', this)"
+                    onmousedown="this.dataset.dragging='1'" onmouseup="this.dataset.dragging='0'" ontouchstart="this.dataset.dragging='1'" ontouchend="this.dataset.dragging='0'">
+                <span style="font-size:11px;color:var(--muted)">+1000</span>
+                <span class="lat-val" id="latval-${id}">${lat} ms</span>
+            </div>
+            <div class="slider-centre"><span>← plays late · plays ahead →</span><span class="lat-unit">offset (ms)</span></div>
+        </div>`;
+    }
+    if (el.innerHTML !== html) el.innerHTML = html;
+}
+
+// Update the displayed value live while dragging, without hammering the server.
+function latSliderInput(ip, el) {
+    const v = Math.round(parseFloat(el.value) || 0);
+    document.getElementById('latval-' + el.id).textContent = v + ' ms';
+}
+
+// Persist + apply on release (or keyboard change).
+async function latSliderCommit(ip, el) {
+    const ms = Math.round(parseFloat(el.value) || 0);
+    el.dataset.dragging = '0';
+    await api('POST', '/api/clients/latency', { ip, ms });
 }
 
 async function fetchLibrary() {
@@ -408,6 +525,7 @@ document.getElementById('search').addEventListener('input', renderLibrary);
 // ── Polling ──────────────────────────────────────────────────────────
 async function tick() {
     await fetchState();
+    if (currentTab === 'config') fetchClients();
 }
 tick();
 setInterval(tick, 1000);

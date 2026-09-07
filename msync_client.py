@@ -234,6 +234,7 @@ class SyncClient:
         # so the sound reaching the listeners lines up with the server room.
         # Tune live from the console with: latency <ms>
         self._out_latency = config.OUTPUT_LATENCY_MS / 1000.0
+        self._out_latency_ms = config.OUTPUT_LATENCY_MS  # for display
 
     # ------------------------------------------------------------------ #
     # HTTP API to the server (state, library, queue, playback control)    #
@@ -609,9 +610,9 @@ class SyncClient:
                     else:
                         with self.lock:
                             self._out_latency = ms / 1000.0
-                        print(f"  output latency compensation: {ms:.0f} ms"
-                              f" (set {ms:.0f} in config.OUTPUT_LATENCY_MS"
-                              f" to make it permanent)")
+                        print(f"  output latency compensation: {ms:.0f} ms")
+                        print("  (Use the web UI's Configure tab, or set "
+                              "config.OUTPUT_LATENCY_MS, to make it permanent.")
                 elif cmd == "queue":
                     print("  queue:", ", ".join(self.queue) if self.queue
                           else "(empty)")
@@ -634,8 +635,9 @@ class SyncClient:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         print(f"[client] listening on UDP {self.port}")
 
-        # register with server
-        sock.sendto(C.make_packet(C.TYPE_REGISTER), (self.host, self.port))
+        # register with server (send our hostname so the web UI can name us)
+        sock.sendto(C.make_packet(C.TYPE_REGISTER, host=socket.gethostname()),
+                    (self.host, self.port))
 
         self.clock.exchange(sock)
         last_ntp = time.time()
@@ -658,6 +660,15 @@ class SyncClient:
                         with self.lock:
                             self.queue = list(body.get("queue", []))
                             self.queue_size = len(self.queue)
+                    elif ptype == C.TYPE_LATENCY:
+                        # Server-set output-latency offset (ms) for this room.
+                        try:
+                            ms = float(body.get("ms", 0.0))
+                        except (TypeError, ValueError):
+                            ms = 0.0
+                        with self.lock:
+                            self._out_latency = ms / 1000.0
+                            self._out_latency_ms = ms
                 except socket.timeout:
                     pass
 

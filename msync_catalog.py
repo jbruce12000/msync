@@ -133,6 +133,54 @@ class Catalog:
                     elapsed REAL NOT NULL DEFAULT 0,
                     playing INTEGER NOT NULL DEFAULT 1
                 )""")
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS clients (
+                    ip          TEXT PRIMARY KEY,   -- 10.0.0.4
+                    hostname    TEXT NOT NULL DEFAULT '',
+                    latency_ms  REAL NOT NULL DEFAULT 0,  -- output offset
+                    last_seen   REAL NOT NULL DEFAULT 0
+                )""")
+
+    # ------------------------------------------------------------------ #
+    # Clients (rooms)                                                     #
+    # ------------------------------------------------------------------ #
+    def upsert_client(self, ip, hostname, last_seen=None):
+        """Record a client heartbeat (hostname is best-effort - a client may
+        not send one), keeping any latency setting already stored."""
+        with self._conn:
+            self._conn.execute("""
+                INSERT INTO clients (ip, hostname, latency_ms, last_seen)
+                VALUES (?, ?, 0, ?)
+                ON CONFLICT(ip) DO UPDATE SET
+                    last_seen = excluded.last_seen
+                """, (ip, hostname, last_seen if last_seen is not None
+                      else time.time()))
+            if hostname:
+                self._conn.execute("""
+                    UPDATE clients SET hostname = ? WHERE ip = ?
+                    """, (hostname, ip))
+
+    def client_latency(self, ip):
+        """Stored latency offset (ms) for a client, 0 if unknown."""
+        row = self._conn.execute(
+            "SELECT latency_ms FROM clients WHERE ip = ?", (ip,)).fetchone()
+        return float(row[0]) if row else 0.0
+
+    def set_client_latency(self, ip, ms):
+        with self._conn:
+            self._conn.execute("""
+                INSERT INTO clients (ip, hostname, latency_ms, last_seen)
+                VALUES (?, '', ?, ?)
+                ON CONFLICT(ip) DO UPDATE SET latency_ms = excluded.latency_ms
+                """, (ip, ms, time.time()))
+
+    def list_clients(self):
+        """Every known client: ip, hostname, latency_ms, last_seen."""
+        rows = self._conn.execute("""
+            SELECT ip, hostname, latency_ms, last_seen FROM clients
+            ORDER BY hostname, ip""").fetchall()
+        return [{"ip": r[0], "hostname": r[1], "latency_ms": r[2],
+                 "last_seen": r[3]} for r in rows]
 
     def _album_of(self, relpath):
         parts = relpath.split("/")

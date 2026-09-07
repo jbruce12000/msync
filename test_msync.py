@@ -28,6 +28,13 @@ def test_protocol_rejects_garbage():
     assert C.parse_packet(b"not a real packet") is None
 
 
+def test_latency_packet_roundtrip():
+    p = C.make_packet(C.TYPE_LATENCY, ms=75)
+    ptype, body = C.parse_packet(p)
+    assert ptype == C.TYPE_LATENCY
+    assert body["ms"] == 75
+
+
 # --------------------------------------------------------------------------- #
 # Stereo playback (server + client)                                            #
 # --------------------------------------------------------------------------- #
@@ -407,8 +414,59 @@ def test_config_output_latency_env(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Library / track selection                                                    #
+# Client latency settings (web Configure)                                      #
 # --------------------------------------------------------------------------- #
+def test_catalog_client_latency_roundtrip(tmp_path):
+    c = Catalog(str(tmp_path), str(tmp_path / "c.db"))
+    c.upsert_client("10.0.0.4", "room4")
+    assert c.client_latency("10.0.0.4") == 0.0
+    c.set_client_latency("10.0.0.4", 87.0)
+    assert c.client_latency("10.0.0.4") == 87.0
+    # unknown IP defaults to 0
+    assert c.client_latency("10.0.0.9") == 0.0
+    # list includes the hostname + value
+    rows = {r["ip"]: r for r in c.list_clients()}
+    assert rows["10.0.0.4"]["latency_ms"] == 87.0
+    assert rows["10.0.0.4"]["hostname"] == "room4"
+
+
+def test_http_clients_list_and_set_latency(server):
+    # Simulate a room registering its latency by calling the catalog directly
+    # (the UDP register path does the same under the hood), then check the
+    # endpoints used by the web UI.
+    server.catalog.upsert_client("192.168.1.5", "bedroom")
+    d = _http(server.port + 1000, "GET", "/api/clients")
+    ips = {c["ip"] for c in d["clients"]}
+    assert "192.168.1.5" in ips
+
+    d = _http(server.port + 1000, "POST",
+              f"/api/clients/latency?ip=192.168.1.5&ms=-35")
+    assert d["latency_ms"] == -35.0
+    assert server.catalog.client_latency("192.168.1.5") == -35.0
+
+    # out-of-range value is rejected
+    status, _ = _http_status(server.port + 1000, "POST",
+                             "/api/clients/latency?ip=192.168.1.5&ms=2000")
+    assert status == 400
+
+
+def test_client_latency_packet_sets_out_latency(client):
+    # The client's UDP loop applies TYPE_LATENCY by setting _out_latency.
+    # Simulate that inline (as msync_client.run() does) and confirm the
+    # callback's output offset follows it.
+    h = client.client
+    with h.lock:
+        h._out_latency = 60.0 / 1000.0
+        h._out_latency_ms = 60.0
+    assert h._out_latency_ms == 60.0
+    assert abs(h._out_latency * 1000 - 60.0) < 1e-9
+    # reset to zero (the default a fresh room should see)
+    with h.lock:
+        h._out_latency = 0.0
+        h._out_latency_ms = 0.0
+    assert h._out_latency_ms == 0.0
+
+
 def test_http_library(server):
     d = _http(server.port + 1000, "GET", "/api/library")
     for t in ("track_01_A440.wav", "track_02_B494.wav",

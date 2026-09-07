@@ -847,6 +847,17 @@ class SyncedServer:
             "artist": artist,
         }
 
+    def send_latency(self, ip, ms):
+        """Tell a client to set its output-latency offset (ms) right now."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(2)
+            sock.sendto(C.make_packet(C.TYPE_LATENCY, ms=ms),
+                        (ip, self.port))
+            sock.close()
+        except OSError as e:
+            print(f"[server] send_latency {ip}: {e}")
+
     def udp_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -882,8 +893,17 @@ class SyncedServer:
                                          t1=body["t1"], t2=t2, t3=C.ts())
                     sock.sendto(resp, addr)
                 elif ptype == C.TYPE_REGISTER:
+                    # Record the room (IP + best-effort hostname) so the web
+                    # UI can list it and store per-room latency settings.
+                    ip = addr[0]
+                    hostname = str(body.get("host") or "").strip()[:64]
+                    self.catalog.upsert_client(ip, hostname)
                     sock.sendto(C.make_packet(C.TYPE_WELCOME,
                                               **self._sync_payload()), addr)
+                    # Push this room's stored output-latency offset (0 if
+                    # never set) so a freshly-connected client starts tuned.
+                    lat = self.catalog.client_latency(ip)
+                    sock.sendto(C.make_packet(C.TYPE_LATENCY, ms=lat), addr)
             except socket.timeout:
                 continue
         sock.close()
@@ -976,6 +996,8 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
             elif path == "/api/queue":
                 self._json({"queue": srv.queue_list(),
                             "now_playing": srv.song.name if srv.song else ""})
+            elif path == "/api/clients":
+                self._json({"clients": srv.catalog.list_clients()})
             else:
                 super().do_GET()
 
@@ -1078,6 +1100,23 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
                     self._json({"error": "level required"}, 400)
                 else:
                     self._json({"volume": srv.set_vol(level)})
+            elif path == "/api/clients/latency":
+                ip = (qs.get("ip") or [None])[0] or body.get("ip")
+                raw = qs.get("ms") or (["%s" % body["ms"]] if "ms" in body else [])
+                if not ip or not raw:
+                    self._json({"error": "ip and ms required"}, 400)
+                    return
+                try:
+                    ms = float(raw[0])
+                except (ValueError, TypeError):
+                    self._json({"error": "ms must be a number"}, 400)
+                    return
+                if not -1000.0 <= ms <= 1000.0:
+                    self._json({"error": "ms out of range (-1000..1000)"}, 400)
+                    return
+                srv.catalog.set_client_latency(ip, ms)
+                srv.send_latency(ip, ms)   # apply live to the client
+                self._json({"ip": ip, "latency_ms": ms})
             else:
                 self._json({"error": "not found"}, 404)
 

@@ -27,12 +27,17 @@ few milliseconds even across Wi-Fi.
   sync server by nudging its sample rate by an inaudible fraction of a
   percent, glitch-free — no pops, no cracks, no audio artifacts.
 - **Room-latency compensation** — rooms whose sound reaches the speakers
-  through a slow path (HDMI → TV/AVR, Bluetooth, …) are measured with a
-  microphone and played that far *ahead* of the sync timeline, so they line
-  up with the rooms on plain analog/USB outputs.
+  through a slow path (HDMI → TV/AVR, Bluetooth, …) arrive late no matter
+  how tight the sync loop is. The web UI's **Configure** tab sets each
+  room's output-latency offset live (−1000 to +1000 ms, 1 ms at a time);
+  the value is stored in the server's database and pushed to that room's
+  client instantly — and again the next time it starts — so the tuning is
+  permanent.
 - **Web UI** — browse your local music collection from any browser, search
-  by song, artist, or album, and queue up selections with a click. Works on
-  phones, tablets, laptops — any device on the same network.
+  by song, artist, or album, and queue up selections with a click. A
+  **Configure** tab lists every connected room and tunes each one's output
+  latency on the fly. Works on phones, tablets, laptops — any device on the
+  same network.
 - **Play queue** — build a custom set on the fly; queue individual tracks or
   whole albums from the web UI, any client console, or the HTTP API.
 - **Album & tag support** — reads audio tags (artist, album, track number,
@@ -183,6 +188,10 @@ The page shows:
 - **Library** — your entire local music collection, grouped by album, with
   a search box to filter by song title, artist, or album name.
 - **Queue** — the upcoming play queue with reorder and remove controls.
+- **Configure** — every room running a client, with a slider for how far
+  that room should play ahead of (or behind) the sync timeline, applied
+  instantly and saved in the server's database. See "Matching rooms with a
+  slow audio path" below.
 
 Click **▶ play** next to any track (or album header) to start it instantly
 on every machine, or click **+ queue** to line it up next. You can queue
@@ -205,7 +214,7 @@ Every client has a small console as well. While a client is running, type:
 | `pause` / `resume` | pause or resume everyone |
 | `next` / `prev` | skip forward / back |
 | `vol 0.7` | set volume (0.0 – 1.5) |
-| `latency 120` | tune this room's output-latency compensation live (ms); see "Matching rooms with a slow audio path" |
+| `latency 120` | tune this room's output-latency offset live (ms); the web UI's Configure tab saves it permanently |
 | `queue` | show what's queued |
 | `clear` | empty the queue |
 | `q` | stop this client |
@@ -259,12 +268,14 @@ the scripts — the server and every client read it:
   config.py or via `MSYNC_DEFAULT_PORT`; every client and server must agree.
 - **`HTTP_PORT_OFFSET`** — the HTTP port is the UDP port plus this offset
   (default **+1000** → HTTP **10770**), used for the web UI and downloads.
-- **`OUTPUT_LATENCY_MS`** — extra latency of **this** machine's audio output,
-  in milliseconds (default `0`). Rooms whose sound goes through a slow path
-  (HDMI → TV/AVR, Bluetooth, …) arrive late; set this to the measured value
-  and the room plays that far ahead of the sync timeline. Measured with
-  `tools/measure_latency.py` (see below), or tweaked live from a client
-  console with `latency <ms>`. Env override: `MSYNC_OUTPUT_LATENCY_MS`.
+- **`OUTPUT_LATENCY_MS`** — **local fallback** for this machine's
+  audio-output latency, in milliseconds (default `0`). The normal way to set
+  a room's offset is the web UI's Configure tab: the server stores each
+  room's value in its database and pushes it to the client whenever it
+  connects or the value changes. This config value only applies before a
+  freshly-installed client has heard from its server (the server's stored
+  value wins as soon as the client registers). Env override:
+  `MSYNC_OUTPUT_LATENCY_MS`.
 
 ## Matching rooms with a slow audio path
 
@@ -272,32 +283,39 @@ If one room sounds **late** even though every client reports `err` ≈ 0ms, its
 speakers are probably behind a high-latency output chain — most commonly
 HDMI into a TV or AVR, which buffers 100–300ms of audio for video sync. The
 sync loop can't see that (ALSA/PipeWire only know about the digital side of
-the port); only a real measurement reveals it.
+the port); only an output-latency offset fixes it.
 
-`tools/measure_latency.py` measures it for you:
+The web UI's **Configure** tab is the practical way to tune it:
 
-1. Plug a USB microphone into the affected machine so it can hear **both**
-   its target speakers (the TV/AVR) and the machine's low-latency analog/USB
-   output.
-2. Run:
-   ```bash
-   ./venv/bin/python tools/measure_latency.py --list     # check device names
-   ./venv/bin/python tools/measure_latency.py            # measure
-   ```
-   (Overrides if auto-detection picks wrong devices: `--sink`, `--ref`,
-   `--mic` each match a substring of the device name.)
-3. The script plays a chirp through each output, records both sink monitor
-   ports plus the microphone, cross-correlates them, and prints the value:
-   ```
-   ==> OUTPUT_LATENCY_MS = 140
-   ```
-4. Put that value in `config.py` (or run with `--write-config`) on that
-   machine and restart its client. Refine ±10ms by ear from the client
-   console with `latency <ms>`.
+1. Open `http://<server-ip>:10770/` and switch to the **Configure** tab.
+   Every connected room appears there automatically — hostname, IP, and a
+   live online/offline status.
+2. Each room has a slider spanning **−1000 ms to +1000 ms** in 1 ms steps,
+   with the current value shown right next to it. Rooms default to **0 ms**.
+3. Move a room's slider while music plays and listen: a positive offset makes
+   that room play that far *ahead* of the sync timeline (so slow speakers
+   arrive in time); a negative offset plays it as late as the reference path.
+4. The value is stored in the server's database and **pushed to that room's
+   client immediately** — and reapplied from the database the next time the
+   client starts, so the tuning is permanent until you change it.
 
-The printed value is how much *slower* the target path is than the
-reference path — exactly the advance that makes this room line up with a
-room on the equivalent low-latency path.
+Start at 0 and nudge the slider up until the room stops sounding late, then
+trim with 1 ms steps. Sign is intuitive: if a room is *late*, slide up.
+
+If you'd rather have a measured starting point than tune by ear,
+`tools/measure_latency.py` plays a chirp through the target output and a
+reference output, records both with a USB microphone, cross-correlates, and
+prints a suggested value you can drop into the Configure slider:
+
+```bash
+./venv/bin/python tools/measure_latency.py --list     # check device names
+./venv/bin/python tools/measure_latency.py            # measure
+```
+
+(Overrides if auto-detection picks wrong devices: `--sink`, `--ref`, `--mic`
+each match a substring of the device name.) The printed value is how much
+*slower* the target path is than the reference path — exactly the offset to
+enter.
 
 ## How the sync stays perfect
 
