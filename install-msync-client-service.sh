@@ -23,6 +23,11 @@
 # Safe to re-run: it re-installs/updates the unit + env file in place and
 # restarts the service to apply the changes.
 #
+# The script also creates ./venv (if missing) and keeps its Python
+# requirements (requirements.txt) installed, so a fresh checkout installs
+# cleanly. Override the interpreter with MSYNC_VENV_PYTHON to manage your
+# own environment instead.
+#
 # Audio notes
 # -----------
 # A system service connects to whatever audio daemon it can reach. The unit
@@ -46,6 +51,53 @@ UNIT_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 SERVICE_USER="${SUDO_USER:-}"
 START="yes"
 UNINSTALL="no"
+
+ensure_venv() {
+    # Create and populate the project's virtualenv on first run, and keep
+    # its requirements installed on every run. MSYNC_VENV_PYTHON overrides
+    # the interpreter entirely for users who manage their own environment.
+    if [ -n "${MSYNC_VENV_PYTHON:-}" ]; then
+        return 0
+    fi
+
+    local venv_dir="$INSTALL_DIR/venv"
+    local venv_py="$venv_dir/bin/python"
+
+    if [ ! -x "$venv_py" ]; then
+        echo "Creating virtualenv at $venv_dir ..."
+        if command -v python3 >/dev/null 2>&1 && python3 -m venv "$venv_dir"; then
+            :
+        elif command -v virtualenv >/dev/null 2>&1 && virtualenv -p python3 "$venv_dir"; then
+            :
+        else
+            echo "error: could not create a virtualenv at $venv_dir" >&2
+            echo "  install python3-venv (e.g. sudo apt install python3-venv)" >&2
+            echo "  or virtualenv (e.g. sudo apt install python3-virtualenv), then re-run." >&2
+            exit 1
+        fi
+    fi
+
+    # Some distros (Debian/Ubuntu) ship a python3 whose venv lacks pip —
+    # the venv then exists but can install nothing. Bootstrap pip with the
+    # official get-pip.py instead of failing cryptically later.
+    if ! "$venv_py" -m pip --version >/dev/null 2>&1; then
+        echo "Bootstrapping pip into $venv_dir ..."
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL https://bootstrap.pypa.io/get-pip.py | "$venv_py" - \
+                || { echo "error: could not bootstrap pip into $venv_dir" >&2; exit 1; }
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO- https://bootstrap.pypa.io/get-pip.py | "$venv_py" - \
+                || { echo "error: could not bootstrap pip into $venv_dir" >&2; exit 1; }
+        else
+            echo "error: no curl or wget available to bootstrap pip" >&2
+            echo "  install python3-venv (e.g. sudo apt install python3-venv) and re-run." >&2
+            exit 1
+        fi
+    fi
+
+    "$venv_dir/bin/pip" install -r "$INSTALL_DIR/requirements.txt" \
+        || { echo "error: could not install $INSTALL_DIR/requirements.txt" >&2; exit 1; }
+}
 
 usage() {
     awk 'NR > 1 && /^#/ { line = $0; sub(/^# ?/, "", line); print line }
@@ -80,7 +132,7 @@ fi
 
 # --- sanity checks ------------------------------------------------------- #
 [ -f "$CLIENT" ] || { echo "error: $CLIENT not found (run from the msync dir)" >&2; exit 1; }
-[ -x "$PYTHON" ] || { echo "error: venv python not found at $PYTHON" >&2; exit 1; }
+ensure_venv   # create ./venv + install requirements.txt if needed
 
 # --- read host/port from config.py (the service's source of truth) -------- #
 # Importing config.py here also picks up any MSYNC_SERVER / MSYNC_DEFAULT_PORT
