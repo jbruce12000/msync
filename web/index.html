@@ -32,9 +32,7 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 
 /* Main panels */
 .main { flex: 1; display: flex; overflow: hidden; }
-.panel { display: flex; flex-direction: column; overflow: hidden; }
-.panel-left { flex: 1; border-right: 1px solid var(--border); }
-.panel-right { width: 300px; }
+.panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
 
 /* Tabs */
 .tabbar { display: flex; gap: 4px; padding: 6px 12px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
@@ -109,12 +107,37 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 .album-group-header .album-count { color: var(--muted); font-weight: normal; font-size: 11px; }
 
 /* Queue items */
-.queue-item { padding: 6px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 13px; transition: background 0.1s; }
+.queue-item { padding: 6px 12px; display: flex; align-items: center; gap: 8px; font-size: 13px; transition: background 0.1s; }
 .queue-item:hover { background: rgba(88,166,255,0.08); }
+.queue-item.now-playing { background: rgba(88,166,255,0.1); }
+.queue-item.now-playing .name { font-weight: 600; }
 .queue-item .idx { color: var(--muted); font-size: 11px; min-width: 16px; text-align: right; }
 .queue-item .name { flex: 1; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 .queue-item .remove { opacity: 0; color: var(--red); cursor: pointer; font-size: 14px; transition: opacity 0.15s; }
 .queue-item:hover .remove { opacity: 1; }
+/* Drag handle (mouse, pen, and touch — touch-action:none keeps the gesture
+   owned by the row so the page doesn't scroll mid-drag). */
+.queue-item .grip {
+    cursor: grab; color: var(--muted); font-size: 13px; line-height: 1;
+    padding: 4px 4px; margin-left: -6px; flex-shrink: 0;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    -webkit-touch-callout: none;
+}
+.queue-item .grip:hover { color: var(--accent); }
+.queue-item .grip:active { cursor: grabbing; }
+/* SortableJS drag state: the drop-placeholder slot, the row being dragged
+   (dimmed while its ghost floats after the pointer), and the ghost itself. */
+.sortable-ghost { opacity: 0.45; }
+.sortable-ghost .grip { visibility: hidden; }
+.sortable-chosen { background: rgba(88,166,255,0.15); }
+.sortable-drag { opacity: 0.3; }
+.queue-ghost {
+    position: fixed; z-index: 1000; pointer-events: none;
+    background: var(--surface); border: 1px solid var(--accent);
+    border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    opacity: 0.95; margin: 0;
+    cursor: grabbing;
+}
 
 .empty { text-align: center; padding: 24px; color: var(--muted); font-size: 12px; }
 
@@ -122,22 +145,12 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 .scroll:hover::-webkit-scrollbar-thumb { background: #484f58; }
 
 /* ── Responsive: tablets & phones ───────────────────────────────────── */
-@media (max-width: 1024px) {
-    .panel-right { width: 250px; }
-}
-@media (max-width: 820px) {          /* tablet portrait */
-    .main { flex-direction: column; }
-    .panel-left { flex: 1 1 62%; min-height: 0; border-right: none; border-bottom: 1px solid var(--border); }
-    .panel-right { width: auto; flex: 1 1 38%; min-height: 0; }
-}
 @media (max-width: 640px) {          /* phones */
     body { height: 100dvh; }
     .header { flex-wrap: wrap; gap: 8px 12px; padding: 10px 12px; }
     .now-playing { min-width: 0; }
     .controls { flex-basis: 100%; justify-content: center; }
     .controls button { width: 38px; height: 38px; font-size: 16px; }
-    .panel-left { flex: 1 1 58%; }
-    .panel-right { flex: 1 1 42%; }
     .now-playing .progress { max-width: none; }
 }
 
@@ -166,6 +179,11 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
         padding: 6px 12px;
         border-radius: 8px;
         background: var(--border);
+    }
+    .queue-item .grip {
+        font-size: 20px;
+        padding: 10px 14px;
+        margin-left: -10px;
     }
     .search-clear {
         font-size: 18px;
@@ -247,12 +265,13 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 <!-- Tab bar -->
 <div class="tabbar">
     <button class="tab active" data-tab="play" onclick="setTab('play')">Play</button>
+    <button class="tab" data-tab="queue" onclick="setTab('queue')">Queue</button>
     <button class="tab" data-tab="config" onclick="setTab('config')">Configure</button>
 </div>
 
-<!-- Play view: Library + Queue -->
+<!-- Play view: Library -->
 <div class="main" id="view-play">
-    <div class="panel panel-left">
+    <div class="panel">
         <div class="panel-header">
             <h2>Library</h2>
             <span class="count" id="lib-count"></span>
@@ -264,7 +283,11 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
         </div>
         <div class="scroll" id="library"></div>
     </div>
-    <div class="panel panel-right">
+</div>
+
+<!-- Queue view -->
+<div class="main" id="view-queue" style="display:none;">
+    <div class="panel">
         <div class="panel-header">
             <h2>Queue</h2>
             <span class="count" id="queue-count"></span>
@@ -280,6 +303,7 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
     <div class="configure" id="configure"></div>
 </div>
 
+<script src="static/sortable.min.js"></script>
 <script>
 let state = { queue: [], now_playing: null, paused: false, volume: 100, elapsed: 0, duration: 0 };
 let library = { songs: [], albums: [], singles: [] };
@@ -303,6 +327,7 @@ function setTab(name) {
     document.querySelectorAll('.tab').forEach(b =>
         b.classList.toggle('active', b.dataset.tab === name));
     document.getElementById('view-play').style.display = name === 'play' ? '' : 'none';
+    document.getElementById('view-queue').style.display = name === 'queue' ? '' : 'none';
     document.getElementById('view-config').style.display = name === 'config' ? '' : 'none';
     if (name === 'config') fetchClients();
 }
@@ -710,22 +735,31 @@ function albumQueue(name) {
 function esc(s) { return s.replace(/'/g, "\\'").replace(/"/g, '&quot;'); }
 
 // ── Queue rendering ──────────────────────────────────────────────────
+let drag = false;   // true while a SortableJS drag is in flight (blocks renders)
+let dragFrom = -1;  // dragged item's flat queue index when the drag started
+
 function renderQueue() {
     const el = document.getElementById('queue');
+    // An active drag manipulates the DOM node-by-node; rebuilding innerHTML
+    // here would kill the gesture. The 1s poll still reconciles state.queue
+    // meanwhile, and the drop commits the reorder to the server.
+    if (drag) { updateQueueCount(); return; }
     const q = state.queue || [];
     const np = state.now_playing;
 
     let html = '';
 
-    // Now-playing slot at top — removable like a queue item. The current
-    // track is never stored in the pending queue itself (it's popped before
-    // playback starts), so removing it starts the next queued song.
+    // Now-playing slot at top — removable like a queue item but not
+    // draggable (it's never part of the pending queue itself). The current
+    // track is popped before playback starts, so removing it starts the
+    // next queued song.
     if (np) {
         const npLabel = [np.artist, np.album, np.title || np.name]
             .filter(Boolean).join(' - ') || np.name;
-        html += `<div class="queue-item" style="background:rgba(88,166,255,0.1)">
+        html += `<div class="queue-item now-playing" data-np="1">
+            <span class="grip" aria-hidden="true"></span>
             <span class="idx" style="color:var(--accent)">▶</span>
-            <span class="name" style="font-weight:600">${esc(npLabel)}</span>
+            <span class="name">${esc(npLabel)}</span>
             <span class="remove" onclick="removeNowPlaying()" title="Remove current song, start next">✕</span>
         </div>`;
     }
@@ -738,6 +772,7 @@ function renderQueue() {
             ? [m.artist, m.album, m.title].filter(Boolean).join(' - ')
             : q[i];
         html += `<div class="queue-item">
+            <span class="grip" title="Drag to reorder" aria-hidden="true">☰</span>
             <span class="idx">${i + 1}</span>
             <span class="name">${esc(label)}</span>
             <span class="remove" onclick="queueRemove(${i})" title="Remove">✕</span>
@@ -749,7 +784,79 @@ function renderQueue() {
     // innerHTML on every 1s poll destroys/recreates nodes (killing hover,
     // flushing CSS transitions) which looks like blinking.
     if (el.innerHTML !== html) el.innerHTML = html;
-    document.getElementById('queue-count').textContent = q.length;
+    updateQueueCount();
+}
+
+function updateQueueCount() {
+    document.getElementById('queue-count').textContent = (state.queue || []).length;
+}
+
+// ── Queue drag & drop reordering (SortableJS) ────────────────────────
+// SortableJS (vendored in static/sortable.min.js) handles mouse, pen, and
+// touch in one library. forceFallback gives a consistent drag ghost on every
+// device; `handle` restricts drags to the ☰ grip so taps/scrolls anywhere
+// else on a row still work (touch-action:none on the grip keeps the gesture
+// owned by the row on touch); `filter` pins the now-playing slot in place —
+// and SortableJS ignores filtered rows when computing indices, so its
+// indices line up 1:1 with the server's flat queue (queue_list()).
+const queueEl = document.getElementById('queue');
+
+Sortable.create(queueEl, {
+    handle: '.grip',
+    filter: '[data-np]',           // now-playing slot stays put (and uncounted)
+    animation: 150,                // smooth live reordering
+    forceFallback: true,           // own ghost on mouse AND touch (consistent)
+    fallbackClass: 'queue-ghost',  // reuse .queue-ghost styling as the drag image
+    ghostClass: 'sortable-ghost',
+    chosenClass: 'sortable-chosen',
+    dragClass: 'sortable-drag',
+    scroll: true,                  // auto-scroll the container near its edges
+    swapThreshold: 0.55,
+    onStart(evt) {
+        drag = true;
+        dragFrom = flatQueueIndex(evt.item);
+    },
+    onUpdate() {
+        refreshQueueNumbers();     // keep row numbers live while items swap
+    },
+    onEnd(evt) {
+        const to = flatQueueIndex(evt.item);
+        const from = dragFrom;
+        drag = false;
+        if (to === from || to < 0 || from < 0) return fetchState();  // no net move
+        // Optimistic local reorder so the list doesn't snap back while the
+        // server confirms; fetchState() then reconciles the authoritative
+        // order (album entries may split/regroup server-side).
+        const q = state.queue || [];
+        if (from < q.length) {
+            const [item] = q.splice(from, 1);
+            if (item) q.splice(to, 0, item);
+            const m = state.queue_meta || [];
+            if (from < m.length) {
+                const [meta] = m.splice(from, 1);
+                if (meta) m.splice(to, 0, meta);
+            }
+            renderQueue();
+        }
+        api('POST', '/api/queue/move', { from, to }).then(() => fetchState());
+    },
+});
+
+function flatQueueIndex(item) {
+    // Flat queue index = position among real rows (the now-playing slot is
+    // filtered out), which is exactly the server's index space.
+    return [...queueEl.querySelectorAll('.queue-item:not([data-np])')]
+        .indexOf(item);
+}
+
+function refreshQueueNumbers() {
+    const rows = [...queueEl.querySelectorAll('.queue-item')];
+    const start = state.now_playing ? 1 : 0;
+    rows.forEach((row, i) => {
+        const idxEl = row.querySelector('.idx');
+        if (!idxEl) return;
+        idxEl.textContent = row.dataset.np ? '▶' : (i - start + 1);
+    });
 }
 
 // ── Search ───────────────────────────────────────────────────────────

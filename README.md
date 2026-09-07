@@ -483,7 +483,7 @@ msync_catalog.py   the SQLite album/track catalog
 msync_inotify.py   watches the music folder and refreshes the catalog
 msync_common.py    shared sync protocol (you can ignore this)
 make_test_music.py generates demo songs (--with-albums for sample albums)
-web/index.html     the web UI
+web/               the web UI (index.html + vendored sortable.min.js drag lib)
 music/             your music (config.MUSIC_DIR); sub-folders are albums
 music/.queue/      drop-to-queue folder (created automatically)
 msync.db           the catalog database (config.DB_PATH)

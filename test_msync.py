@@ -307,6 +307,63 @@ def test_queue_rejects_missing_file(server):
     assert server.add_to_queue(["nope.mp3"]) == []
 
 
+def test_queue_move_songs(server):
+    """move_queue_item reorders expanded queue items — the drag & drop
+    backend. ``to_index`` is the item's final landing index."""
+    server.add_to_queue(["track_02_B494.wav", "track_03_C554.wav"])
+    base = ["track_02_B494.wav", "track_03_C554.wav"]
+    assert server.queue_list() == base
+    # Drag item 0 down past item 1 → it lands at final index 1.
+    assert server.move_queue_item(0, 1)
+    assert server.queue_list() == ["track_03_C554.wav", "track_02_B494.wav"]
+    # Drag item 1 back up to the top.
+    assert server.move_queue_item(1, 0)
+    assert server.queue_list() == base
+    # No-op move and out-of-range indices are safe and leave the queue alone.
+    assert server.move_queue_item(0, 0)
+    assert not server.move_queue_item(5, 0)
+    assert not server.move_queue_item(-1, 0)
+    assert not server.move_queue_item(0, 9)
+    assert server.queue_list() == base
+
+
+def test_queue_move_album_tracks(album_server):
+    """Dragging a track within an album keeps the album grouped (reordered);
+    dragging it out of the album splits the entry and the remaining tracks
+    regroup into an album entry when they end up adjacent again."""
+    album_server.clear_queue()
+    album_server.add_album("Demo Album")
+    two = ["Demo Album/01 Intro.wav", "Demo Album/02 Bridge.wav"]
+    assert album_server.queue_list() == two
+    # Swap the two tracks within the album (drag 01 below 02).
+    assert album_server.move_queue_item(0, 1)
+    assert album_server.queue_list() == two[::-1]
+    # Split: queue a single behind the album, then drag track 02 (index 1)
+    # down past the single so it ends at final index 2.
+    album_server.clear_queue()
+    album_server.add_album("Demo Album")
+    album_server.add_to_queue(["solo_single.wav"])
+    assert album_server.queue_list() == two + ["solo_single.wav"]
+    assert album_server.move_queue_item(1, 2)
+    assert album_server.queue_list() == [
+        "Demo Album/01 Intro.wav", "solo_single.wav", "Demo Album/02 Bridge.wav"]
+    # Now that 02 sits directly after 01 again, dragging the single back to
+    # the end regroups the pair into one album entry.
+    assert album_server.move_queue_item(1, 2)
+    assert album_server.queue_list() == two + ["solo_single.wav"]
+    assert [e["type"] for e in album_server.queue] == ["album", "song", "song"]
+    # An album is re-split when a single song is dragged into its middle.
+    album_server.clear_queue()
+    album_server.add_album("Demo Album")
+    album_server.add_to_queue(["solo_single.wav"])
+    assert album_server.queue_list() == two + ["solo_single.wav"]
+    # Drag the single (index 2) between the album's two tracks (index 1).
+    assert album_server.move_queue_item(2, 1)
+    assert album_server.queue_list() == [
+        "Demo Album/01 Intro.wav", "solo_single.wav", "Demo Album/02 Bridge.wav"]
+    assert [e["type"] for e in album_server.queue] == ["album", "song", "album"]
+
+
 def test_drop_folder_absorbs(server):
     qdir = server.queue_dir
     assert qdir and os.path.isdir(qdir)
@@ -388,6 +445,32 @@ def test_http_queue_list(server):
     d = _http(server.port + 1000, "GET", "/api/queue")
     assert d["queue"] == ["track_02_B494.wav"]
     assert d["now_playing"] == "track_01_A440.wav"
+
+
+def test_http_queue_move(server):
+    """POST /api/queue/move reorders the queue — the exact request the web
+    UI's drag & drop sends (?from=N&to=M)."""
+    server.add_to_queue(["track_02_B494.wav", "track_03_C554.wav"])
+    d = _http(server.port + 1000, "POST", "/api/queue/move?from=0&to=1")
+    assert d["moved"] is True
+    assert server.queue_list() == ["track_03_C554.wav", "track_02_B494.wav"]
+    # Same index is a no-op.
+    d = _http(server.port + 1000, "POST", "/api/queue/move?from=1&to=1")
+    assert d["moved"] is True
+    assert server.queue_list() == ["track_03_C554.wav", "track_02_B494.wav"]
+
+
+def test_http_queue_move_validation(server):
+    """Bad indices are rejected with 400 and leave the queue untouched."""
+    server.add_to_queue(["track_02_B494.wav"])
+    conn = http.client.HTTPConnection("127.0.0.1",
+                                      server.port + 1000, timeout=5)
+    conn.request("POST", "/api/queue/move?from=abc&to=1")
+    r = conn.getresponse()
+    r.read()
+    conn.close()
+    assert r.status == 400
+    assert server.queue_list() == ["track_02_B494.wav"]
 
 
 def test_http_remove_current_starts_next_queue_song(server):

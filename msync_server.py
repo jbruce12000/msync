@@ -483,6 +483,73 @@ class SyncedServer:
                 return relpath
         return None
 
+    def _flat_len(self):
+        """Number of slots in the expanded queue (albums expand to tracks)."""
+        return sum(len(e.get("paths")) if e.get("type") == "album" else 1
+                   for e in self.queue)
+
+    def move_queue_item(self, from_index, to_index):
+        """Move the item at flat (expanded) queue index ``from_index`` so it
+        lands at final flat index ``to_index`` — drag & drop reordering.
+        Individual songs move as whole entries; dragging a track out of (or
+        within) an album entry splits that album around the track. Returns
+        True when the move was applied (False on out-of-range indices)."""
+        with self.lock:
+            total = self._flat_len()
+            if from_index < 0 or from_index >= total \
+                    or to_index < 0 or to_index > total:
+                return False
+            if from_index == to_index:
+                return True          # already where it should be
+            hit = self._find_expanded(from_index)
+            if hit is None:
+                return False
+            k, entry, offset = hit
+            if entry.get("type") == "song":
+                dragged = self.queue.pop(k)
+            else:
+                # Dragged a single track out of an album entry: drop it and
+                # keep the remaining tracks as one album entry.
+                album = entry.get("album") or ""
+                paths = entry["paths"]
+                dragged = {"type": "song", "path": paths[offset],
+                           "relpath": self._relpath(paths[offset])}
+                remaining = paths[:offset] + paths[offset + 1:]
+                if remaining:
+                    self.queue[k] = {"type": "album", "album": album,
+                                     "paths": remaining}
+                else:
+                    self.queue.pop(k)
+            self._insert_song(dragged, min(to_index, self._flat_len()))
+            self._persist_queue()
+            return True
+
+    def _insert_song(self, dragged, to_index):
+        """Insert the 1-slot song entry ``dragged`` so it lands at flat
+        index ``to_index`` (0 = front, current length = append). When the
+        landing spot falls inside an album entry, that entry is split around
+        the new song. Caller must hold the lock."""
+        acc = 0
+        for k, e in enumerate(self.queue):
+            L = len(e.get("paths")) if e.get("type") == "album" else 1
+            if to_index == acc:
+                self.queue.insert(k, dragged)
+                return
+            if to_index < acc + L:
+                album = e.get("album") or ""
+                off = to_index - acc
+                pieces = []
+                if off:
+                    pieces.append({"type": "album", "album": album,
+                                   "paths": e["paths"][:off]})
+                pieces.append(dragged)
+                pieces.append({"type": "album", "album": album,
+                               "paths": e["paths"][off:]})
+                self.queue[k:k + 1] = pieces
+                return
+            acc += L
+        self.queue.append(dragged)
+
     def library_list(self):
         """Every track (relative path), in playback order. Freshly dropped
         files appear once the catalog is refreshed."""
@@ -975,6 +1042,7 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
       GET  /api/library       -> list of available songs
       GET  /api/queue         -> queue + now playing
       POST /api/queue/add     -> add song(s) to queue  (?name= or JSON)
+      POST /api/queue/move    -> reorder (?from=N&to=M or JSON)
       POST /api/queue/remove  -> remove by index (?index=N) or name
       POST /api/queue/clear   -> empty the queue
       POST /api/control/toggle|stop|next|prev|volume
@@ -1111,6 +1179,19 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
             elif path == "/api/queue/clear":
                 n = srv.clear_queue()
                 self._json({"removed": n, "queue_size": 0})
+            elif path == "/api/queue/move":
+                from_i = (body.get("from") if body.get("from") is not None
+                          else (qs.get("from") or [None])[0])
+                to_i = (body.get("to") if body.get("to") is not None
+                        else (qs.get("to") or [None])[0])
+                try:
+                    from_i, to_i = int(from_i), int(to_i)
+                except (TypeError, ValueError):
+                    self._json({"error": "from and to (integer) required"}, 400)
+                else:
+                    moved = srv.move_queue_item(from_i, to_i)
+                    self._json({"moved": moved},
+                               200 if moved else 400)
             elif path == "/api/control/toggle":
                 if "state" in qs:
                     want = qs["state"][0] in ("1", "true", "yes")
