@@ -188,10 +188,11 @@ The page shows:
 - **Library** — your entire local music collection, grouped by album, with
   a search box to filter by song title, artist, or album name.
 - **Queue** — the upcoming play queue with reorder and remove controls.
-- **Configure** — every room running a client, with a slider for how far
-  that room should play ahead of (or behind) the sync timeline, applied
-  instantly and saved in the server's database. See "Matching rooms with a
-  slow audio path" below.
+- **Configure** — every room running a client, with a per-room slider (and a
+  typed value box) for how far that room plays ahead of or behind the sync
+  timeline — applied instantly and saved in the server's database. Most
+  useful for rooms whose audio path adds latency, like **HDMI into a TV/AVR**
+  or Bluetooth speakers. See "The Configure tab" below.
 
 Click **▶ play** next to any track (or album header) to start it instantly
 on every machine, or click **+ queue** to line it up next. You can queue
@@ -277,35 +278,41 @@ the scripts — the server and every client read it:
   value wins as soon as the client registers). Env override:
   `MSYNC_OUTPUT_LATENCY_MS`.
 
-## Matching rooms with a slow audio path
+## The Configure tab — rooms with a slow audio path (HDMI, Bluetooth, …)
 
 If one room sounds **late** even though every client reports `err` ≈ 0ms, its
-speakers are probably behind a high-latency output chain — most commonly
-HDMI into a TV or AVR, which buffers 100–300ms of audio for video sync. The
-sync loop can't see that (ALSA/PipeWire only know about the digital side of
-the port); only an output-latency offset fixes it.
-
-The web UI's **Configure** tab is the practical way to tune it:
+speakers are probably behind a high-latency output chain. The **Configure**
+tab in the web UI exists for exactly this: rooms whose audio output adds
+latency. That's most common with a client connected by **HDMI into a TV or
+AVR** (which buffers 100–300ms of audio for video sync), but also describes
+Bluetooth/USB speakers, soundbars, or external DACs with their own
+buffering. The sync loop can't see any of that (ALSA/PipeWire only know
+about the digital side of the port); only an output-latency offset fixes it.
 
 1. Open `http://<server-ip>:10770/` and switch to the **Configure** tab.
    Every connected room appears there automatically — hostname, IP, and a
-   live online/offline status.
+   live online/offline status. Clients re-register and heartbeat every few
+   seconds, so the list stays current even if you restart a room or the
+   server.
 2. Each room has a slider spanning **−1000 ms to +1000 ms** in 1 ms steps,
-   with the current value shown right next to it. Rooms default to **0 ms**.
-3. Move a room's slider while music plays and listen: a positive offset makes
-   that room play that far *ahead* of the sync timeline (so slow speakers
-   arrive in time); a negative offset plays it as late as the reference path.
+   plus a **value box on the right** that you can drag along with the slider
+   *or type into* for an exact offset (Enter or click away to apply). Rooms
+   default to **0 ms**.
+3. Move the room's slider while music plays and listen: a positive offset
+   makes that room play that far *ahead* of the sync timeline, so slow
+   speakers arrive in time; a negative offset plays it late relative to the
+   others. An HDMI room usually needs a positive offset in the tens to low
+   hundreds of ms — start at 0 and slide up until it stops sounding late.
 4. The value is stored in the server's database and **pushed to that room's
    client immediately** — and reapplied from the database the next time the
-   client starts, so the tuning is permanent until you change it.
+   client connects, so the tuning is permanent until you change it.
 
-Start at 0 and nudge the slider up until the room stops sounding late, then
-trim with 1 ms steps. Sign is intuitive: if a room is *late*, slide up.
+Sign is intuitive: if a room is *late*, slide up.
 
 If you'd rather have a measured starting point than tune by ear,
 `tools/measure_latency.py` plays a chirp through the target output and a
 reference output, records both with a USB microphone, cross-correlates, and
-prints a suggested value you can drop into the Configure slider:
+prints a suggested value you can type into the Configure value box:
 
 ```bash
 ./venv/bin/python tools/measure_latency.py --list     # check device names
@@ -340,6 +347,11 @@ If clients can't see the server, open these ports for the server's IP:
   coordinates clients; only its own speakers are silent.
 - **Client says "no sync from server"** — check the IP, the firewall, and
   that the server is actually running.
+- **A room shows *offline* in the Configure tab** — it hasn't been heard
+  from in ~15 seconds. The server marks a room online whenever its client
+  sends a sync/timing packet, so make sure that room's client service is
+  running and can reach the server (see the bullet above), then it should
+  turn green within a few seconds.
 - **Clients sound out of sync** — wait ~10 seconds for the clock estimator
   to settle; then `err` should drop to a few ms.
 - **Music is only on one speaker or sounds thin** — that's expected for the
