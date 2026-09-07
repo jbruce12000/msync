@@ -578,10 +578,12 @@ class SyncedServer:
             self.local_pos += C.CATCHUP_STEP if ef > 0 else -C.CATCHUP_STEP
             err = target - self.local_pos
         # gentle PI drift controller on the smoothed error (server is its own
-        # clock, so no FF); tight integrator clip + fast unwind so a stale
-        # windup can't keep the pitch pinned at ±MAX_PITCH
-        if abs(ef) > C.DRIFT_HYSTERESIS:
-            self._pitch_int += max(-C.INT_LIMIT, min(C.INT_LIMIT, ef))
+        # clock, so no FF) with an audible deadband like the client; tight
+        # integrator clip + fast unwind so a stale windup can't keep the
+        # pitch pinned at ±MAX_PITCH
+        ed = float(np.copysign(max(abs(ef) - C.DRIFT_HYSTERESIS, 0.0), ef))
+        if ed:
+            self._pitch_int += max(-C.INT_LIMIT, min(C.INT_LIMIT, ed))
             # integral pulling against the error: unwind it now
             if self._pitch_int * ef < 0.0:
                 self._pitch_int *= 0.5
@@ -589,7 +591,7 @@ class SyncedServer:
             self._pitch_int *= C.INT_UNWIND
         self._pitch_int = max(-C.INT_LIMIT, min(C.INT_LIMIT, self._pitch_int))
         pitch = max(-C.MAX_PITCH, min(C.MAX_PITCH,
-                    ef * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT))
+                    ed * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT))
         rate = 1.0 + pitch
         idx = max(0.0, self.local_pos * song.sr)
         n = len(song.data)

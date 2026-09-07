@@ -333,14 +333,14 @@ class SyncClient:
             if abs(ef) > C.CATCHUP_THRESHOLD:
                 self.local_pos += C.CATCHUP_STEP if ef > 0 else -C.CATCHUP_STEP
                 err = target - self.local_pos
-            # PI drift controller on the smoothed error: feedforward from
-            # NTP-measured clock drift, plus small proportional+integral
-            # correction for residual error. The integrator clip is tight
-            # (INT_LIMIT ≈ 400ppm authority) and it unwinds quickly
-            # (INT_UNWIND), so a stale windup cannot keep the pitch pinned
-            # at ±MAX_PITCH.
-            if abs(ef) > C.DRIFT_HYSTERESIS:
-                self._pitch_int += np.clip(ef, -C.INT_LIMIT, C.INT_LIMIT)
+            # PI drift controller on the smoothed error, with an audible
+            # deadband: sub-DRIFT_HYSTERESIS errors are inaudible and (for
+            # this box) mostly NTP-reference noise, so don't chase them —
+            # chasing produces a ±MAX_PITCH wobble. Errors inside the deadband
+            # only let the integrator unwind.
+            ed = float(np.copysign(max(abs(ef) - C.DRIFT_HYSTERESIS, 0.0), ef))
+            if ed:
+                self._pitch_int += np.clip(ed, -C.INT_LIMIT, C.INT_LIMIT)
                 # integral pulling against the error: unwind it now, not
                 # slowly over the next several seconds
                 if self._pitch_int * ef < 0.0:
@@ -350,7 +350,7 @@ class SyncClient:
             self._pitch_int = np.clip(self._pitch_int, -C.INT_LIMIT, C.INT_LIMIT)
             ff = self.clock.drift * 1e-6                      # s/s from NTP
             self.drift_pitch = float(np.clip(
-                ff + ef * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT,
+                ff + ed * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT,
                 -C.MAX_PITCH, C.MAX_PITCH))
             rate = 1.0 + self.drift_pitch
             # Status metric: smooth the CALLBACK-boundary error (the quantity
