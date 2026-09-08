@@ -1,8 +1,9 @@
 # msync — play the same music, in sync, on every machine
 
-msync lets you start a song on one machine and have it play **in sync on
-every other machine in the house** — your phone, a laptop, the living-room
-PC — all at the same instant, staying together for the whole song.
+msync is a music player for your home. It's composed of a server and one or 
+more clients. Those clients play the songs you selected in the web interface.
+The song plays synchronized on all clients. This way you can have music in your living room and patio be synchronized. This works even for systems that have a
+lot of latency like bluetooth or hdmi.
 
 It's two small Python programs:
 
