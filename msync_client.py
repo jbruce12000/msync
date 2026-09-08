@@ -351,13 +351,6 @@ class SyncClient:
         self._pitch_int = 0.0          # PI integrator state (tight clip + fast unwind)
         self.err_f = 0.0               # low-passed PLL error (EMA of callback err)
         self.err_smooth = 0.0          # rolling avg of callback-boundary error
-        # Optional Kalman error smoother (replaces the EMA when configured;
-        # A/B switchable via USE_KALMAN). Tuning comes from config.py
-        # (KALMAN_Q/R/GATE/GATE_SLEW). Keeps its own velocity estimate so
-        # it survives a rebase/re-seek via reset().
-        self.kalman = (C.ErrorKalman(config.KALMAN_Q, config.KALMAN_R,
-                                     config.KALMAN_GATE, config.KALMAN_GATE_SLEW)
-                       if config.USE_KALMAN else None)
         self.queue = []                # server queue (names), from TYPE_STATE
         self.queue_size = 0            # from TYPE_SYNC (cheap field)
 
@@ -494,17 +487,9 @@ class SyncClient:
             # into the PI, that noise saturates the ±0.2% pitch clamp on
             # nearly every block and the actuator limit-cycles at ±MAX_PITCH
             # (an audible slow speed wobble). Drive the loop from the
-            # smoothed error instead. Two smoothers are supported:
-            #   * the default fixed-gain EMA (PLL_ALPHA); and
-            #   * the optional ErrorKalman, which adapts its gain to the
-            #     measurement noise and estimates error velocity (a clean,
-            #     noise-free stand-in for a PID derivative term). A/B via
-            #     config.USE_KALMAN.
-            if self.kalman is not None:
-                ef = self.kalman.update(err, frames / buf.sr)
-            else:
-                self.err_f += C.PLL_ALPHA * (err - self.err_f)
-                ef = self.err_f
+            # smoothed error instead.
+            self.err_f += C.PLL_ALPHA * (err - self.err_f)
+            ef = self.err_f
             # Bounded fast re-alignment: right after a pause/resume, a busy
             # server stall, or a seek, a rate-only PLL capped at MAX_PITCH
             # would take tens of seconds to close a large gap. Nudge the
@@ -635,11 +620,6 @@ class SyncClient:
         """
         self._base_clock = C.ts()
         self._base_pos = self.local_pos
-        # The target reference just snapped to the playhead: the filter's
-        # position AND velocity estimates are stale (their evolution was
-        # anchored to the old reference). Re-anchor both.
-        if self.kalman is not None:
-            self.kalman.reset()
 
     # ------------------------------------------------------------------ #
     def _apply_state(self, st):
@@ -682,8 +662,6 @@ class SyncClient:
                     # reference, not decay toward it.
                     self._pitch_int = 0.0
                     self.err_f = 0.0
-                    if self.kalman is not None:
-                        self.kalman.reset()
                     # The stream STAYS OPEN through pauses — the callback
                     # just fills silence. Restarting PortAudio re-primes the
                     # device buffer, pushing this client audibly behind the
@@ -703,8 +681,6 @@ class SyncClient:
                     self._rebase()
                     self._pitch_int = 0.0
                     self.err_f = 0.0
-                    if self.kalman is not None:
-                        self.kalman.reset()
             elif self._loading_name == name:
                 return                # already fetching this track now
             prev_name = self.buffer.name    # how we tell a newer state "took over"
@@ -749,8 +725,6 @@ class SyncClient:
             self._rebase()
             self._pitch_int = 0.0          # fresh rebase: drop stale windup
             self.err_f = 0.0               # ... and the smoothed PLL error
-            if self.kalman is not None:
-                self.kalman.reset()
             self.playing = playing
             # Publish the new buffer LAST so the callback either sees the old
             # or the new track fully initialised, never a partial one.

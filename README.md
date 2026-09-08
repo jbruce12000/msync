@@ -440,44 +440,6 @@ constantly measures how fast its own clock runs compared to the DJ's
 at most 0.2% — to stay locked. That's how a whole house keeps in time
 without any clicks or skips.
 
-The drift controller is a phase-locked loop (PLL) inside the audio callback.
-It smooths the raw sync error — which carries tens of ms of NTP reference
-jitter plus a half-block sawtooth from the block-quantized playhead — and
-drives a proportional+integral pitch correction (with a small deadband and
-anti-windup). The default smoother is a fixed-gain EMA (`PLL_ALPHA`).
-
-### Experimental: Kalman error smoother
-
-Set `MSYNC_USE_KALMAN=1` (in `config.py` or as an environment variable for
-both services) to replace the EMA with a 2-state Kalman filter
-(`msync_common.ErrorKalman`) in both the server and client loops. Instead of
-a fixed averaging weight, the Kalman maintains a covariance of its own
-uncertainty and picks the *optimal* blend of prediction and measurement each
-step:
-
-- **Adaptive gain** — when the raw error is noisy (an NTP jitter spike) the
-  gain drops automatically and the estimate stops chasing it; when the
-  signal is clean it trusts the measurement more. The EMA has a single
-  fixed weight for all noise levels.
-- **Velocity state** — the filter estimates the error's rate of change
-  directly, giving the PLL a clean, de-noised derivative term to work with
-  (a PID's D term would amplify the same noise the Kalman averages away).
-- **Outlier rejection** — an innovation-gated update: a sample more than 4σ
-  outside the prediction is treated as a corrupted reference, its
-  measurement noise is inflated ~100×, and the estimate barely moves (the
-  classic PLL limit-cycle — pitch pinned at ±0.2% — never starts).
-- **Tuning** — `KALMAN_Q`, `KALMAN_R`, `KALMAN_GATE` and `KALMAN_GATE_SLEW`
-  in `config.py` (or `MSYNC_KALMAN_*` env vars). Increasing `q` or lowering
-  `r` makes the filter trust measurements more, shortening its effective time
-  constant; the defaults (`q=4e-6, r=1e-4`, ≈0.9s) match the EMA's
-  responsiveness and avoid the limit-cycle seen with the original laggier
-  `q=1e-6, r=5e-4` (≈2.1s) tuning on high-latency HDMI paths.
-
-Caveat: this is experimental and off by default — the EMA remains the
-battle-tested path. Expect identical steady-state behavior on a quiet
-network; the gain shows on a jittery one (e.g. a loaded Wi-Fi bridge or a
-busy server where NTP round-trips are noisy).
-
 ## Firewall / networking
 
 Clients discover the server via UDP broadcast, so make sure the server's
