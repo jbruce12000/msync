@@ -1,7 +1,7 @@
 # msync — play the same music, in sync, on every machine
 
 msync lets you start a song on one machine and have it play **in sync on
-every other machine in the room** — your phone, a laptop, the living-room
+every other machine in the house** — your phone, a laptop, the living-room
 PC — all at the same instant, staying together for the whole song.
 
 It's two small Python programs:
