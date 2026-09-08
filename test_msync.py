@@ -911,7 +911,29 @@ def test_error_kalman_converges_to_constant():
     # After the transient (first ~50 steps) the estimate sits near truth.
     tail = xs[50:]
     assert abs(np.mean(tail) - 0.030) < 0.005
-    assert np.std(tail) < 0.005           # smoother than the 20ms noise
+    # Defaults are tuned for responsiveness (tau ~0.9 s, matching the EMA)
+    # rather than maximum smoothing, so expect ~7 ms rms on 20 ms noise.
+    assert np.std(tail) < 0.010           # smoother than the 20ms noise
+
+
+def test_error_kalman_defaults_not_laggy():
+    # Regression guard for the limit-cycle fix: the original q=1e-6, r=5e-4
+    # defaults gave an effective ~2 s filter that lagged the true error
+    # through the catch-up nudge and limit-cycled the pitch clamp at
+    # +-MAX_PITCH on high-jitter paths. The tuned defaults must respond to a
+    # step within ~1 s (comparable to the EMA's tau~1.1 s).
+    k = C.ErrorKalman()
+    dt = 0.2
+    xs = []; t = 0.0; z = 0.0
+    rng = np.random.default_rng(3)
+    for _ in range(5):                     # settle on zero
+        xs.append(k.update(z, dt)); t += dt
+    z = 0.10                               # step to a 100 ms gap
+    for _ in range(5):
+        xs.append(k.update(z + rng.normal(0, 0.01), dt)); t += dt
+    # 1.0 s (5 steps) after the step the estimate must have closed >= 50% of
+    # the gap; a laggy ~2 s filter would still be below ~40%.
+    assert xs[-1] > 0.05
 
 
 def test_error_kalman_tracks_ramp_velocity():
@@ -957,8 +979,9 @@ def test_error_kalman_reset_clears_stale_velocity():
 
 
 def test_client_callback_with_kalman_smoothes_err(client):
-    # The Kalman path through the real callback (USE_KALMAN off in tests, so
-    # force it on this instance): after a warm-up to lockstep, an NTP-origin
+    # The Kalman path through the real callback. USE_KALMAN defaults on in
+    # the deployed config, but force this instance explicitly so the test
+    # does not depend on config.py: after a warm-up to lockstep, an NTP-origin
     # jitter must stay out of the loop's smoothed error — the estimate that
     # feeds the deadband + PI — just like the EMA path, while the raw err
     # spikes.

@@ -230,14 +230,17 @@ class ErrorKalman:
     noise in seconds^2.
     """
 
-    def __init__(self, q=1e-6, r=5e-4, gate=4.0, gate_slew=100.0):
+    def __init__(self, q=4e-6, r=1e-4, gate=4.0, gate_slew=100.0):
         # Process noise covariance (per second). `q` scales how much we trust
         # the constant-velocity model vs. the measurements; larger = trusts
         # measurements more, follows jitter; smaller = smoother but laggier.
+        # q=4e-6, r=1e-4 gives an effective ~0.9 s filter (comparable to the
+        # EMA's tau~1.1 s), fast enough to avoid limit-cycling the pitch
+        # clamp through the catch-up nudge on high-jitter output paths.
         self.q = q
         # Measurement noise variance (seconds^2). Larger = trusts each raw
-        # err less, degrades to a heavier low-pass. r=5e-4 s^2 is ~22 ms rms,
-        # consistent with the tens of ms of reference jitter seen in practice.
+        # err less, degrades to a heavier low-pass. r=1e-4 s^2 is ~10 ms rms,
+        # consistent with a few-to-tens of ms of reference jitter in practice.
         self.r = r
         # Innovation gating: a measurement whose Mahalanobis distance from the
         # prediction exceeds `gate` sigma is treated as an outlier (a torn /

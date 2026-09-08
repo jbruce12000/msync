@@ -352,9 +352,12 @@ class SyncClient:
         self.err_f = 0.0               # low-passed PLL error (EMA of callback err)
         self.err_smooth = 0.0          # rolling avg of callback-boundary error
         # Optional Kalman error smoother (replaces the EMA when configured;
-        # A/B switchable via USE_KALMAN). Keeps its own velocity estimate so
+        # A/B switchable via USE_KALMAN). Tuning comes from config.py
+        # (KALMAN_Q/R/GATE/GATE_SLEW). Keeps its own velocity estimate so
         # it survives a rebase/re-seek via reset().
-        self.kalman = C.ErrorKalman() if config.USE_KALMAN else None
+        self.kalman = (C.ErrorKalman(config.KALMAN_Q, config.KALMAN_R,
+                                     config.KALMAN_GATE, config.KALMAN_GATE_SLEW)
+                       if config.USE_KALMAN else None)
         self.queue = []                # server queue (names), from TYPE_STATE
         self.queue_size = 0            # from TYPE_SYNC (cheap field)
 

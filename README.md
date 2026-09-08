@@ -466,6 +466,12 @@ step:
   outside the prediction is treated as a corrupted reference, its
   measurement noise is inflated ~100×, and the estimate barely moves (the
   classic PLL limit-cycle — pitch pinned at ±0.2% — never starts).
+- **Tuning** — `KALMAN_Q`, `KALMAN_R`, `KALMAN_GATE` and `KALMAN_GATE_SLEW`
+  in `config.py` (or `MSYNC_KALMAN_*` env vars). Increasing `q` or lowering
+  `r` makes the filter trust measurements more, shortening its effective time
+  constant; the defaults (`q=4e-6, r=1e-4`, ≈0.9s) match the EMA's
+  responsiveness and avoid the limit-cycle seen with the original laggier
+  `q=1e-6, r=5e-4` (≈2.1s) tuning on high-latency HDMI paths.
 
 Caveat: this is experimental and off by default — the EMA remains the
 battle-tested path. Expect identical steady-state behavior on a quiet

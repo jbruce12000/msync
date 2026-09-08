@@ -124,7 +124,10 @@ class SyncedServer:
         self._pitch_int = 0.0       # drift PI integrator state
         self.err_f = 0.0            # low-passed PLL error (EMA of callback err)
         # Optional Kalman error smoother (replaces the EMA when configured).
-        self.kalman = C.ErrorKalman() if config.USE_KALMAN else None
+        # Tuning comes from config.py (KALMAN_Q/R/GATE/GATE_SLEW).
+        self.kalman = (C.ErrorKalman(config.KALMAN_Q, config.KALMAN_R,
+                                     config.KALMAN_GATE, config.KALMAN_GATE_SLEW)
+                       if config.USE_KALMAN else None)
         self._fade_out = False      # set by close_audio -> callback fades to silence
 
         # Startup playback: resume exactly where the previous run left off —

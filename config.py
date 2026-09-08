@@ -71,4 +71,19 @@ OUTPUT_LATENCY_MS = float(os.environ.get("MSYNC_OUTPUT_LATENCY_MS", "0"))
 # error velocity, which acts as a clean derivative term. Set to 1 to A/B
 # test against the EMA path; leave 0 for the battle-tested default. Read in
 # msync_server.py and msync_client.py.
-USE_KALMAN = os.environ.get("MSYNC_USE_KALMAN", "0") in ("1", "true", "yes")
+#USE_KALMAN = os.environ.get("MSYNC_USE_KALMAN", "0") in ("1", "true", "yes")
+USE_KALMAN = 1
+
+# Kalman filter tuning (used only when USE_KALMAN=1; see ErrorKalman in
+# msync_common.py). The defaults are conservative (q=1e-6, r=5e-4 gives an
+# effective ~2.1s filter, laggier than the EMA's ~1.1s, which can limit-cycle
+# the pitch clamp on high-jitter paths). The tuned values below (q=4e-6,
+# r=1e-4) match the EMA's responsiveness while keeping the outlier gate:
+#   q           process noise (s^2/s) - larger trusts measurements more
+#   r           measurement noise (s^2) - larger smooths more, lags more
+#   KALMAN_GATE  outlier rejection threshold (sigma); 0 disables
+#   KALMAN_GATE_SLEW  measurement-noise inflation for gated samples
+KALMAN_Q         = float(os.environ.get("MSYNC_KALMAN_Q", "4e-6"))
+KALMAN_R         = float(os.environ.get("MSYNC_KALMAN_R", "1e-4"))
+KALMAN_GATE      = float(os.environ.get("MSYNC_KALMAN_GATE", "4.0"))
+KALMAN_GATE_SLEW = float(os.environ.get("MSYNC_KALMAN_GATE_SLEW", "100.0"))
