@@ -80,6 +80,31 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
     vertical-align: -1px; animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* Toasts: fleeting status messages (bottom-right, auto-dismiss) */
+#toasts {
+    position: fixed; right: 16px; bottom: 16px; z-index: 100;
+    display: flex; flex-direction: column; gap: 8px;
+    pointer-events: none; max-width: min(380px, calc(100vw - 32px));
+}
+.toast {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    color: var(--text);
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.45);
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity 0.25s ease, transform 0.25s ease;
+    pointer-events: auto;   /* container is click-through; toasts themselves aren't */
+}
+.toast.show { opacity: 1; transform: translateY(0); }
+.toast.warn { border-left-color: var(--yellow); }
+.toast.error { border-left-color: var(--red); }
+.toast .toast-close { float: right; margin-left: 8px; color: var(--muted); cursor: pointer; user-select: none; }
+
 .panel-header { padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .panel-header h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); flex-shrink: 0; }
 .panel-header .count { font-size: 11px; color: var(--muted); }
@@ -334,6 +359,38 @@ async function api(method, path, body) {
     } catch(e) { return { error: e.message }; }
 }
 
+// ── Toasts ───────────────────────────────────────────────────────────
+// Fleeting status messages: slide up in the corner, auto-dismiss, and
+// float-close. kind: 'warn' / 'error' / undefined (default/accent).
+function toast(msg, kind, ms) {
+    const box = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast' + (kind ? ' ' + kind : '');
+    const close = document.createElement('span');
+    close.className = 'toast-close';
+    close.textContent = '✕';
+    close.onclick = () => dismiss();
+    el.appendChild(close);
+    el.appendChild(document.createTextNode(msg));
+    box.appendChild(el);
+    requestAnimationFrame(() => el.classList.add('show'));
+    let timer = null;
+    function dismiss() {
+        if (!el.isConnected) return;
+        clearTimeout(timer);
+        el.classList.remove('show');
+        el.addEventListener('transitionend', () => el.remove(), { once: true });
+        setTimeout(() => el.remove(), 600);   // safety net
+    }
+    timer = setTimeout(dismiss, ms || 2600);
+}
+
+// Last path segment (a queue relpath -> human display name).
+function shortName(p) {
+    const parts = String(p).split('/');
+    return parts[parts.length - 1];
+}
+
 // ── Tabs ─────────────────────────────────────────────────────────────
 let currentTab = 'search';
 function setTab(name) {
@@ -560,7 +617,18 @@ function updateScanStatus() {
 
 function control(action) { api('POST', `/api/control/${action}`); }
 function playSong(name) { api('POST', `/api/control/play`, { name }); }
-function queueAdd(name) { api('POST', '/api/queue/add', { name }); }
+async function queueAdd(name) {
+    const d = await api('POST', '/api/queue/add', { name });
+    if (d.error) { toast(d.error, 'error'); return; }
+    const added = d.added || [];
+    if (added.length) {
+        toast(added.length === 1
+            ? `Added to queue — ${shortName(added[0])}`
+            : `Added ${added.length} tracks to queue`);
+        fetchState();
+    }
+    // Duplicates are rejected silently by the server: nothing to show.
+}
 function queueClear() { api('POST', '/api/queue/clear'); }
 
 // Party mode: shuffle the whole collection and dump 50 random tracks (or all,
@@ -574,7 +642,12 @@ async function partyMode() {
     try {
         const names = pickRandom(all, 50);
         const d = await api('POST', '/api/queue/add', { names });
-        if (!d.error) await fetchState();   // refresh the queue list
+        if (d.error) { toast(d.error, 'error'); return; }
+        const added = d.added || [];
+        if (added.length) {
+            toast(`🎉 ${added.length} random track${added.length === 1 ? '' : 's'} added to queue`);
+            fetchState();   // refresh the queue list
+        }
     } finally {
         btn.disabled = false;
         btn.textContent = '🎉 Party';
@@ -704,7 +777,11 @@ function renderLibrary() {
         const visible = tracks.filter(t =>
             !q || (t._l || '').includes(q) || (alb._al || '').includes(q));
         if (q && !visible.length) continue;
-        const isOpen = openAlbums[alb.album] || !!q;
+        // When a search matches EVERY track of an album, show the group
+        // collapsed: the whole album is already under the header, so an
+        // expanded list adds nothing. A partial match stays open so the
+        // user sees exactly which tracks matched.
+        const isOpen = q ? visible.length < tracks.length : !!openAlbums[alb.album];
         const arrowCls = isOpen ? ' open' : '';
         const artistLabel = alb.artist ? esc(alb.artist) + ' · ' : '';
         html += `<div class="album-group">
@@ -752,11 +829,20 @@ function toggleAlbum(name) {
     renderLibrary();
 }
 
-function albumQueue(name) {
-    // Queue all tracks from an album
+async function albumQueue(name) {
+    // Queue every track of an album in one request (so a batch toast shows
+    // once with the count, instead of one toast per track).
     const alb = (library.albums || []).find(a => a.album === name);
     if (!alb) return;
-    for (const t of (alb.tracks || [])) queueAdd(t.relpath);
+    const names = (alb.tracks || []).map(t => t.relpath);
+    if (!names.length) return;
+    const d = await api('POST', '/api/queue/add', { names });
+    if (d.error) { toast(d.error, 'error'); return; }
+    const added = d.added || [];
+    if (added.length) {
+        toast(`Added ${added.length} track${added.length === 1 ? '' : 's'} to queue — ${name}`);
+        fetchState();
+    }
 }
 
 // Escape for safe innerHTML injection. The value is used both in plain text
@@ -943,5 +1029,8 @@ document.addEventListener('keydown', e => {
     }
 });
 </script>
+
+<!-- Fleeting status messages (toasts) -->
+<div id="toasts"></div>
 </body>
 </html>

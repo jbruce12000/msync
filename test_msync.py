@@ -307,6 +307,32 @@ def test_queue_rejects_missing_file(server):
     assert server.add_to_queue(["nope.mp3"]) == []
 
 
+def test_queue_rejects_duplicates_silently(server):
+    """Adding an already-queued track returns [] (silently, no error) —
+    whether it was queued before as a song entry or inside an album entry."""
+    assert server.add_to_queue(["track_02_B494.wav"]) == ["track_02_B494.wav"]
+    # Same track again: nothing added, nothing raised.
+    assert server.add_to_queue(["track_02_B494.wav"]) == []
+    # Same name case-insensitively (find_files resolves the real path).
+    assert server.add_to_queue(["TRACK_02_B494.WAV"]) == []
+    # Mixing a duplicate with a new track adds only the new one.
+    assert server.add_to_queue(["track_02_B494.wav", "track_03_C554.wav"]) \
+        == ["track_03_C554.wav"]
+
+
+def test_queue_rejects_track_already_in_queued_album(album_server):
+    """A track that's already inside a queued album entry must be rejected
+    when added by name — album entries occupy their whole track list."""
+    album_server.clear_queue()
+    assert album_server.add_album("Demo Album") == [
+        "Demo Album/01 Intro.wav", "Demo Album/02 Bridge.wav"]
+    # Both tracks are now claimed by the album entry, so adding them again
+    # (individually or together) is a silent no-op.
+    assert album_server.add_to_queue(["Demo Album/01 Intro.wav"]) == []
+    assert album_server.add_to_queue(["Demo Album/02 Bridge.wav",
+                                      "solo_single.wav"]) == ["solo_single.wav"]
+
+
 def test_queue_move_songs(server):
     """move_queue_item reorders expanded queue items — the drag & drop
     backend. ``to_index`` is the item's final landing index."""

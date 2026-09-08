@@ -277,9 +277,10 @@ class SyncedServer:
 
     def _song_entries(self, files):
         """Build song entries from a list of absolute file paths, skipping
-        any that are already queued. Returns (entries, added_relpaths)."""
-        seen = {e.get("path") for e in self.queue
-                if e.get("type") == "song" and e.get("path")}
+        any that are already queued — as a song entry OR inside an album
+        entry (partial duplicates are dropped silently; new tracks pass).
+        Returns (entries, added_relpaths)."""
+        seen = self._queued_paths()
         added = []
         for f in files:
             if f not in seen:
