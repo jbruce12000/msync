@@ -64,3 +64,11 @@ CLIENT_STALE_AFTER = int(os.environ.get("MSYNC_CLIENT_STALE_AFTER", "86400"))
 # run the script, it prints the value), then set that value here. 0 means
 # the normal amount of buffering is fine for this room.
 OUTPUT_LATENCY_MS = float(os.environ.get("MSYNC_OUTPUT_LATENCY_MS", "0"))
+
+# Use the 2-state Kalman error smoother in place of the fixed-gain EMA
+# (PLL_ALPHA) for the drift controller's smoothed input. Kalman adapts its
+# gain to measurement noise (better under NTP jitter spikes) and estimates
+# error velocity, which acts as a clean derivative term. Set to 1 to A/B
+# test against the EMA path; leave 0 for the battle-tested default. Read in
+# msync_server.py and msync_client.py.
+USE_KALMAN = os.environ.get("MSYNC_USE_KALMAN", "0") in ("1", "true", "yes")

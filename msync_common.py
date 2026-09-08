@@ -191,3 +191,111 @@ def tune_process():
             os.nice(-10)
         except OSError:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# Kalman error smoother (optional replacement for the PLL's EMA deadband)     #
+#                                                                             #
+# The rate controller feeds on `err_f`, a low-pass of the raw callback error. #
+# The raw error carries tens of ms of NTP-reference jitter and a half-block   #
+# sawtooth from local_pos stepping once per block, so the EMA (PLL_ALPHA,     #
+# tau ~0.6s at 5 Hz callbacks) must be fairly heavy to keep the pitch clamp   #
+# from limit-cycling at +-MAX_PITCH. A Kalman filter can do better: instead   #
+# of a fixed-weight average it maintains a covariance of its own uncertainty  #
+# and, at each measurement, blends the prediction with the observation using  #
+# the *optimal* weight for the given process/measurement noise. When noise    #
+# spikes (a bad NTP sample), the gain drops automatically and the estimate    #
+# stops chasing it; when the signal is clean it trusts the measurement more.  #
+#                                                                             #
+# The state here is the *true* synchronization error that the PLL chases:     #
+#   x       position error (s)  ~= target - local_pos, de-noised             #
+#   v       error velocity (s/s) - captures residual clock skew not covered  #
+#                                   by the NTP drift feedforward             #
+# A constant-velocity process model with a small Q (drift is slow) means      #
+# v does most of the filtering work: it integrates many observations into a   #
+# smooth slope, which is exactly what a derivative term would provide but     #
+# without amplifying measurement noise. Feed `x` (not the raw err) into the   #
+# same deadband + PI as before — the Kalman just replaces the EMA.            #
+# --------------------------------------------------------------------------- #
+class ErrorKalman:
+    """2-state constant-velocity Kalman filter smoothing the PLL error.
+
+    Usage mirrors the EMA it replaces: construct once, call ``update(err, dt)``
+    once per audio callback with the session's measured callback period, and
+    read ``.x`` for the smoothed error estimate. ``reset()`` re-anchors after
+    a rebase/seek so the filter does not carry stale velocity across a jump.
+
+    Parameters are expressed as rates so the filter is independent of the
+    callback period ``dt``: process noise in seconds^2/second, measurement
+    noise in seconds^2.
+    """
+
+    def __init__(self, q=1e-6, r=5e-4, gate=4.0, gate_slew=100.0):
+        # Process noise covariance (per second). `q` scales how much we trust
+        # the constant-velocity model vs. the measurements; larger = trusts
+        # measurements more, follows jitter; smaller = smoother but laggier.
+        self.q = q
+        # Measurement noise variance (seconds^2). Larger = trusts each raw
+        # err less, degrades to a heavier low-pass. r=5e-4 s^2 is ~22 ms rms,
+        # consistent with the tens of ms of reference jitter seen in practice.
+        self.r = r
+        # Innovation gating: a measurement whose Mahalanobis distance from the
+        # prediction exceeds `gate` sigma is treated as an outlier (a torn /
+        # corrupted NTP reference). Its effective measurement noise is scaled
+        # up by gate_slew, which collapses the Kalman gain for that step so a
+        # single bad sample cannot yank the estimate (the EMA has no such
+        # guard). Defaults: gate 4 sigma, ~100x noise inflation.
+        self.gate = gate
+        self.gate_slew = gate_slew
+        self.reset()
+
+    def reset(self):
+        self.x = 0.0          # position error estimate (s)
+        self.v = 0.0          # error velocity estimate (s/s)
+        # Covariance P = [[p00, p01], [p10, p11]]. Start uncertain.
+        self.p00 = 1.0
+        self.p01 = 0.0
+        self.p11 = 1.0
+        self._dt = 0.0
+
+    def update(self, z, dt):
+        """Fold one noisy measurement ``z`` (raw err) taken ``dt`` seconds
+        after the previous one into the estimate. Returns the smoothed x."""
+        if dt <= 0:
+            dt = 1e-4
+        self._dt = dt
+        # --- predict (constant velocity, dt seconds ahead) ---
+        self.x += self.v * dt
+        # propagation matrix F = [[1, dt], [0, 1]]
+        p00 = self.p00 + 2.0 * dt * self.p01 + dt * dt * self.p11 + self.q * dt
+        p01 = self.p01 + dt * self.p11
+        p11 = self.p11 + self.q * dt
+        # --- update (scalar measurement) ---
+        # innovation variance S = H P H' + R = p00 + r
+        s = p00 + self.r
+        if s <= 0:
+            s = 1e-12
+        # Innovation gating: reject gross outliers (corrupted NTP reference
+        # after a network stall, a torn packet, ...) by inflating the
+        # measurement noise for this step when the innovation is far outside
+        # what the model predicts. The gain collapses, so one bad sample
+        # barely moves the estimate (a fixed-gain EMA has no such guard).
+        # The inflated R is also used in the covariance update below, so an
+        # outlier does not spuriously shrink the filter's uncertainty.
+        innov = z - self.x
+        g = self.gate * self.gate * s
+        r_eff = self.r
+        if innov * innov > g:
+            r_eff = self.r * self.gate_slew
+            s = p00 + r_eff
+        k0 = p00 / s
+        k1 = p01 / s
+        self.x += k0 * innov
+        self.v += k1 * innov
+        # Joseph-form update keeps P symmetric positive-definite.
+        k0m = 1.0 - k0
+        self.p00 = k0m * k0m * p00 + k0 * k0 * r_eff
+        self.p01 = (1.0 - k0) * p01 - k1 * k0m * p00 + k0 * k1 * r_eff
+        self.p11 = (p11 - 2.0 * k1 * p01
+                    + k1 * k1 * (p00 + r_eff))
+        return self.x

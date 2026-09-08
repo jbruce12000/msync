@@ -123,6 +123,8 @@ class SyncedServer:
         self.local_pos = 0.0        # local playhead (seconds) in current song
         self._pitch_int = 0.0       # drift PI integrator state
         self.err_f = 0.0            # low-passed PLL error (EMA of callback err)
+        # Optional Kalman error smoother (replaces the EMA when configured).
+        self.kalman = C.ErrorKalman() if config.USE_KALMAN else None
         self._fade_out = False      # set by close_audio -> callback fades to silence
 
         # Startup playback: resume exactly where the previous run left off —
@@ -218,6 +220,8 @@ class SyncedServer:
         self.playing = True
         self._pitch_int = 0.0      # fresh track: fresh alignment state
         self.err_f = 0.0
+        if self.kalman is not None:
+            self.kalman.reset()
         # Publish the song ref LAST: the audio callback reads it without the
         # lock, so it either sees the fully-updated old state or the fully-
         # updated new state (at most one torn block at a track swap).
@@ -675,9 +679,13 @@ class SyncedServer:
         # half-block sawtooth from local_pos stepping once per block and, on
         # a client, reference jitter — enough to slam the ±0.2% pitch clamp
         # every block and start a limit cycle. Drive the controller from the
-        # smoothed error.
-        self.err_f += C.PLL_ALPHA * (err - self.err_f)
-        ef = self.err_f
+        # smoothed error. Same two smoothers as the client (EMA, or the
+        # ErrorKalman when config.USE_KALMAN is set).
+        if self.kalman is not None:
+            ef = self.kalman.update(err, frames / song.sr)
+        else:
+            self.err_f += C.PLL_ALPHA * (err - self.err_f)
+            ef = self.err_f
         # Bounded fast catch-up (same as the client): recovers from a server
         # stall or a fresh resume in a few blocks instead of a slow pitch
         # slew that would take tens of seconds. Gated on the smoothed error.
@@ -861,6 +869,8 @@ class SyncedServer:
                 self.song_start = C.ts() - self.local_pos
             self._pitch_int = 0.0      # pause/resume invalidates old windup
             self.err_f = 0.0           # (and the smoothed PLL error)
+            if self.kalman is not None:
+                self.kalman.reset()
             self._persist_playback()
         return self.playing
 
@@ -874,6 +884,8 @@ class SyncedServer:
             self.playing = False
             self._pitch_int = 0.0      # fresh alignment on the next play
             self.err_f = 0.0
+            if self.kalman is not None:
+                self.kalman.reset()
             self._persist_playback()
         return self.playing
 
