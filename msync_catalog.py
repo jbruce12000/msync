@@ -171,47 +171,55 @@ class Catalog:
         the room's just-reported playback sync error; None (e.g. plain NTP
         heartbeats) keeps the last reported value."""
         at = last_seen if last_seen is not None else time.time()
-        with self._conn:
-            if err_ms is None:
-                self._conn.execute("""
-                    INSERT INTO clients (ip, hostname, latency_ms, last_seen)
-                    VALUES (?, ?, 0, ?)
-                    ON CONFLICT(ip) DO UPDATE SET
-                        last_seen = excluded.last_seen
-                    """, (ip, hostname, at))
-            else:
-                self._conn.execute("""
-                    INSERT INTO clients (ip, hostname, latency_ms, err_ms,
-                                         last_seen)
-                    VALUES (?, ?, 0, ?, ?)
-                    ON CONFLICT(ip) DO UPDATE SET
-                        last_seen = excluded.last_seen,
-                        err_ms    = excluded.err_ms
-                    """, (ip, hostname, err_ms, at))
-            if hostname:
-                self._conn.execute("""
-                    UPDATE clients SET hostname = ? WHERE ip = ?
-                    """, (hostname, ip))
+        # Every DB writer must hold self.lock: the connection is shared
+        # across threads (check_same_thread=False) and two overlapping
+        # "with self._conn:" transactions raise "cannot start a transaction
+        # within a transaction". Heartbeats hit this path every second.
+        with self.lock:
+            with self._conn:
+                if err_ms is None:
+                    self._conn.execute("""
+                        INSERT INTO clients (ip, hostname, latency_ms, last_seen)
+                        VALUES (?, ?, 0, ?)
+                        ON CONFLICT(ip) DO UPDATE SET
+                            last_seen = excluded.last_seen
+                        """, (ip, hostname, at))
+                else:
+                    self._conn.execute("""
+                        INSERT INTO clients (ip, hostname, latency_ms, err_ms,
+                                             last_seen)
+                        VALUES (?, ?, 0, ?, ?)
+                        ON CONFLICT(ip) DO UPDATE SET
+                            last_seen = excluded.last_seen,
+                            err_ms    = excluded.err_ms
+                        """, (ip, hostname, err_ms, at))
+                if hostname:
+                    self._conn.execute("""
+                        UPDATE clients SET hostname = ? WHERE ip = ?
+                        """, (hostname, ip))
 
     def client_latency(self, ip):
         """Stored latency offset (ms) for a client, 0 if unknown."""
-        row = self._conn.execute(
-            "SELECT latency_ms FROM clients WHERE ip = ?", (ip,)).fetchone()
-        return float(row[0]) if row else 0.0
+        with self.lock:
+            row = self._conn.execute(
+                "SELECT latency_ms FROM clients WHERE ip = ?", (ip,)).fetchone()
+            return float(row[0]) if row else 0.0
 
     def set_client_latency(self, ip, ms):
-        with self._conn:
-            self._conn.execute("""
-                INSERT INTO clients (ip, hostname, latency_ms, last_seen)
-                VALUES (?, '', ?, ?)
-                ON CONFLICT(ip) DO UPDATE SET latency_ms = excluded.latency_ms
-                """, (ip, ms, time.time()))
+        with self.lock:
+            with self._conn:
+                self._conn.execute("""
+                    INSERT INTO clients (ip, hostname, latency_ms, last_seen)
+                    VALUES (?, '', ?, ?)
+                    ON CONFLICT(ip) DO UPDATE SET latency_ms = excluded.latency_ms
+                    """, (ip, ms, time.time()))
 
     def list_clients(self):
         """Every known client: ip, hostname, latency_ms, err_ms, last_seen."""
-        rows = self._conn.execute("""
-            SELECT ip, hostname, latency_ms, err_ms, last_seen FROM clients
-            ORDER BY hostname, ip""").fetchall()
+        with self.lock:
+            rows = self._conn.execute("""
+                SELECT ip, hostname, latency_ms, err_ms, last_seen FROM clients
+                ORDER BY hostname, ip""").fetchall()
         return [{"ip": r[0], "hostname": r[1], "latency_ms": r[2],
                  "err_ms": r[3], "last_seen": r[4]} for r in rows]
 
@@ -220,9 +228,10 @@ class Catalog:
         (their heartbeat/register timestamps in ``last_seen`` are older than
         that) so dead rooms leave the catalog DB — and the Configure tab."""
         cutoff = time.time() - stale_after
-        with self._conn:
-            self._conn.execute(
-                "DELETE FROM clients WHERE last_seen < ?", (cutoff,))
+        with self.lock:
+            with self._conn:
+                self._conn.execute(
+                    "DELETE FROM clients WHERE last_seen < ?", (cutoff,))
 
     def _album_of(self, relpath):
         parts = relpath.split("/")

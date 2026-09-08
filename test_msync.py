@@ -572,6 +572,55 @@ def test_catalog_client_heartbeat_refreshes_last_seen(tmp_path):
     assert row["last_seen"] > 1000.0                # heartbeat refreshed it
 
 
+def test_catalog_heartbeat_wins_against_concurrent_writer(tmp_path):
+    """A client heartbeat (upsert_client, sent ~every second) must not crash
+    the sync thread when another DB writer (queue add, playback persist, scan)
+    is mid-transaction on the same shared connection. Regression for a real
+    outage: 'cannot start a transaction within a transaction' killed the UDP
+    loop, silently leaving every room offline in the Configure tab."""
+    import threading
+    c = Catalog(str(tmp_path), str(tmp_path / "c.db"))
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def other_writer():
+        # Host the catalog lock + an open write transaction, the way a
+        # concurrent save_queue/save_playback/scan would.
+        with c.lock, c._conn:
+            c._conn.execute("DELETE FROM clients")
+            entered.set()
+            release.wait(10)          # hold the transaction open
+
+    tw = threading.Thread(target=other_writer)
+    tw.start()
+    assert entered.wait(5)            # the other writer owns the DB now
+
+    result = {}
+
+    def heartbeat():
+        try:
+            c.upsert_client("10.0.0.9", "room9")
+            result["ok"] = True
+        except Exception as exc:
+            result["err"] = repr(exc)
+
+    th = threading.Thread(target=heartbeat)
+    th.start()
+    time.sleep(0.2)
+    try:
+        # The heartbeat must WAIT for the writer, not raise/complete early.
+        assert "ok" not in result and "err" not in result
+        assert th.is_alive()
+    finally:
+        release.set()
+    tw.join(timeout=5)
+    th.join(timeout=5)
+    assert result.get("ok"), f"heartbeat failed: {result.get('err')}"
+    row = {r["ip"]: r for r in c.list_clients()}["10.0.0.9"]
+    assert row["last_seen"] > 0
+
+
 def test_catalog_client_err_ms_roundtrip(tmp_path):
     # The Configure tab shows each room's sync error: registers carry it in,
     # plain heartbeats must not wipe it, and a newer register replaces it.

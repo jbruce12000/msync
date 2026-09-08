@@ -976,19 +976,23 @@ class SyncedServer:
         bcast = ("255.255.255.255", self.port)
         print(f"[server] UDP sync on port {self.port}")
         last_bcast, last_state = 0.0, 0.0
+        last_warn = 0.0
 
         while not self._stop.is_set():
-            t = C.ts()
-            if t - last_bcast >= C.SYNC_INTERVAL:
-                sock.sendto(C.make_packet(C.TYPE_SYNC, **self._sync_payload()), bcast)
-                last_bcast = t
-            if t - last_state >= C.STATE_INTERVAL:
-                sock.sendto(C.make_packet(C.TYPE_STATE, **self._state_payload()), bcast)
-                last_state = t
-            # handle incoming (NTP requests, registers)
-            sock.settimeout(C.SYNC_INTERVAL / 2)
             try:
-                data, addr = sock.recvfrom(2048)
+                t = C.ts()
+                if t - last_bcast >= C.SYNC_INTERVAL:
+                    sock.sendto(C.make_packet(C.TYPE_SYNC, **self._sync_payload()), bcast)
+                    last_bcast = t
+                if t - last_state >= C.STATE_INTERVAL:
+                    sock.sendto(C.make_packet(C.TYPE_STATE, **self._state_payload()), bcast)
+                    last_state = t
+                # handle incoming (NTP requests, registers)
+                sock.settimeout(C.SYNC_INTERVAL / 2)
+                try:
+                    data, addr = sock.recvfrom(2048)
+                except socket.timeout:
+                    continue
                 p = C.parse_packet(data)
                 if not p:
                     continue
@@ -1026,6 +1030,15 @@ class SyncedServer:
                     sock.sendto(C.make_packet(C.TYPE_LATENCY, ms=lat), addr)
             except socket.timeout:
                 continue
+            except Exception as exc:
+                # Never let a transient error (busy/locked catalog during a
+                # scan, a malformed packet, ENOBUFS spam, ...) kill the sync
+                # loop: without it clients drift out of sync and the Configure
+                # tab shows every room offline. Log (rate-limited) and continue.
+                if time.time() - last_warn >= 5.0:
+                    C.logger().warning(
+                        "udp: sync loop error (continuing): %r", exc)
+                    last_warn = time.time()
         sock.close()
 
 
