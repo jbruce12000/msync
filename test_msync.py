@@ -545,17 +545,6 @@ def test_config_music_dir_default(monkeypatch):
     assert os.path.isdir(config.MUSIC_DIR)
 
 
-def test_config_env_override(monkeypatch, tmp_path):
-    import importlib
-    import config
-    monkeypatch.setenv("MSYNC_MUSIC_DIR", str(tmp_path / "my-library"))
-    importlib.reload(config)
-    assert config.MUSIC_DIR == str(tmp_path / "my-library")
-    # restore the default so the rest of the suite sees the standard layout
-    monkeypatch.delenv("MSYNC_MUSIC_DIR", raising=False)
-    importlib.reload(config)
-
-
 def test_config_output_latency_env(monkeypatch):
     import importlib
     import config

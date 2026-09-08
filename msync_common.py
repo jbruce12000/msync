@@ -69,6 +69,11 @@ REGISTER_INTERVAL = 10.0    # client re-registration period (s): keeps the
                             # server restarts (the server also treats every
                             # NTP request as a heartbeat)
 
+# Idle / paused intervals – broadcast much less when nothing is moving
+IDLE_SYNC_INTERVAL  = 10.0  # server sync broadcast period when paused/stopped
+IDLE_STATE_INTERVAL = 10.0  # server state broadcast period when paused/stopped
+IDLE_NTP_INTERVAL   = 10.0  # client NTP resync period when paused/stopped
+
 # Playback tuning
 LATENCY_SEC   = 0.20        # client start latency per song (schedule ahead)
 MAX_PITCH     = 0.002       # max drift correction pitch (0.2%)

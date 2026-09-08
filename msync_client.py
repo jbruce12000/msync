@@ -791,7 +791,7 @@ class SyncClient:
 
         try:
             while not self._stop.is_set():
-                sock.settimeout(0.1)
+                sock.settimeout(1.0 if not self.playing else 0.1)
                 try:
                     data, addr = sock.recvfrom(4096)
                     p = C.parse_packet(data)
@@ -825,7 +825,8 @@ class SyncClient:
                         last_warn = time.time()
 
                 now = time.time()
-                if now - last_ntp >= C.NTP_INTERVAL:
+                ntp_int = C.NTP_INTERVAL if self.playing else C.IDLE_NTP_INTERVAL
+                if now - last_ntp >= ntp_int:
                     if self.clock.exchange(sock):
                         if abs(self.clock.drift) > 1.0:
                             pass  # debug optionally

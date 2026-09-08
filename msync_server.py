@@ -1009,14 +1009,16 @@ class SyncedServer:
         while not self._stop.is_set():
             try:
                 t = C.ts()
-                if t - last_bcast >= C.SYNC_INTERVAL:
+                sync_int = C.SYNC_INTERVAL if self.playing else C.IDLE_SYNC_INTERVAL
+                state_int = C.STATE_INTERVAL if self.playing else C.IDLE_STATE_INTERVAL
+                if t - last_bcast >= sync_int:
                     sock.sendto(C.make_packet(C.TYPE_SYNC, **self._sync_payload()), bcast)
                     last_bcast = t
-                if t - last_state >= C.STATE_INTERVAL:
+                if t - last_state >= state_int:
                     sock.sendto(C.make_packet(C.TYPE_STATE, **self._state_payload()), bcast)
                     last_state = t
                 # handle incoming (NTP requests, registers)
-                sock.settimeout(C.SYNC_INTERVAL / 2)
+                sock.settimeout(sync_int / 2)
                 try:
                     data, addr = sock.recvfrom(2048)
                 except socket.timeout:
