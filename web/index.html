@@ -65,6 +65,23 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 .slider-centre { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-top: 2px; }
 .empty-state { color: var(--muted); text-align: center; padding: 24px; font-size: 12px; }
 
+/* Catalog scan progress (shown while the server indexes/refreshes the library) */
+.scan-banner {
+    background: rgba(88,166,255,0.12);
+    color: var(--accent);
+    font-size: 11px;
+    text-align: center;
+    padding: 5px 12px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.scan-banner[hidden] { display: none; }
+.scan-banner .spinner { display: inline-block; margin-right: 6px;
+    vertical-align: -1px; animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
 .panel-header { padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .panel-header h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); flex-shrink: 0; }
 .panel-header .count { font-size: 11px; color: var(--muted); }
@@ -267,6 +284,11 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
     <button class="tab active" data-tab="play" onclick="setTab('play')">Play</button>
     <button class="tab" data-tab="queue" onclick="setTab('queue')">Queue</button>
     <button class="tab" data-tab="config" onclick="setTab('config')">Configure</button>
+</div>
+
+<!-- Catalog scan progress (hidden unless the server is indexing) -->
+<div class="scan-banner" id="scan-banner" hidden>
+    <span class="spinner">⟳</span><span id="scan-text"></span>
 </div>
 
 <!-- Play view: Library -->
@@ -525,7 +547,23 @@ async function fetchState() {
     if (d.error) return;
     state = d;
     updateHeader();
+    updateScanStatus();
     renderQueue();
+}
+
+// Show a slim banner while the server scans/indexes the music folder (e.g. a
+// fresh catalog). The page otherwise renders as normal — partial results just
+// appear in the library as the scan checkpoints them in.
+function updateScanStatus() {
+    const banner = document.getElementById('scan-banner');
+    const text = document.getElementById('scan-text');
+    const cs = state.catalog_scan;
+    if (cs && cs.running && cs.total) {
+        text.textContent = `Indexing your music… ${cs.done.toLocaleString()} / ${cs.total.toLocaleString()}`;
+        banner.hidden = false;
+    } else {
+        banner.hidden = true;
+    }
 }
 
 function control(action) { api('POST', `/api/control/${action}`); }

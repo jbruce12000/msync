@@ -1098,7 +1098,11 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
             elif path.startswith("/static/"):
                 self._send_static(path[len("/static/"):])
             elif path == "/api/state":
-                self._json(srv._state_payload())
+                # catalog_scan is HTTP-only: the UDP broadcast path shares
+                # _state_payload() and shouldn't carry UI-progress chatter.
+                payload = srv._state_payload()
+                payload["catalog_scan"] = srv.catalog.scan_progress()
+                self._json(payload)
             elif path == "/api/library":
                 self._json({"songs": srv.library_list(),
                             "albums": srv.album_list_full(),

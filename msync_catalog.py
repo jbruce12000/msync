@@ -26,6 +26,11 @@ HIDDEN_DIRS = (".queue",)      # drop-to-queue mailbox is not a music album
 
 AUDIO_EXTS = (".mp3", ".ogg", ".wav", ".flac", ".m4a", ".aac", ".opus", ".wma")
 
+# scan() checkpoints catalog DB writes every N metadata reads so a fresh or
+# heavily out-of-date catalog fills in progressively and readers (the web UI)
+# always see a consistent, locked-free snapshot during a big re-tag.
+SCAN_CHECKPOINT = 200
+
 
 def is_audio_name(name):
     return os.path.splitext(name)[1].lower() in AUDIO_EXTS
@@ -84,6 +89,14 @@ class Catalog:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._ensure_schema()
+        # Only one full scan runs at a time (startup background scan, the
+        # monitor loop's periodic one, and inotify-triggered ones all share
+        # this). A scan that finds another already running skips itself.
+        self._scan_lock = threading.Lock()
+        # Scan progress for the web UI: (to_read, done, total) while a scan
+        # is running, None when idle. Written by the scanning thread and read
+        # lock-free by HTTP handlers (single tuple assignment is atomic).
+        self.scan_status = None
 
     def close(self):
         try:
@@ -285,7 +298,28 @@ class Catalog:
 
     def scan(self):
         """Refresh the catalog from disk; only changed files are re-read.
+
+        The slow part (tag metadata reads) runs WITHOUT holding self.lock, so
+        the web UI's library/queue/state queries keep working while a big
+        library is re-tagged. Rows are checkpointed to the DB in batches so a
+        fresh catalog fills in progressively (and scan_progress() reports
+        how far along it is) instead of appearing empty until it finishes.
+
         Returns the number of rows added/updated/removed."""
+        # Never let concurrent scans (startup, monitor loop, inotify) pile up
+        # into overlapping metadata reads; a dropped scan simply does nothing
+        # — the next periodic scan picks up any remaining work.
+        if not self._scan_lock.acquire(blocking=False):
+            return 0
+        try:
+            try:
+                return self._scan_inner()
+            finally:
+                self.scan_status = None   # even on an unexpected exception
+        finally:
+            self._scan_lock.release()
+
+    def _scan_inner(self):
         now = time.time()
         lg = C.logger()
         seen = {}
@@ -302,8 +336,7 @@ class Catalog:
                 # size, album, added_at, title).
                 stale[rp] = (fn, mtime, size, album, added_at, title)
 
-            upserts, missing = [], []
-            to_read = []
+            to_read, missing = [], []
             for rp, (fn, mtime, size, path) in seen.items():
                 old = stale.get(rp)
                 # Unchanged files are skipped — unless they came from a
@@ -315,37 +348,60 @@ class Catalog:
                 to_read.append((rp, fn, mtime, size, path))
             missing = [rp for rp in stale if rp not in seen]
 
-            # The first scan (or a new/changed file) needs a metadata read per
-            # file, which is the slow part on a big library — show progress.
-            nread = len(to_read)
-            if nread:
-                lg.info("catalog: reading metadata for %d new/changed "
-                        "track(s) (of %d total)", nread, total)
-            for i, (rp, fn, mtime, size, path) in enumerate(to_read, 1):
-                meta = self._read_meta(path)
-                upserts.append((
-                    rp, fn,
-                    meta["album"] or self._album_of(rp),  # tag, else folder
-                    meta["artist"] or "",
-                    meta["title"] or fn,                  # tag, else filename
-                    meta["track"],
-                    meta["duration"], meta["sample_rate"], meta["channels"],
-                    size, mtime, now))
-                if nread > 100 and (i % 100 == 0 or i == nread):
-                    lg.info("catalog: metadata %d/%d", i, nread)
+        # The first scan (or a new/changed file) needs a metadata read per
+        # file, which is the slow part on a big library — show progress.
+        nread = len(to_read)
+        if nread:
+            lg.info("catalog: reading metadata for %d new/changed "
+                    "track(s) (of %d total)", nread, total)
+        self.scan_status = (nread, 0, total)
 
-            with self._conn:
-                if upserts:
+        def checkpoint(rows, dels):
+            """Write one consistent batch under the lock (WAL readers see a
+            point-in-time snapshot, so queries never glimpse torn rows)."""
+            with self.lock, self._conn:
+                if rows:
                     self._conn.executemany("""
                         INSERT OR REPLACE INTO tracks
                         (relpath, name, album, artist, title, track, duration,
                          sample_rate, channels, size, mtime, added_at)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", upserts)
-                if missing:
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+                if dels:
                     self._conn.executemany(
                         "DELETE FROM tracks WHERE relpath=?",
-                        [(m,) for m in missing])
-        return len(upserts) + len(missing)
+                        [(m,) for m in dels])
+
+        upserts = []
+        for i, (rp, fn, mtime, size, path) in enumerate(to_read, 1):
+            # Metadata reads happen WITHOUT the catalog lock so HTTP queries
+            # (albums, state, queue) stay responsive during the scan.
+            meta = self._read_meta(path)
+            upserts.append((
+                rp, fn,
+                meta["album"] or self._album_of(rp),  # tag, else folder
+                meta["artist"] or "",
+                meta["title"] or fn,                  # tag, else filename
+                meta["track"],
+                meta["duration"], meta["sample_rate"], meta["channels"],
+                size, mtime, now))
+            if nread > 100 and (i % 100 == 0 or i == nread):
+                lg.info("catalog: metadata %d/%d", i, nread)
+            if len(upserts) >= SCAN_CHECKPOINT:
+                checkpoint(upserts, [])
+                upserts = []
+            self.scan_status = (nread, i, total)
+        checkpoint(upserts, missing)
+        self.scan_status = None
+        return nread + len(missing)
+
+    def scan_progress(self):
+        """Scan progress for the web UI, or None when idle:
+        {'running': True, 'total': N, 'done': N, 'to_read': N}."""
+        if self.scan_status is None:
+            return None
+        to_read, done, total = self.scan_status
+        return {"running": True, "total": total,
+                "done": min(done, total), "to_read": to_read}
 
     # ------------------------------------------------------------------ #
     # Queries                                                             #

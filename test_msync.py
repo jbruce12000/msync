@@ -1158,6 +1158,62 @@ def test_catalog_migrates_old_db_and_rereads(tmp_path):
     assert cat.scan() == 0
 
 
+def test_scan_never_blocks_reads_and_reports_progress(tmp_path, monkeypatch):
+    """A catalog scan (metadata re-tag) must not block catalog queries: the
+    web UI's /api/state and /api/library endpoints stay responsive while a
+    fresh or out-of-date library is being scanned. The scan reports progress,
+    overlapping scans are skipped (no scan pile-up), and the DB still ends up
+    fully populated."""
+    import threading
+    lib = tmp_path / "lib"
+    for k in range(3):
+        (lib / f"Album {k}").mkdir(parents=True)
+    for i in range(15):
+        make_tagged_wav(lib / f"Album {i % 3}" / f"{i:02d} Track.wav",
+                        title=f"Track {i}", artist="Some Artist",
+                        album=f"Album {i % 3}")
+    make_tagged_wav(lib / "Single.wav")        # root-level single
+    monkeypatch.setattr("msync_catalog.SCAN_CHECKPOINT", 5)
+
+    # Slow the (normally fast) metadata reads so the scan is genuinely
+    # in-flight while we probe it from "the web UI thread".
+    real_read_meta = Catalog._read_meta
+    monkeypatch.setattr(
+        Catalog, "_read_meta",
+        lambda self, path: (time.sleep(0.15), real_read_meta(self, path))[1])
+
+    cat = Catalog(str(lib), str(tmp_path / "cat.db"))
+    result = {}
+    def run_scan():
+        result["n"] = cat.scan()
+    t = threading.Thread(target=run_scan)
+    t.start()
+    try:
+        time.sleep(0.25)                       # get into the metadata loop
+        prog = cat.scan_progress()
+        assert prog and prog["running"]
+        assert prog["to_read"] == 16 and prog["total"] == 16
+        assert prog["done"] >= 1, f"scan not progressing: {prog}"
+
+        # Reads must NOT wait on the scan: an in-flight read would take
+        # ~16 x 0.15s = 2.4s to finish under the old (blocking) design.
+        t0 = time.time()
+        cat.albums_with_tracks()
+        cat.track("Album 0/00 Track.wav")
+        elapsed = time.time() - t0
+        assert elapsed < 0.5, \
+            f"catalog read blocked {elapsed:.2f}s behind the scan"
+
+        # A second scan while one is running does nothing (no pile-up).
+        assert cat.scan() == 0
+    finally:
+        t.join(timeout=30)
+    assert result["n"] == 16
+    assert cat.scan_progress() is None         # idle again once finished
+    assert len(cat.albums()) == 3
+    assert cat.track("Single.wav") is not None
+
+
 def test_refresh_playlist_keeps_current_song(album_server):
     """Reordering the playlist — as a background scan does when tagged
     track numbers order an album differently from its filenames — must
