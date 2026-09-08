@@ -135,7 +135,15 @@ class ClockSync:
 
 
 class SongBuffer:
-    """Decoded current song data, downloaded from server via HTTP."""
+    """Decoded current song data, downloaded from server via HTTP.
+
+    Decoded audio is stored on disk as a raw float32 binary file and read
+    back via numpy.memmap.  On machines with plenty of RAM the OS keeps the
+    pages resident (zero extra I/O); on memory-constrained hosts (e.g. a
+    Raspberry Pi Zero with 512 MB) the kernel pages unused regions out to
+    swap/SD-card, letting the client run without fitting the whole decoded
+    song in physical memory.
+    """
 
     def __init__(self, cache_dir):
         self.cache_dir = cache_dir
@@ -145,11 +153,38 @@ class SongBuffer:
         self.sr = 44100
         self.nchannels = 2
         self.duration = 0.0
+        self._decoded_path = None   # on-disk float32 file behind self.data
+
+    def close(self):
+        """Release the memmap and remove the decoded temp file (if any)."""
+        self._release_data()
+        self.name = None
+        self.data = None
+        self.duration = 0.0
+        self._decoded_path = None
+
+    def _release_data(self):
+        """Flush and close the current memmap, then delete its temp file."""
+        if self.data is not None and hasattr(self.data, "flush"):
+            try:
+                self.data.flush()
+            except Exception:
+                pass
+            del self.data
+            self.data = None
+        if self._decoded_path is not None:
+            try:
+                os.remove(self._decoded_path)
+            except OSError:
+                pass
+            self._decoded_path = None
 
     def load(self, host, port, name, duration=None):
         if name == self.name and self.data is not None:
             return True
-        # Try cache first
+        # Release any previous decoded data before loading a new song
+        self._release_data()
+        # Try cache first (skip the HTTP round-trip)
         path = os.path.join(self.cache_dir, name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         if os.path.isfile(path):
@@ -190,13 +225,22 @@ class SongBuffer:
     def _prune_cache(self, keep=None):
         """Bound the download cache to CACHE_MAX_FILES tracks, deleting the
         oldest (by mtime) when over. ``keep`` is the just-downloaded file,
-        which is spared even under clock skew. Failures are ignored: this is a
-        cache, not a requirement."""
+        which is spared even under clock skew.  Files whose name ends with
+        ``.decoded`` are memmap temporaries that should have been cleaned up
+        by ``_release_data``; any strays are also removed.  Failures are
+        ignored: this is a cache, not a requirement."""
         try:
             entries = []
             for root, _dirs, files in os.walk(self.cache_dir):
                 for fn in files:
                     p = os.path.join(root, fn)
+                    # Always remove orphaned .decoded temp files
+                    if fn.endswith(".decoded"):
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+                        continue
                     if p == keep:
                         continue
                     try:
@@ -208,29 +252,60 @@ class SongBuffer:
                 for _mtime, _size, p in entries[:len(entries) - CACHE_MAX_FILES]:
                     try:
                         os.remove(p)
+                        # Also remove its companion .decoded if present
+                        try:
+                            os.remove(p + ".decoded")
+                        except OSError:
+                            pass
                     except OSError:
                         pass
         except OSError:
             pass
 
     def _decode(self, path):
+        """Decode *path* to a disk-backed memmap of stereo float32 samples.
+
+        The decoded samples are written to a ``.decoded`` file next to the
+        source and memory-mapped read-only.  This keeps the decoded audio
+        on disk and lets the OS page it in/out on demand — critical on
+        memory-constrained hosts like the Pi Zero — while appearing as a
+        normal numpy array to the audio callback.
+        """
         decoded = miniaudio.decode_file(path, output_format=miniaudio.SampleFormat.FLOAT32)
         self.sr = decoded.sample_rate
         # Normalize to true stereo (N, 2) float32. Monaural sources are
         # broadcast to both channels; >2ch sources keep the first two.
         frames = np.frombuffer(decoded.samples, dtype=np.float32)
         if decoded.nchannels == 2:
-            self.data = frames.reshape(-1, 2)
+            stereo = frames.reshape(-1, 2)
         elif decoded.nchannels == 1:
-            self.data = np.repeat(frames[:, None], 2, axis=1)
+            stereo = np.repeat(frames[:, None], 2, axis=1)
         else:
             f = frames.reshape(-1, decoded.nchannels)
-            self.data = f[:, :2].copy() if decoded.nchannels > 2 else f
+            stereo = f[:, :2].copy() if decoded.nchannels > 2 else f
+
+        # Write the decoded stereo float32 to a disk file and memmap it so
+        # the OS can page regions out of physical RAM on memory-constrained
+        # hosts.  On machines with headroom the pages stay resident (zero
+        # extra I/O beyond the initial decode+write).
+        decoded_path = path + ".decoded"
+        with open(decoded_path, "wb") as f:
+            f.write(stereo.tobytes())
+        del stereo          # free the in-memory copy immediately
+
+        self.data = np.memmap(decoded_path, dtype=np.float32, mode="r")
+        # Reshape back to (N, 2) stereo — memmap supports this without
+        # copying; the view is backed by the same disk pages.
+        nframes = len(self.data) // 2
+        self.data = self.data.reshape(nframes, 2)
+        self._decoded_path = decoded_path
+
         self.nchannels = 2
-        self.duration = len(self.data) / self.sr
+        self.duration = nframes / self.sr
         # self.name is set by the caller (SongBuffer.load) to the relpath
         # so don't overwrite it here; just print the basename.
-        print(f"[client] loaded {os.path.basename(path)} ({self.duration:.1f}s, stereo)")
+        print(f"[client] loaded {os.path.basename(path)} "
+              f"({self.duration:.1f}s, stereo, memmap)")
         return True
 
 
@@ -543,6 +618,7 @@ class SyncClient:
         self._loading_name = name
         try:
             if not scratch.load(self.host, self.port, name, duration):
+                scratch.close()     # clean up any partial decoded file
                 return
         finally:
             # clear the in-flight marker (a false "loading" only ever skips a
@@ -554,6 +630,7 @@ class SyncClient:
             # we were downloading (the buffer still holds `prev_name`, the
             # song we were already on)
             if self.buffer.name != prev_name:
+                scratch.close()     # discard: a newer track superseded this one
                 return
             self.server_song_start = song_start
             self.local_pos = max(0.0, self.clock.server_now() - song_start)
@@ -754,6 +831,7 @@ class SyncClient:
             pass
         finally:
             self.close_audio()
+            self.buffer.close()        # release memmap + temp file
             try:
                 sock.close()
             except Exception:

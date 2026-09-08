@@ -247,6 +247,7 @@ class ClientHarness:
         except Exception:
             pass
         self.client.close_audio()
+        self.client.buffer.close()
 
 
 @pytest.fixture
