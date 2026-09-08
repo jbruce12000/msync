@@ -838,16 +838,47 @@ class SyncClient:
                 pass
 
 
-def resolve_server(cli_server, config_server=None):
-    """Pick the sync server host/IP. An explicit --server wins over config.py's
-    SERVER (so manual/testing runs can point anywhere without editing config);
-    when no flag is given, config.py's SERVER is used, falling back to the
-    loopback address if it is blank."""
+def discover_server(port, timeout=3.0):
+    """Listen for the server's TYPE_STATE broadcast and return its IP.
+
+    The server sends TYPE_STATE packets to 255.255.255.255 once per second;
+    a client on the same LAN subnet will receive them.  Returns the source
+    IP of the first valid packet, or None on timeout."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    try:
+        sock.bind(("", port))
+        sock.settimeout(timeout)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                data, addr = sock.recvfrom(4096)
+                p = C.parse_packet(data)
+                if p and p[0] == C.TYPE_STATE:
+                    return addr[0]          # source IP of the broadcast
+            except socket.timeout:
+                break
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    return None
+
+
+def resolve_server(cli_server=None):
+    """Pick the sync server host/IP.
+
+    Priority: --server flag > UDP broadcast discovery > 127.0.0.1 fallback."""
     if cli_server:
         return cli_server
-    if config_server is None:
-        config_server = config.SERVER
-    return config_server or "127.0.0.1"
+    port = config.DEFAULT_PORT
+    found = discover_server(port)
+    if found:
+        print(f"[client] discovered server at {found}")
+        return found
+    print("[client] no server found on LAN; falling back to 127.0.0.1")
+    return "127.0.0.1"
 
 
 def main():
@@ -855,9 +886,9 @@ def main():
     C.tune_process()          # GIL handoff + process priority (best-effort)
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", default=None,
-                    help="server host/IP to connect to; overrides "
-                         "config.py's SERVER (which is used when no flag "
-                         "is given; default: 127.0.0.1)")
+                    help="server host/IP to connect to; when omitted the "
+                         "client auto-discovers the server on the LAN "
+                         "(falls back to 127.0.0.1)")
     ap.add_argument("--port", type=int, default=config.DEFAULT_PORT,
                     help=f"UDP port (default: {config.DEFAULT_PORT})")
     ap.add_argument("--cache", default=config.CACHE_DIR,
@@ -866,7 +897,7 @@ def main():
                     help="print the tracks stored on the server and exit")
     args = ap.parse_args()
 
-    server = resolve_server(args.server, config.SERVER)
+    server = resolve_server(args.server)
 
     if args.list:
         c = SyncClient(server, args.port, args.cache)

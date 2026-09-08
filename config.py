@@ -40,10 +40,6 @@ DB_PATH = os.environ.get("MSYNC_DB_PATH", _here("msync.db"))
 # UDP sync/state/clock port (server binds it, clients listen).
 DEFAULT_PORT = int(os.environ.get("MSYNC_DEFAULT_PORT", "9770"))
 
-# Server host/IP clients connect to. Takes priority over the client's
-# --server flag; empty = unconfigured (client falls back to localhost).
-SERVER = os.environ.get("MSYNC_SERVER", "10.0.0.2")
-
 # Web UI / HTTP API port is the UDP port plus this offset.
 HTTP_PORT_OFFSET = 1000
 

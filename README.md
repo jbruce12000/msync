@@ -83,13 +83,11 @@ restart it, which is also how you apply later changes to `config.py`.
 ### config.py — set your values first
 
 Open `config.py` (next to the scripts) and make sure the values match your
-setup **before** installing. The installer reads it; every machine must
-agree on the sync port, and each client must know the server's IP:
+setup **before** installing. The installer reads it; every machine must agree
+on the sync port:
 
 - **`MUSIC_DIR`** — where the music lives (default `./music`); set on the
   **server**.
-- **`SERVER`** — the **server's** IP address, e.g. `10.0.0.2`; set on
-  **every client**.
 - **`DEFAULT_PORT`** — the UDP sync port (default **9770**); must be the
   same on every machine. The web UI port is `DEFAULT_PORT + HTTP_PORT_OFFSET`
   (default **10770**).
@@ -99,10 +97,14 @@ agree on the sync port, and each client must know the server's IP:
   is slow (default `0`); you normally set each room's offset from the web
   UI's Configure tab instead.
 
+Clients don't need a server IP: the server broadcasts its state over UDP
+on the LAN, and each client auto-discovers it (single-network setups only).
+If discovery fails, use the `--server` flag to point a client at the server
+manually.
+
 (Alternatively set the matching `MSYNC_*` environment variables —
-`MSYNC_SERVER`, `MSYNC_MUSIC_DIR`, `MSYNC_DEFAULT_PORT`, `MSYNC_DB_PATH` —
-which override config.py. After changing anything, re-run the installer to
-apply.)
+`MSYNC_MUSIC_DIR`, `MSYNC_DEFAULT_PORT`, `MSYNC_DB_PATH` — which override
+config.py. After changing anything, re-run the installer to apply.)
 
 > Ubuntu/Debian may also need `sudo apt install libportaudio2` (the sound
 > library the client/server use).
@@ -206,8 +208,7 @@ looks like this (view it with `journalctl -u msync-server -f`):
 
 ### 3. Install the client service on every other machine
 
-On each other machine, make sure `config.py`'s `SERVER` is set to the DJ
-machine's IP (e.g. `10.0.0.2`), then run:
+On each other machine (same LAN as the DJ), just run:
 
 ```bash
 cd msync
@@ -440,7 +441,9 @@ without any clicks or skips.
 
 ## Firewall / networking
 
-If clients can't see the server, open these ports for the server's IP:
+Clients discover the server via UDP broadcast, so make sure the server's
+broadcast traffic isn't blocked. If clients can't see the server, open these
+ports on the machine(s) running a firewall:
 
 | Port | Use |
 |---|---|
@@ -451,8 +454,10 @@ If clients can't see the server, open these ports for the server's IP:
 
 - **"No audio device" / sound errors on the server** — it still runs and
   coordinates clients; only its own speakers are silent.
-- **Client says "no sync from server"** — check the IP, the firewall, and
-  that the server is actually running.
+- **Client says "no sync from server"** — make sure the client and server
+  are on the same LAN subnet (broadcast discovery), check the firewall, and
+  that the server is actually running. In a pinch, point the client at the
+  server explicitly with `msync_client.py --server <server-ip>`.
 - **A room shows *offline* in the Configure tab** — it hasn't been heard
   from in ~15 seconds. The server marks a room online whenever its client
   sends a sync/timing packet, so make sure that room's client service is

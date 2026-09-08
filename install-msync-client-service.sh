@@ -5,10 +5,9 @@
 # Installs msync_client.py as a systemd SYSTEM service so synchronized
 # playback keeps running even when nobody is logged in.
 #
-# The service launches the client with NO host/port arguments: the host and
-# port are read from config.py (SERVER and DEFAULT_PORT, or their
-# MSYNC_SERVER / MSYNC_DEFAULT_PORT env overrides). Edit config.py, then
-# re-run this script to apply.
+# The service launches the client with NO arguments: the client auto-discovers
+# the server on the LAN via UDP broadcast (config.py's DEFAULT_PORT). Edit
+# config.py, then re-run this script to apply.
 #
 #   sudo ./install-msync-client-service.sh [options]
 #
@@ -134,14 +133,12 @@ fi
 [ -f "$CLIENT" ] || { echo "error: $CLIENT not found (run from the msync dir)" >&2; exit 1; }
 ensure_venv   # create ./venv + install requirements.txt if needed
 
-# --- read host/port from config.py (the service's source of truth) -------- #
-# Importing config.py here also picks up any MSYNC_SERVER / MSYNC_DEFAULT_PORT
-# env overrides present in this shell, exactly as the service will see them.
-CFG_LINE="$( { cd "$INSTALL_DIR" && "$PYTHON" -c \
-    'import config; print("%s %s" % (config.SERVER, config.DEFAULT_PORT))'; } 2>/dev/null )" \
-    || { echo "error: could not read SERVER/DEFAULT_PORT from config.py" >&2; exit 1; }
-CFG_SERVER="${CFG_LINE% *}"
-CFG_PORT="${CFG_LINE#* }"
+# --- read port from config.py (the service's source of truth) ------------- #
+# Importing config.py here also picks up any MSYNC_DEFAULT_PORT env override
+# present in this shell, exactly as the service will see them.
+CFG_PORT="$( { cd "$INSTALL_DIR" && "$PYTHON" -c \
+    'import config; print(config.DEFAULT_PORT)'; } 2>/dev/null )" \
+    || { echo "error: could not read DEFAULT_PORT from config.py" >&2; exit 1; }
 case "$CFG_PORT" in
     ''|*[!0-9]*) echo "error: config.py DEFAULT_PORT is not a valid port ('$CFG_PORT')" >&2; exit 1 ;;
 esac
@@ -166,14 +163,12 @@ fi
 UID_VAL="$(id -u "$SERVICE_USER")"
 RUN_DIR="/run/user/$UID_VAL"
 
-# --- env file (audio only; host/port live in config.py) ------------------- #
+# --- env file (audio only; port lives in config.py) ----------------------- #
 install -d -m 0755 "$ENV_DIR"
 cat > "$ENV_FILE" <<EOF
 # msync $SERVICE_NAME service settings ($(date +%FT%T))
-# Host/port are NOT set here: the service reads them from config.py
-# (SERVER / DEFAULT_PORT). Uncomment these to override config.py for this
-# service only (they take effect via config.py's env-var handling):
-# MSYNC_SERVER=10.0.0.5
+# Port is NOT set here: the service reads it from config.py (DEFAULT_PORT).
+# Uncomment this to override config.py for this service only:
 # MSYNC_DEFAULT_PORT=9770
 
 # --- audio daemon access -------------------------------------------------
@@ -211,12 +206,7 @@ EOF
 chmod 0644 "$UNIT_FILE"
 
 echo "Installed $SERVICE_NAME (user=$SERVICE_USER)"
-if [ -n "$CFG_SERVER" ]; then
-    echo "Host/port read from config.py: $CFG_SERVER:$CFG_PORT"
-else
-    echo "Note: config.py SERVER is blank — the client will fall back to"
-    echo "      127.0.0.1. Set SERVER in config.py and re-run this script."
-fi
+echo "UDP port read from config.py: $CFG_PORT (server auto-discovered on the LAN)"
 sudo -u "$SERVICE_USER" "$PYTHON" -c "import sounddevice, numpy, miniaudio" \
     || echo "warning: service user's Python can't import the audio libs"
 
