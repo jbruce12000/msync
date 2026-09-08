@@ -101,7 +101,7 @@ def make_packet(ptype: int, **fields) -> bytes:
 
 
 def parse_packet(data: bytes):
-    if not data.startswith(MAGIC):
+    if not data.startswith(MAGIC) or len(data) <= len(MAGIC):
         return None
     ptype = data[len(MAGIC)]
     try:

@@ -27,8 +27,6 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 .controls button:hover { border-color: var(--accent); color: var(--accent); }
 .controls button.play-btn { width: 40px; background: var(--accent); border-color: var(--accent); color: #fff; }
 .controls button.play-btn:hover { background: #79c0ff; }
-.volume { display: flex; align-items: center; gap: 4px; margin-left: 8px; }
-.volume span { font-size: 12px; color: var(--muted); min-width: 32px; text-align: right; font-variant-numeric: tabular-nums; }
 
 /* Main panels */
 .main { flex: 1; display: flex; overflow: hidden; }
@@ -218,7 +216,6 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
     .now-playing .title { font-size: 17px; }
     .now-playing .album { font-size: 13px; }
     .now-playing .time { font-size: 12px; }
-    .volume span { font-size: 13px; }
     .tab { font-size: 13px; }
     .panel-header h2 { font-size: 13px; }
     .panel-header .count { font-size: 12px; }
@@ -271,11 +268,6 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
         <button class="play-btn" id="btn-play" onclick="control('toggle')" title="Play/Pause">▶</button>
         <button onclick="control('next')" title="Next">⏭</button>
         <button onclick="control('stop')" title="Stop">⏹</button>
-        <div class="volume">
-            <button onclick="volumeAdjust(-5)" title="Volume down">−</button>
-            <span id="vol-display">100</span>
-            <button onclick="volumeAdjust(5)" title="Volume up">+</button>
-        </div>
     </div>
 </div>
 
@@ -327,7 +319,7 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 
 <script src="static/sortable.min.js"></script>
 <script>
-let state = { queue: [], now_playing: null, paused: false, volume: 100, elapsed: 0, duration: 0 };
+let state = { queue: [], now_playing: null, paused: false, elapsed: 0, duration: 0 };
 let library = { songs: [], albums: [], singles: [] };
 let openAlbums = {};  // album name -> true if expanded
 const NP_KEY = '__np__';  // sentinel for now-playing slot in queue
@@ -567,7 +559,6 @@ function updateScanStatus() {
 }
 
 function control(action) { api('POST', `/api/control/${action}`); }
-function volumeAdjust(delta) { api('POST', `/api/control/volume?delta=${delta}`); }
 function playSong(name) { api('POST', `/api/control/play`, { name }); }
 function queueAdd(name) { api('POST', '/api/queue/add', { name }); }
 function queueClear() { api('POST', '/api/queue/clear'); }
@@ -636,7 +627,6 @@ function updateHeader() {
     const album = document.getElementById('np-album');
     const time = document.getElementById('np-time');
     const btn = document.getElementById('btn-play');
-    const vol = document.getElementById('vol-display');
 
     if (np) {
         title.textContent = np.title || np.name;
@@ -655,7 +645,6 @@ function updateHeader() {
         npElapsed = 0;
         updateProgress();
     }
-    vol.textContent = state.volume || 0;
 }
 
 // Smooth progress between polls: advance npElapsed each animation frame
@@ -770,7 +759,21 @@ function albumQueue(name) {
     for (const t of (alb.tracks || [])) queueAdd(t.relpath);
 }
 
-function esc(s) { return s.replace(/'/g, "\\'").replace(/"/g, '&quot;'); }
+// Escape for safe innerHTML injection. The value is used both in plain text
+// nodes AND inside single-quoted JS strings in onclick handlers, so it must
+// survive HTML parsing (strip < > & and the attribute delimiters) while a
+// literal quote still can't terminate the JS string. Order matters: & must be
+// escaped FIRST so the entities we emit below (&quot; &lt; &gt;) aren't
+// re-escaped; then backslash/quote are escaped for the JS-string contexts.
+function esc(s) {
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/\\/g, '\\\\')
+        .replace(/'/g, "\\'");
+}
 
 // ── Queue rendering ──────────────────────────────────────────────────
 let drag = false;   // true while a SortableJS drag is in flight (blocks renders)
@@ -937,8 +940,6 @@ document.addEventListener('keydown', e => {
         case ' ': e.preventDefault(); control('toggle'); break;
         case 'n': control('next'); break;
         case 'p': control('prev'); break;
-        case '+': case '=': volumeAdjust(5); break;
-        case '-': volumeAdjust(-5); break;
     }
 });
 </script>

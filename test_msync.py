@@ -910,14 +910,15 @@ def test_client_callback_output_latency_compensation(client):
     assert i0_exp - int(before * h.buffer.sr) > int(0.29 * h.buffer.sr)
 
 
-def test_resolve_server_config_priority(monkeypatch):
-    """config.py's SERVER takes priority over an explicit --server; the CLI
-    flag only takes effect when config is unconfigured (blank), and the
-    loopback address is the last-resort fallback."""
+def test_resolve_server_cli_priority(monkeypatch):
+    """An explicit --server beats config.py's SERVER (manual/testing runs can
+    point anywhere without editing config); config is used when no flag is
+    given, and the loopback address is the last-resort fallback."""
     import config
     import msync_client as MC
     monkeypatch.setattr(config, "SERVER", "10.0.0.5")
-    assert MC.resolve_server("192.168.0.99") == "10.0.0.5"
+    assert MC.resolve_server("192.168.0.99") == "192.168.0.99"   # CLI wins
+    assert MC.resolve_server(None) == "10.0.0.5"                 # config used
     monkeypatch.setattr(config, "SERVER", "")
     assert MC.resolve_server("192.168.0.99") == "192.168.0.99"
     assert MC.resolve_server(None) == "127.0.0.1"

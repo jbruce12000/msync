@@ -265,6 +265,12 @@ class SyncedServer:
                 self.song = None
                 self.local_pos = 0.0
                 return {"source": "stopped", "file": None}
+            if not self.playlist:
+                # Every track was removed while running: nothing to advance to.
+                self._clear_playback()
+                self.song = None
+                self.local_pos = 0.0
+                return {"source": "stopped", "file": None}
             self.index = (self.index + 1) % len(self.playlist)
             self._play(self.playlist[self.index], announce="playlist")
             return {"source": "playlist", "file": self.song.name}
@@ -790,39 +796,58 @@ class SyncedServer:
         last_catalog = time.time()
         last_playback = 0.0
         last_client_prune = 0.0
+        lg = C.logger()
+        last_warn = 0.0
         while not self._stop.is_set():
-            with self.lock:
-                if (self.playing and self.song is not None
-                        and self.local_pos >= self.song.duration - 0.1):
-                    print(f"[server] ended: {self.song.name}")
-                    if self.queue:
-                        self._start_next()
-                    else:
-                        # Queue empty — stop instead of auto-advancing the
-                        # playlist to the next album track.
-                        self.playing = False
-                        self.song = None
+            try:
+                with self.lock:
+                    # End-of-song is judged on the synced timeline
+                    # (C.ts() - song_start), not the audio callback's local_pos:
+                    # a server whose stream failed to open (no audio device)
+                    # must still advance the queue and everyone following it,
+                    # and a stuck callback can't freeze playback forever.
+                    if (self.playing and self.song is not None
+                            and (C.ts() - self.song_start)
+                                >= self.song.duration - 0.1):
+                        print(f"[server] ended: {self.song.name}")
+                        if self.queue:
+                            self._start_next()
+                        else:
+                            # Queue empty — stop instead of auto-advancing the
+                            # playlist to the next album track.
+                            self.playing = False
+                            self.song = None
+                            self._persist_playback()
+                    # Track where we are so a restart resumes the same song at
+                    # roughly the same position (also covers clean shutdowns).
+                    if self.song is not None and time.time() - last_playback >= 5.0:
                         self._persist_playback()
-                # Track where we are so a restart resumes the same song at
-                # roughly the same position (also covers clean shutdowns).
-                if self.song is not None and time.time() - last_playback >= 5.0:
-                    self._persist_playback()
-                    last_playback = time.time()
-            self._absorb_drops()
-            # refresh the catalog periodically so freshly added albums and
-            # tracks (e.g. via the drop folder) become browsable/skippable.
-            # Skip while the initial background scan is still populating the
-            # DB so we don't pile redundant full scans on top of it.
-            if (time.time() - last_catalog >= 5.0
-                    and self._scan_done.is_set()):
-                self.catalog.scan()
-                self._refresh_playlist()
-                last_catalog = time.time()
-            # Forget rooms that haven't been heard from in a long time (see
-            # config.CLIENT_STALE_AFTER) so dead rooms don't pile up.
-            if time.time() - last_client_prune >= 60.0:
-                self._prune_clients()
-                last_client_prune = time.time()
+                        last_playback = time.time()
+                self._absorb_drops()
+                # refresh the catalog periodically so freshly added albums and
+                # tracks (e.g. via the drop folder) become browsable/skippable.
+                # Skip while the initial background scan is still populating the
+                # DB so we don't pile redundant full scans on top of it.
+                if (time.time() - last_catalog >= 5.0
+                        and self._scan_done.is_set()):
+                    self.catalog.scan()
+                    self._refresh_playlist()
+                    last_catalog = time.time()
+                # Forget rooms that haven't been heard from in a long time (see
+                # config.CLIENT_STALE_AFTER) so dead rooms don't pile up.
+                if time.time() - last_client_prune >= 60.0:
+                    self._prune_clients()
+                    last_client_prune = time.time()
+            except Exception as exc:
+                # A corrupt track (decode failure in _start_next -> _play), a
+                # file deleted mid-scan (os.stat race in _walk_files), a busy
+                # DB, ... must never kill this thread: it advances the queue,
+                # absorbs the drop folder and refreshes the catalog, so without
+                # it the server silently freezes at the current song. Log
+                # (rate-limited) and keep going, like the UDP loop does.
+                if time.time() - last_warn >= 5.0:
+                    lg.warning("monitor: loop error (continuing): %r", exc)
+                    last_warn = time.time()
             time.sleep(0.25)
 
     # ------------------------------------------------------------------ #
@@ -856,6 +881,8 @@ class SyncedServer:
 
     def prev(self):
         with self.lock:
+            if not self.playlist:
+                return {"source": "stopped", "file": None}
             self.seek = 0.0
             self.index = (self.index - 1) % len(self.playlist)
             self._play(self.playlist[self.index], announce="playlist")

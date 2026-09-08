@@ -16,8 +16,11 @@ def _here(name):
 # Music library                                                               #
 # --------------------------------------------------------------------------- #
 
-# Server's music folder (audio files here get played and scanned).
-MUSIC_DIR = os.environ.get("MSYNC_MUSIC_DIR", _here("../../music"))
+# Server's music folder (audio files here get played and scanned). Defaults
+# to the "music" folder next to this file (see the README/project layout);
+# point MSYNC_MUSIC_DIR (or edit this line) at a larger library elsewhere.
+#MUSIC_DIR = os.environ.get("MSYNC_MUSIC_DIR", _here("music"))
+MUSIC_DIR = "/home/jbruce/music"
 
 # Sub-folder inside MUSIC_DIR: drop audio files here to queue them.
 QUEUE_SUBDIR = ".queue"

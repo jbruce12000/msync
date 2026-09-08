@@ -40,6 +40,10 @@ import miniaudio
 import config
 import msync_common as C
 
+# Bound the client's download cache: keep at most this many tracks on disk
+# so a long-lived client doesn't grow the cache dir without limit.
+CACHE_MAX_FILES = 40
+
 
 class ClockSync:
     """NTP-style client<->server clock offset + drift estimation."""
@@ -74,7 +78,9 @@ class ClockSync:
         ptype, body = p
         if ptype != C.TYPE_NTP_RESP:
             return False
-        t1_, t2, t3 = body["t1"], body["t2"], body["t3"]
+        t1_, t2, t3 = body.get("t1"), body.get("t2"), body.get("t3")
+        if None in (t1_, t2, t3):
+            return False          # malformed response: ignore, don't crash
         # clock offset (client viewpoint): server_time = client_time + offset
         self.rtt = (t4 - t1_) - (t3 - t2)
         # Reject grossly-corrupted round trips (long queues/jitter, etc.).
@@ -150,6 +156,7 @@ class SongBuffer:
             try:
                 self._decode(path)
                 self.name = name
+                self._prune_cache(keep=path)
                 return True
             except Exception:
                 pass
@@ -177,7 +184,34 @@ class SongBuffer:
         if not self._decode(path):
             return False
         self.name = name
+        self._prune_cache(keep=path)
         return True
+
+    def _prune_cache(self, keep=None):
+        """Bound the download cache to CACHE_MAX_FILES tracks, deleting the
+        oldest (by mtime) when over. ``keep`` is the just-downloaded file,
+        which is spared even under clock skew. Failures are ignored: this is a
+        cache, not a requirement."""
+        try:
+            entries = []
+            for root, _dirs, files in os.walk(self.cache_dir):
+                for fn in files:
+                    p = os.path.join(root, fn)
+                    if p == keep:
+                        continue
+                    try:
+                        entries.append((os.path.getmtime(p), os.path.getsize(p), p))
+                    except OSError:
+                        pass
+            if len(entries) > CACHE_MAX_FILES:
+                entries.sort(key=lambda e: (e[0], e[1]))
+                for _mtime, _size, p in entries[:len(entries) - CACHE_MAX_FILES]:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
 
     def _decode(self, path):
         decoded = miniaudio.decode_file(path, output_format=miniaudio.SampleFormat.FLOAT32)
@@ -648,6 +682,8 @@ class SyncClient:
         last_status = time.time()
         last_reg = time.time()   # re-register periodically (heartbeat)
 
+        last_warn = 0.0
+
         try:
             while not self._stop.is_set():
                 sock.settimeout(0.1)
@@ -675,6 +711,13 @@ class SyncClient:
                             self._out_latency_ms = ms
                 except socket.timeout:
                     pass
+                except Exception as exc:
+                    # A malformed packet or a transient state-apply error must
+                    # not kill the run loop (the server is equally tolerant):
+                    # without this a single bad datagram stops audio + sync.
+                    if time.time() - last_warn >= 5.0:
+                        print(f"[client] sync loop error (continuing): {exc!r}")
+                        last_warn = time.time()
 
                 now = time.time()
                 if now - last_ntp >= C.NTP_INTERVAL:
@@ -718,14 +761,15 @@ class SyncClient:
 
 
 def resolve_server(cli_server, config_server=None):
-    """Pick the sync server host/IP. config.py's SERVER takes priority over
-    a --server given on the command line (which is only a testing override);
-    when neither is set, fall back to the loopback address."""
+    """Pick the sync server host/IP. An explicit --server wins over config.py's
+    SERVER (so manual/testing runs can point anywhere without editing config);
+    when no flag is given, config.py's SERVER is used, falling back to the
+    loopback address if it is blank."""
+    if cli_server:
+        return cli_server
     if config_server is None:
         config_server = config.SERVER
-    if config_server:
-        return config_server
-    return cli_server or "127.0.0.1"
+    return config_server or "127.0.0.1"
 
 
 def main():
@@ -733,8 +777,9 @@ def main():
     C.tune_process()          # GIL handoff + process priority (best-effort)
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", default=None,
-                    help="server host/IP for testing; config.py's SERVER "
-                         "takes priority over this (default: 127.0.0.1)")
+                    help="server host/IP to connect to; overrides "
+                         "config.py's SERVER (which is used when no flag "
+                         "is given; default: 127.0.0.1)")
     ap.add_argument("--port", type=int, default=config.DEFAULT_PORT,
                     help=f"UDP port (default: {config.DEFAULT_PORT})")
     ap.add_argument("--cache", default=config.CACHE_DIR,
