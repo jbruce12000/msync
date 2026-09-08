@@ -91,6 +91,26 @@ def test_clock_sync_measures_localhost(server, client):
     assert abs(client.client.clock.offset) < 0.05      # < 50 ms offset
 
 
+def test_discover_server_succeeds_while_paused(server):
+    """Discovery must work even when the server is paused/stopped.
+
+    While paused the server's state/sync broadcasts drop to the idle 10s
+    cadence, which a short passive listen usually misses. The active
+    TYPE_PROBE -> unicast TYPE_WELCOME answer must still find it quickly
+    (regression: clients starting while the server is paused fell back to
+    127.0.0.1 and went offline)."""
+    from msync_client import discover_server
+    assert server.playing                       # paused below
+    server.play_pause()
+    assert not server.playing
+    found = discover_server(server.port, timeout=2.0)
+    # The reply comes from the server's 0.0.0.0-bound socket (source IP is
+    # this host's LAN address, not necessarily 127.0.0.1). The point: a
+    # *paused* server — whose broadcasts have dropped to the idle 10 s
+    # cadence — must still be discovered quickly via the active probe.
+    assert found is not None
+
+
 def test_clock_sync_offset_stable_under_jitter():
     """The NTP offset estimate must stay near the true offset (a few ms)
     under normal network jitter. It must NOT blow up to seconds/minutes the

@@ -885,6 +885,13 @@ class SyncClient:
 
                 now = time.time()
                 ntp_int = C.NTP_INTERVAL if self.playing else C.IDLE_NTP_INTERVAL
+                # How long a server is allowed to go silent before we call it
+                # lost. Sync lands every SYNC_INTERVAL (0.05s) while playing
+                # but only every IDLE_SYNC_INTERVAL (10s) when paused, so the
+                # threshold must widen in step or a healthy-but-paused server
+                # reads as "no sync" every 4s (and provokes constant re-discovery).
+                stale_s = (4.0 if self.playing
+                           else max(C.IDLE_SYNC_INTERVAL * 2.5, 8.0))
                 if now - last_ntp >= ntp_int:
                     if self.clock.exchange(sock):
                         if abs(self.clock.drift) > 1.0:
@@ -896,15 +903,15 @@ class SyncClient:
                     # if the server restarted or a packet was lost.
                     self.register(sock)
                     last_reg = now
-                if self._provisional and now - last_state > 4.0 \
+                if self._provisional and now - last_state > stale_s \
                         and now - last_probe >= C.REGISTER_INTERVAL:
                     # Provisional host (discovery / loopback fallback) but no
                     # server sync for a while — our resolved address may be
                     # stale (e.g. discovery raced a network blip and we fell
                     # back to 127.0.0.1). Re-run discovery to retarget the
-                    # real server without restarting; the server is always
-                    # broadcasting, so hearing it re-anchors us and the
-                    # heartbeat/register follows.
+                    # real server without restarting; the server answers the
+                    # active probe directly, so hearing it re-anchors us and
+                    # the heartbeat/register follows.
                     last_probe = now
                     found = discover_server(self.port, timeout=1.5)
                     if found and found != self.host:
@@ -915,7 +922,7 @@ class SyncClient:
                             self.clock = ClockSync(found, self.port)
                         # Sync resumes on the next broadcast; refresh state too.
                         last_state = now
-                if now - last_state > 4.0:
+                if now - last_state > stale_s:
                     print(f"[client] no sync from server; drift={self.clock.drift:+.0f}ppm "
                           f"offset={self.clock.offset*1000:+.0f}ms")
                 if now - last_status > 2.0:
@@ -948,24 +955,32 @@ class SyncClient:
 
 
 def discover_server(port, timeout=3.0):
-    """Listen for the server's TYPE_STATE broadcast and return its IP.
+    """Find the server's IP on the LAN and return it, else None.
 
-    The server sends TYPE_STATE packets to 255.255.255.255 once per second;
-    a client on the same LAN subnet will receive them.  Returns the source
-    IP of the first valid packet, or None on timeout."""
+    Two mechanisms, tried together:
+      1. Active probe: broadcast a TYPE_PROBE; the server answers directly
+         (unicast) with TYPE_WELCOME. This works even when the server is
+         paused/stopped, when its state broadcasts slump to the idle (10 s)
+         cadence — a passive listen would usually miss them in a short
+         window.
+      2. Passive listen: the server also broadcasts TYPE_STATE (1 Hz when
+         playing). Serves as a fallback / older-server compatibility.
+
+    Returns the source IP of the first valid answer."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     try:
         sock.bind(("", port))
         sock.settimeout(timeout)
+        sock.sendto(C.make_packet(C.TYPE_PROBE), ("255.255.255.255", port))
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
                 data, addr = sock.recvfrom(4096)
                 p = C.parse_packet(data)
-                if p and p[0] == C.TYPE_STATE:
-                    return addr[0]          # source IP of the broadcast
+                if p and p[0] in (C.TYPE_WELCOME, C.TYPE_STATE):
+                    return addr[0]          # source IP of the broadcast/reply
             except socket.timeout:
                 break
     except OSError:

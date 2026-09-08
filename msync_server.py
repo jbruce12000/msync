@@ -1058,6 +1058,15 @@ class SyncedServer:
                     # never set) so a freshly-connected client starts tuned.
                     lat = self.catalog.client_latency(ip)
                     sock.sendto(C.make_packet(C.TYPE_LATENCY, ms=lat), addr)
+                elif ptype == C.TYPE_PROBE:
+                    # Discovery ping from a client looking for a server.
+                    # Answer DIRECTLY to the sender (unicast) so discovery
+                    # works even when this server is paused/stopped and the
+                    # broadcast cadence has dropped to the idle interval
+                    # (10s) — a 3s discovery window would otherwise usually
+                    # miss it and clients would fall back to 127.0.0.1.
+                    sock.sendto(C.make_packet(C.TYPE_WELCOME,
+                                              **self._sync_payload()), addr)
             except socket.timeout:
                 continue
             except Exception as exc:
