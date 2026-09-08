@@ -937,17 +937,18 @@ def test_client_callback_output_latency_compensation(client):
 
 
 def test_resolve_server_cli_priority(monkeypatch):
-    """An explicit --server flag beats auto-discovery; when no flag is given
-    the client tries UDP broadcast discovery, falling back to 127.0.0.1."""
+    """An explicit --server flag is authoritative; otherwise the client
+    auto-discovers, and falls back to 127.0.0.1 (both marked provisional so
+    it can re-discover instead of staying wedged)."""
     import msync_client as MC
-    assert MC.resolve_server("192.168.0.99") == "192.168.0.99"   # CLI wins
-    # discovery finds nothing → loopback fallback
+    assert MC.resolve_server("192.168.0.99") == ("192.168.0.99", False)
+    # discovery finds nothing → loopback fallback (provisional)
     monkeypatch.setattr(MC, "discover_server", lambda port, timeout=3.0: None)
-    assert MC.resolve_server() == "127.0.0.1"
-    # discovery finds a server
+    assert MC.resolve_server() == ("127.0.0.1", True)
+    # discovery finds a server (provisional)
     monkeypatch.setattr(MC, "discover_server",
                         lambda port, timeout=3.0: "10.0.0.5")
-    assert MC.resolve_server() == "10.0.0.5"
+    assert MC.resolve_server() == ("10.0.0.5", True)
 
 
 def test_client_fetch_tracks(client):

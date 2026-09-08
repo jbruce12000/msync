@@ -64,8 +64,13 @@ class ClockSync:
     def exchange(self, sock):
         """One NTP exchange; returns True if updated."""
         t1 = C.ts()
-        sock.sendto(C.make_packet(C.TYPE_NTP_REQ, t1=t1),
-                    (self.addr, self.port))
+        try:
+            sock.sendto(C.make_packet(C.TYPE_NTP_REQ, t1=t1),
+                        (self.addr, self.port))
+        except OSError:
+            # Transient network drop (interface down mid-run): don't crash,
+            # just skip this round trip; the loop keeps retrying.
+            return False
         sock.settimeout(1.0)
         try:
             data, _ = sock.recvfrom(2048)
@@ -315,9 +320,15 @@ def urllib_quote(name):
 
 
 class SyncClient:
-    def __init__(self, host, port, cache_dir):
+    def __init__(self, host, port, cache_dir, provisional=False):
         self.host = host
         self.port = port
+        # True when `host` was chosen by broadcast discovery (or its loopback
+        # fallback) rather than an explicit --server flag. A provisional host
+        # may be stale (e.g. discovery raced a network blip and fell back to
+        # 127.0.0.1), so such a client re-runs discovery if it stops hearing
+        # the server, and retargets itself without a restart.
+        self._provisional = provisional
         self.clock = ClockSync(host, port)
         self.buffer = SongBuffer(cache_dir)
 
@@ -348,6 +359,25 @@ class SyncClient:
     # ------------------------------------------------------------------ #
     # HTTP API to the server (state, library, queue, playback control)    #
     # ------------------------------------------------------------------ #
+    def _sendto(self, sock, payload, addr):
+        """UDP send that never crashes the run loop. A transient network
+        drop (interface down, ENOBUFS) must not kill the process — the
+        client should keep listening and retry, not exit."""
+        try:
+            sock.sendto(payload, addr)
+            return True
+        except OSError:
+            return False
+
+    def register(self, sock):
+        """Send a REGISTER heartbeat (best-effort). Keeps the web UI's room
+        list + online status fresh even across a server restart."""
+        return self._sendto(
+            sock, C.make_packet(C.TYPE_REGISTER,
+                                host=socket.gethostname(),
+                                err_ms=round(self.err_smooth * 1000, 1)),
+            (self.host, self.port))
+
     def _api(self, method, path, params=None, body=None):
         import urllib.parse as up
         if params:
@@ -748,16 +778,14 @@ class SyncClient:
 
         # register with server (send our hostname so the web UI can name us,
         # plus our current sync error so the Configure tab can display it)
-        sock.sendto(C.make_packet(
-            C.TYPE_REGISTER, host=socket.gethostname(),
-            err_ms=round(self.err_smooth * 1000, 1)),
-            (self.host, self.port))
+        self.register(sock)
 
         self.clock.exchange(sock)
         last_ntp = time.time()
         last_state = time.time()
         last_status = time.time()
         last_reg = time.time()   # re-register periodically (heartbeat)
+        last_probe = 0.0         # last re-discovery attempt (provisional hosts)
 
         last_warn = 0.0
 
@@ -806,11 +834,27 @@ class SyncClient:
                     # Re-register so the web UI's room list stays populated
                     # (hostname fresh, last-seen fresh, sync error fresh) even
                     # if the server restarted or a packet was lost.
-                    sock.sendto(C.make_packet(
-                        C.TYPE_REGISTER, host=socket.gethostname(),
-                        err_ms=round(self.err_smooth * 1000, 1)),
-                        (self.host, self.port))
+                    self.register(sock)
                     last_reg = now
+                if self._provisional and now - last_state > 4.0 \
+                        and now - last_probe >= C.REGISTER_INTERVAL:
+                    # Provisional host (discovery / loopback fallback) but no
+                    # server sync for a while — our resolved address may be
+                    # stale (e.g. discovery raced a network blip and we fell
+                    # back to 127.0.0.1). Re-run discovery to retarget the
+                    # real server without restarting; the server is always
+                    # broadcasting, so hearing it re-anchors us and the
+                    # heartbeat/register follows.
+                    last_probe = now
+                    found = discover_server(self.port, timeout=1.5)
+                    if found and found != self.host:
+                        print(f"[client] re-discovered server at {found}; "
+                              f"retargeting from {self.host}")
+                        with self.lock:
+                            self.host = found
+                            self.clock = ClockSync(found, self.port)
+                        # Sync resumes on the next broadcast; refresh state too.
+                        last_state = now
                 if now - last_state > 4.0:
                     print(f"[client] no sync from server; drift={self.clock.drift:+.0f}ppm "
                           f"offset={self.clock.offset*1000:+.0f}ms")
@@ -867,18 +911,21 @@ def discover_server(port, timeout=3.0):
 
 
 def resolve_server(cli_server=None):
-    """Pick the sync server host/IP.
+    """Pick the sync server host/IP. Returns (host, provisional): an explicit
+    --server flag is authoritative (provisional=False); otherwise the client
+    auto-discovers (provisional=True) and falls back to 127.0.0.1 (also
+    provisional, so it can re-discover later instead of staying wedged).
 
     Priority: --server flag > UDP broadcast discovery > 127.0.0.1 fallback."""
     if cli_server:
-        return cli_server
+        return cli_server, False
     port = config.DEFAULT_PORT
     found = discover_server(port)
     if found:
         print(f"[client] discovered server at {found}")
-        return found
+        return found, True
     print("[client] no server found on LAN; falling back to 127.0.0.1")
-    return "127.0.0.1"
+    return "127.0.0.1", True
 
 
 def main():
@@ -897,10 +944,10 @@ def main():
                     help="print the tracks stored on the server and exit")
     args = ap.parse_args()
 
-    server = resolve_server(args.server)
+    server, provisional = resolve_server(args.server)
 
     if args.list:
-        c = SyncClient(server, args.port, args.cache)
+        c = SyncClient(server, args.port, args.cache, provisional=provisional)
         tracks = c.fetch_tracks()
         if not tracks:
             print("(no tracks found on server)")
@@ -909,7 +956,7 @@ def main():
                 print(t)
         return
 
-    c = SyncClient(server, args.port, args.cache)
+    c = SyncClient(server, args.port, args.cache, provisional=provisional)
     threading.Thread(target=c._console, daemon=True).start()
     c.run()
     print("bye")
