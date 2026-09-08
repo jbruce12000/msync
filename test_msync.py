@@ -925,6 +925,40 @@ def test_client_callback_output_latency_compensation(client):
     assert i0_exp - int(before * h.buffer.sr) > int(0.29 * h.buffer.sr)
 
 
+def test_client_callback_playhead_advances_when_buffer_exhausted(client):
+    """When the current track's data runs out (server already moved to the
+    next track but it's still downloading), the playhead must keep advancing
+    so err stays bounded against the (still-rising) server timeline. A frozen
+    playhead here makes err grow without bound through the whole download gap
+    and hammers the PLL to ±MAX_PITCH at every song transition."""
+    h = client.client
+    wait_until(lambda: h.buffer.data is not None
+               and h.buffer.duration > 1.0 and h.stream is not None)
+    with C.stream_ops_lock:
+        h.stream.stop()          # silence the real callback: no measurement race
+    with h.lock:
+        h.playing = True
+        h._pitch_int = 0.0
+        h.err_f = 0.0
+        # Anchor the playhead just past the end of the buffer AND on the
+        # target (err ~ 0) so the only thing under test is the exhausted-
+        # buffer advance, with no catch-up nudge muddying the measurement.
+        end_pos = len(h.buffer.data) / h.buffer.sr + 0.5
+        h.server_song_start = h.clock.server_now() - end_pos
+        h.local_pos = end_pos
+        before = h.local_pos
+    out = np.zeros((8192, 2), dtype=np.float32)
+    h._cb(out, 8192, None, None)
+    with h.lock:
+        advance = h.local_pos - before
+    block = 8192 / h.buffer.sr
+    # the playhead must keep tracking the timeline instead of freezing
+    assert advance > block * 0.99, f"playhead froze (advance={advance:.6f})"
+    assert advance < block * 1.01 + C.CATCHUP_STEP * 2.0
+    # and we output silence, not stale/garbage audio
+    assert np.count_nonzero(out) == 0
+
+
 def test_resolve_server_cli_priority(monkeypatch):
     """An explicit --server flag is authoritative; otherwise the client
     auto-discovers, and falls back to 127.0.0.1 (both marked provisional so

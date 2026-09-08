@@ -513,7 +513,17 @@ class SyncClient:
             idx = max(0.0, (self.local_pos + self._out_latency) * buf.sr)
             n = len(buf.data)
             if idx >= n:
+                # This track's data is exhausted. Normally the server has
+                # already moved on to the next track and we're still
+                # downloading/decoding it, so output silence — but keep
+                # advancing the playhead. If we `return` here the playhead
+                # FREZES while `target` (= server_now() - song_start) keeps
+                # rising with the server's clock, so err grows without bound
+                # for the entire download gap and hammers the PLL to
+                # ±MAX_PITCH. Advancing keeps us locked to the server
+                # timeline; the next track's adoption re-bases it exactly.
                 outdata.fill(0)
+                self.local_pos += frames / buf.sr * rate
                 return
             i0 = int(idx)
             i1 = min(int(idx + frames), n)
