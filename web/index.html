@@ -126,7 +126,7 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 .scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
 /* Track list */
-.track-item { padding: 6px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 13px; transition: background 0.1s; border-left: 3px solid transparent; }
+.track-item { padding: 6px 12px; cursor: default; display: flex; align-items: center; gap: 8px; font-size: 13px; transition: background 0.1s; border-left: 3px solid transparent; }
 .track-item:hover { background: rgba(88,166,255,0.08); }
 .track-item.playing { background: rgba(88,166,255,0.12); border-left-color: var(--accent); }
 .track-item .num { color: var(--muted); font-size: 11px; min-width: 20px; text-align: right; font-variant-numeric: tabular-nums; }
@@ -763,7 +763,9 @@ function renderLibrary() {
     if (singles.length) {
         for (const s of singles) {
             const playing = s.relpath === np ? ' playing' : '';
-            html += `<div class="track-item${playing}" onclick="playSong('${esc(s.relpath)}')" title="${esc(s.relpath)}">
+            // Rows are inert: add a track with its + badge (queueAdd). A raw
+            // click no longer interrupts the currently playing song.
+            html += `<div class="track-item${playing}" title="${esc(s.relpath)}">
                 <span class="name">${esc(s.title)}</span>
                 <span class="badge" onclick="event.stopPropagation();queueAdd('${esc(s.relpath)}')" title="Add to queue">+</span>
             </div>`;
@@ -802,7 +804,9 @@ function renderLibrary() {
                 // (the album is already the group header).
                 const albumLine = isSearch
                     ? `<span class="album-label">${esc(alb.album)}</span>` : '';
-                html += `<div class="track-item${playing}" onclick="playSong('${esc(t.relpath)}')" title="${esc(t.relpath)}">
+                // Rows are inert: add a track with its + badge (queueAdd).
+                // A raw click no longer interrupts the playing song.
+                html += `<div class="track-item${playing}" title="${esc(t.relpath)}">
                     <span class="num">${i + 1}</span>
                     <span class="name">${esc(t.title)}${albumLine}</span>
                     <span class="badge" onclick="event.stopPropagation();queueAdd('${esc(t.relpath)}')" title="Add to queue">+</span>
