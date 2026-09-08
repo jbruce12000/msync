@@ -273,7 +273,7 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 
 <!-- Tab bar -->
 <div class="tabbar">
-    <button class="tab active" data-tab="play" onclick="setTab('play')">Play</button>
+    <button class="tab active" data-tab="search" onclick="setTab('search')">Search</button>
     <button class="tab" data-tab="queue" onclick="setTab('queue')">Queue</button>
     <button class="tab" data-tab="config" onclick="setTab('config')">Configure</button>
 </div>
@@ -283,8 +283,8 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
     <span class="spinner">⟳</span><span id="scan-text"></span>
 </div>
 
-<!-- Play view: Library -->
-<div class="main" id="view-play">
+<!-- Search view: Library -->
+<div class="main" id="view-search">
     <div class="panel">
         <div class="panel-header">
             <h2>Library</h2>
@@ -335,12 +335,12 @@ async function api(method, path, body) {
 }
 
 // ── Tabs ─────────────────────────────────────────────────────────────
-let currentTab = 'play';
+let currentTab = 'search';
 function setTab(name) {
     currentTab = name;
     document.querySelectorAll('.tab').forEach(b =>
         b.classList.toggle('active', b.dataset.tab === name));
-    document.getElementById('view-play').style.display = name === 'play' ? '' : 'none';
+    document.getElementById('view-search').style.display = name === 'search' ? '' : 'none';
     document.getElementById('view-queue').style.display = name === 'queue' ? '' : 'none';
     document.getElementById('view-config').style.display = name === 'config' ? '' : 'none';
     if (name === 'config') fetchClients();
