@@ -944,7 +944,8 @@ def test_client_callback_playhead_advances_when_buffer_exhausted(client):
         # target (err ~ 0) so the only thing under test is the exhausted-
         # buffer advance, with no catch-up nudge muddying the measurement.
         end_pos = len(h.buffer.data) / h.buffer.sr + 0.5
-        h.server_song_start = h.clock.server_now() - end_pos
+        h._base_pos = end_pos
+        h._base_clock = C.ts()
         h.local_pos = end_pos
         before = h.local_pos
     out = np.zeros((8192, 2), dtype=np.float32)
@@ -957,6 +958,55 @@ def test_client_callback_playhead_advances_when_buffer_exhausted(client):
     assert advance < block * 1.01 + C.CATCHUP_STEP * 2.0
     # and we output silence, not stale/garbage audio
     assert np.count_nonzero(out) == 0
+
+
+def test_client_callback_offset_shift_does_not_spike_err(client, monkeypatch):
+    """A mid-playback NTP offset re-estimation must not create a spurious
+    err spike. The err reference is pinned at rebase (_base_pos/_base_clock)
+    and advanced by the local clock at the server rate, so a later change to
+    clock.offset (e.g. after a heavy song download thrashes the NTP
+    estimate) moves server_now() without moving the reference. Previously
+    this showed up as a 100ms+ err right after every song switch on
+    10.0.0.4 because err was re-derived from a fresh server_now() every
+    block."""
+    h = client.client
+    wait_until(lambda: h.buffer.data is not None
+               and h.buffer.duration > 2.0 and h.stream is not None)
+    with C.stream_ops_lock:
+        h.stream.stop()          # silence the real callback: no measurement race
+
+    # Drive a controllable wall clock so the audio blocks and the target
+    # advance in lockstep exactly like real-time playback does.
+    fake = {"t": 0.0}
+    import msync_common as MC
+    monkeypatch.setattr(MC, "ts", lambda: fake["t"])
+
+    frames = 8192
+    block = frames / h.buffer.sr
+    out = np.zeros((frames, 2), dtype=np.float32)
+    with h.lock:
+        h.playing = True
+        h._pitch_int = 0.0
+        h.err_f = 0.0
+        # Anchor at a mid-song position like a just-completed rebase.
+        h.local_pos = 5.0
+        h._rebase()
+    # The NTP offset re-estimates abruptly (+100 ms) — the classic jump after
+    # a heavy download/decode. The anchored reference must absorb it.
+    with h.lock:
+        h.clock.offset += 0.100
+    errs = []
+    for _ in range(6):                       # a few audio blocks (~1.1 s)
+        fake["t"] += block                   # real-time pacing
+        h._cb(out, frames, None, None)
+        with h.lock:
+            target = (h._base_pos
+                      + (1.0 + h.clock.drift * 1e-6) * (fake["t"] - h._base_clock))
+            errs.append(target - h.local_pos)
+    # The 100ms offset jump must NOT leak into the PLL error: err stays a few
+    # ms (just the anchor-instant quantification + drift), not ~100ms.
+    assert max(abs(e) for e in errs) < 0.05, \
+        f"offset shift leaked into err: {[f'{e*1000:.1f}ms' for e in errs]}"
 
 
 def test_resolve_server_cli_priority(monkeypatch):

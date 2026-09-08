@@ -337,6 +337,16 @@ class SyncClient:
         self.playing = False
         self.server_song_start = 0.0   # server wall time song started
         self.local_pos = 0.0           # local playhead (seconds)
+        # Anchor for the err / PLL reference. `err` must never be computed by
+        # comparing `local_pos` against a *fresh* `server_now() - song_start`
+        # every block: NTP re-estimation shifts `server_now()` between blocks,
+        # so a playhead that is perfectly locked to the server still reads a
+        # large spurious error right after a rebase (worst right after a song
+        # download thrashes the clock estimate). Instead we pin the reference
+        # once at each rebase (adopt/resume/seek) and track it with the local
+        # clock, so NTP steps cancel out of the error the PLL chases.
+        self._base_clock = C.ts()      # client wall time at last rebase
+        self._base_pos = 0.0           # target position at that rebase
         self.drift_pitch = 0.0         # current applied pitch from PLL
         self._pitch_int = 0.0          # PI integrator state (tight clip + fast unwind)
         self.err_f = 0.0               # low-passed PLL error (EMA of callback err)
@@ -457,8 +467,19 @@ class SyncClient:
             if buf.data is None or not self.playing:
                 outdata.fill(0)
                 return
-            # target position per estimated server clock
-            target = max(0.0, self.clock.server_now() - self.server_song_start)
+            # Target position: pinned to the last rebase and advanced by the
+            # local clock at the (NTP-measured) server clock rate, NOT
+            # re-derived from a fresh `server_now() - song_start`. This bakes
+            # the current NTP *offset* in once; later offset re-estimation
+            # steps then move the reference without creating a fake `err`
+            # (the culprit behind the 100ms+ spike seen on 10.0.0.4 right
+            # after a song switch). `clock.drift` is a smooth regression
+            # slope (not a jumpy median like `offset`), so using it live keeps
+            # the target tracking the true server rate and the PLL's own
+            # feedforward cancels out of the error dynamics.
+            target = max(0.0, self._base_pos
+                         + (1.0 + self.clock.drift * 1e-6)
+                         * (C.ts() - self._base_clock))
             err = target - self.local_pos
             # Low-pass the error for the rate controller: the raw error
             # carries tens of ms of NTP reference jitter plus a half-block
@@ -516,11 +537,9 @@ class SyncClient:
                 # This track's data is exhausted. Normally the server has
                 # already moved on to the next track and we're still
                 # downloading/decoding it, so output silence — but keep
-                # advancing the playhead. If we `return` here the playhead
-                # FREZES while `target` (= server_now() - song_start) keeps
-                # rising with the server's clock, so err grows without bound
-                # for the entire download gap and hammers the PLL to
-                # ±MAX_PITCH. Advancing keeps us locked to the server
+                # advancing the playhead. A frozen playhead makes err grow
+                # without bound for the entire download gap and hammers the
+                # PLL to ±MAX_PITCH. Advancing keeps us locked to the server
                 # timeline; the next track's adoption re-bases it exactly.
                 outdata.fill(0)
                 self.local_pos += frames / buf.sr * rate
@@ -587,6 +606,22 @@ class SyncClient:
             self._fade_out = False
 
     # ------------------------------------------------------------------ #
+    def _rebase(self):
+        """Pin the PLL's target reference to the just-committed playhead.
+
+        Called (under self.lock) whenever `local_pos` is re-anchored to the
+        server timeline (new track, resume, seek). Snapshots the local wall
+        clock so the callback tracks the target from the single reference
+        point instead of re-deriving `server_now() - song_start` fresh every
+        block — that re-derivation is what turns a live NTP offset
+        re-estimation into a spurious 100ms+ err right after a song switch.
+        The NTP feedforward (`clock.drift`) still drives the rate; only the
+        error *reference* is frozen here.
+        """
+        self._base_clock = C.ts()
+        self._base_pos = self.local_pos
+
+    # ------------------------------------------------------------------ #
     def _apply_state(self, st):
         """Adopt the server's broadcast state.
 
@@ -611,12 +646,15 @@ class SyncClient:
                 # Track the authoritative start time (handles seeks) and
                 # mirror play/pause. On resume, rebase local_pos to the
                 # live song_start the server reports.
+                seeked = (song_start != self.server_song_start
+                          and self.server_song_start != 0.0)
                 self.server_song_start = song_start
                 if playing != self.playing:
                     self.playing = playing
                     if playing:
                         self.local_pos = max(0.0,
                                              self.clock.server_now() - song_start)
+                        self._rebase()
                     # A fresh rebase (or a long pause) invalidates the old
                     # integral: stale windup keeps drift_pitch pinned at
                     # ±MAX_PITCH for the wrong direction. Same for the
@@ -633,6 +671,16 @@ class SyncClient:
                     if playing and self.stream is not None \
                             and not self.stream.active:
                         stream_cmd = "start"
+                elif seeked and self.playing:
+                    # Server seeked within this track: re-anchor the playhead
+                    # to the new song_start so this room doesn't keep playing
+                    # the pre-seek position (a stale `_base_pos` would hold the
+                    # err reference on the old timeline).
+                    self.local_pos = max(0.0,
+                                         self.clock.server_now() - song_start)
+                    self._rebase()
+                    self._pitch_int = 0.0
+                    self.err_f = 0.0
             elif self._loading_name == name:
                 return                # already fetching this track now
             prev_name = self.buffer.name    # how we tell a newer state "took over"
@@ -674,6 +722,7 @@ class SyncClient:
                 return
             self.server_song_start = song_start
             self.local_pos = max(0.0, self.clock.server_now() - song_start)
+            self._rebase()
             self._pitch_int = 0.0          # fresh rebase: drop stale windup
             self.err_f = 0.0               # ... and the smoothed PLL error
             self.playing = playing
@@ -873,7 +922,12 @@ class SyncClient:
                     last_status = now
                     with self.lock:
                         buf = self.buffer
-                        target = (self.clock.server_now() - self.server_song_start
+                        # Same anchored reference the PLL chases (matches the
+                        # callback's err), not a fresh server_now() — the two
+                        # would disagree during NTP offset re-estimation.
+                        target = (self._base_pos
+                                  + (1.0 + self.clock.drift * 1e-6)
+                                  * (C.ts() - self._base_clock)
                                   if buf.data is not None else 0.0)
                         tracker = "playing" if self.playing else "paused"
                         name = buf.name
