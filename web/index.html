@@ -346,7 +346,7 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 <script>
 let state = { queue: [], now_playing: null, paused: false, elapsed: 0, duration: 0 };
 let library = { songs: [], albums: [], singles: [] };
-let openAlbums = {};  // album name -> true if expanded
+let openAlbums = {};  // album name -> true/false once the user toggled it (undefined = never toggled; use the search default)
 const NP_KEY = '__np__';  // sentinel for now-playing slot in queue
 
 // ── API helpers ──────────────────────────────────────────────────────
@@ -777,11 +777,12 @@ function renderLibrary() {
         const visible = tracks.filter(t =>
             !q || (t._l || '').includes(q) || (alb._al || '').includes(q));
         if (q && !visible.length) continue;
-        // When a search matches EVERY track of an album, show the group
+        // When a search matches EVERY track of an album, the group shows
         // collapsed: the whole album is already under the header, so an
         // expanded list adds nothing. A partial match stays open so the
-        // user sees exactly which tracks matched.
-        const isOpen = q ? visible.length < tracks.length : !!openAlbums[alb.album];
+        // user sees exactly which tracks matched. Either way the header
+        // stays tappable: an explicit click expands/collapses and wins.
+        const isOpen = albumOpen(alb);
         const arrowCls = isOpen ? ' open' : '';
         const artistLabel = alb.artist ? esc(alb.artist) + ' · ' : '';
         html += `<div class="album-group">
@@ -824,8 +825,26 @@ function visible_count() {
     return document.querySelectorAll('.track-item').length;
 }
 
+// Effective open state of an album group: an explicit user toggle always
+// wins; otherwise a search shows partial matches open and full matches
+// collapsed, and plain browsing starts collapsed.
+function albumOpen(alb) {
+    const name = alb.album;
+    if (openAlbums[name] !== undefined) return openAlbums[name];
+    const q = (document.getElementById('search').value || '').toLowerCase().trim();
+    if (!q) return false;
+    const tracks = alb.tracks || [];
+    const visible = tracks.filter(t =>
+        !q || (t._l || '').includes(q) || (alb._al || '').includes(q));
+    return visible.length < tracks.length;   // partial match -> open
+}
+
 function toggleAlbum(name) {
-    openAlbums[name] = !openAlbums[name];
+    // Flip the CURRENTLY displayed state, so clicking an album that's open
+    // by default (partial search match) collapses it, and one that's
+    // collapsed by default (full search match) expands it.
+    const alb = (library.albums || []).find(a => a.album === name);
+    if (alb) openAlbums[name] = !albumOpen(alb);
     renderLibrary();
 }
 
