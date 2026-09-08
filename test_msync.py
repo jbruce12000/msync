@@ -137,6 +137,65 @@ def test_clock_sync_offset_stable_under_jitter():
     assert abs(cs.drift) < 500, cs.drift      # ppm: sane, not amplifying epoch
 
 
+class _FakeSock:
+    """Minimal socket stub: recvfrom returns a prebuilt NTP response."""
+
+    def __init__(self, resp):
+        self._resp = resp
+
+    def sendto(self, data, addr):
+        return len(data)
+
+    def settimeout(self, t):
+        pass
+
+    def recvfrom(self, n):
+        return self._resp, ("10.0.0.2", 9770)
+
+
+def test_clock_sync_rejects_stalled_round_trip():
+    """One-way stalls (asymmetric delay) used to slip past the 3 s RTT gate
+    and corrupt the drift slope (+-28k ppm clock spikes). This round trip
+    has RTT ~0.45 s (well under the old limit) but a ~-125 ms offset error
+    from the outbound delay alone; the tightened 0.10 s gate must drop it
+    so the fit never sees the high-leverage sample."""
+    from msync_client import ClockSync
+    cs = ClockSync("10.0.0.2", 9770)
+    assert cs.rtt_limit == 0.10               # regression: was 3.0
+    t0 = C.ts()
+    t1_ = t0 - 0.450                          # client sent 450 ms ago
+    t2 = t1_ + 0.100                          # server received after a 100 ms outbound hop
+    t3 = t2 + 0.001                           # tiny server processing time
+    resp = C.make_packet(C.TYPE_NTP_RESP, t1=t1_, t2=t2, t3=t3)
+    assert cs.exchange(_FakeSock(resp)) is False
+    assert cs.points == []                    # nothing appended to the fit window
+    assert cs.drift == 0.0
+    assert cs.rtt > 0.10                      # gate would have tripped
+
+
+def test_clock_sync_drift_two_bucket_median():
+    """A steady +100 ppm server-vs-client rate difference (offsets growing
+    100 us/s) must be recovered by the two-bucket-median drift estimator even
+    when individual round trips are grossly corrupted. One 250 ms burst used
+    to tilt the 1 Hz OLS slope by thousands of ppm; it must not budge the
+    median-bucket estimate (~+100 ppm)."""
+    from msync_client import ClockSync
+    cs = ClockSync("127.0.0.1", 1)
+    t = 0.0
+    n = 0
+    while len(cs.meds) < 2 * cs.MED_BUCKET + 2:
+        off = 100e-6 * t                      # +100 ppm: +100 us/s
+        if n % 47 == 0:
+            off += 0.250                      # +250 ms corrupted round trip
+        cs.points.append((t, off))
+        if len(cs.points) > cs.window:
+            cs.points.pop(0)
+        cs._recompute()
+        t += 1.0
+        n += 1
+    assert 80 <= cs.drift <= 120, cs.drift
+
+
 def test_client_download_does_not_hold_audio_lock(tmp_path, monkeypatch):
     """A slow new-track download must NOT happen while holding self.lock,
     otherwise the audio callback (which takes that lock every block) would

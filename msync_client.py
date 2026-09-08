@@ -48,18 +48,33 @@ CACHE_MAX_FILES = 40
 class ClockSync:
     """NTP-style client<->server clock offset + drift estimation."""
 
+    # Drift estimator buckets (see _recompute): the wall-clock difference
+    # changes only at the *rate difference between two hardware clocks*
+    # (tens of ppm, on a minutes timescale), so drift is estimated as the
+    # median of the newest MED_BUCKET offset medians minus the median of the
+    # earliest MED_BUCKET, divided by the time gap between their centroids.
+    MED_BUCKET = 60     # one-second median-offset samples per drift bucket
+    DRIFT_VIEW = 300    # max median history kept (seconds at 1 Hz cadence)
+
     def __init__(self, addr, port, window=20):
         self.addr = addr
         self.port = port
         self.window = window
         self.points = []          # list of (t_rt, offset)
+        self.meds = []            # smoothed offset history: (t_rt, median)
         self.offset = 0.0
         self.drift = 0.0          # server clock faster than client (ppm)
         self.rtt = 0.0
         # Round trips slower than this are treated as corrupted (network
         # queueing/jitter) and skipped rather than feeding garbage to the
-        # offset estimator.
-        self.rtt_limit = 3.0
+        # offset estimator. 3 s was far too loose: a one-way stall of even a
+        # few hundred ms injects up to |(d_f - d_b)/2| hundreds of ms of
+        # offset error while RTT stays under the old gate, and one such
+        # sample at a window edge blows the LSQ slope out to tens of
+        # thousands of ppm (the +-28k ppm clock spikes). LAN RTT here
+        # measures 0.3-12 ms (p99 ~22 ms), so 0.10 s is 4-9x headroom and
+        # caps any accepted asymmetry at +-50 ms of offset error.
+        self.rtt_limit = 0.10
 
     def exchange(self, sock):
         """One NTP exchange; returns True if updated."""
@@ -100,39 +115,38 @@ class ClockSync:
         return True
 
     def _recompute(self):
+        """Refit offset (median) and drift (two-bucket median)."""
         if len(self.points) < 2:
             self.offset = self.points[-1][1] if self.points else 0.0
             self.drift = 0.0
             return
-        ts_ = [p[0] for p in self.points]
         offs = [p[1] for p in self.points]
-        n = len(ts_)
-        mx = sum(ts_) / n
-        my = sum(offs) / n
-        # Fit offset = drift*t + offset using timestamps centered on the
-        # mean. Centering keeps the numbers small; regressing against the raw
-        # epoch (t ~ 1.8e9 s) multiplies any slope by ~1.8e9, blowing the
-        # interpolated offset up to hours while the drift stays sane — exactly
-        # the "sync is fine, then err explodes to +1e5s" failure mode.
-        num = sum((ts_[i] - mx) * (offs[i] - my) for i in range(n))
-        den = sum((ts_[i] - mx) ** 2 for i in range(n))
-        slope = num / den if den else 0.0
-        self.drift = slope * 1e6  # ppm
-        # Robust, outlier-resistant offset: the median of recent samples.
-        # (Offset is a slow constant; any residual drift is applied separately
-        # by the PLL's feedforward.) This keeps one bad round trip from
-        # yanking the playhead, unlike a least-squares intercept.
+        # Robust offset: median of recent samples (a slow constant; the
+        # residual rate difference is drift, applied separately by the PLL's
+        # feedforward). The median keeps one bad round trip from yanking the
+        # playhead, unlike a least-squares intercept.
         self.offset = statistics.median(offs)
-        # safety net: scrub samples more than 3*stdev from the median
-        if n >= 4:
-            sd_ = statistics.pstdev(offs)
-            if sd_ > 0:
-                med = statistics.median(offs)
-                keep = [(t, o) for t, o in self.points
-                        if abs(o - med) < 3 * sd_]
-                if 2 <= len(keep) < n:
-                    self.points = keep
-                    self._recompute()
+        # Drift as the rate of the wall-clock difference, estimated robustly.
+        # A 1 Hz OLS slope on raw offset samples amplifies one corrupted
+        # round trip into a thousands-of-ppm spike (the +-28k ppm clock
+        # jitter). Instead, average hard before differentiating: record the
+        # per-sample median offset and diff two wide median buckets. Each
+        # bucket median is ~0.5 ms stable, so over the ~4 min centroid gap
+        # the drift estimate jitters only a couple ppm and is immune to any
+        # corruption short of a 50%-of-bucket outage.
+        self.meds.append((self.points[-1][0], self.offset))
+        if len(self.meds) > self.DRIFT_VIEW:
+            self.meds = self.meds[-self.DRIFT_VIEW:]
+        if len(self.meds) >= 2 * self.MED_BUCKET:
+            new_b = self.meds[-self.MED_BUCKET:]
+            old_b = self.meds[:self.MED_BUCKET]
+            new = statistics.median(o for _, o in new_b)
+            old = statistics.median(o for _, o in old_b)
+            t_new = sum(t for t, _ in new_b) / self.MED_BUCKET
+            t_old = sum(t for t, _ in old_b) / self.MED_BUCKET
+            dt = t_new - t_old
+            if dt > 0.0:
+                self.drift = (new - old) / dt * 1e6
 
     def server_now(self):
         """Estimated current server wall-clock time."""
