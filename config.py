@@ -92,3 +92,22 @@ BANG_BANG_WINDOW_MS = float(os.environ.get("MSYNC_BANG_BANG_WINDOW_MS", "10"))
 #   MSYNC_PID_FILE       optional override path for this host's PID values file
 PID_SETTLE_MS = float(os.environ.get("MSYNC_PID_SETTLE_MS", "0"))
 PID_OMEGA_MAX_FRAC = float(os.environ.get("MSYNC_PID_OMEGA_MAX_FRAC", "0.5"))
+
+# Ziegler-Nichols reaction-curve calibration (see pid_tune.StepTest). The very
+# first time a host runs with no pid file yet, it applies a fixed pitch step
+# for a few seconds while recording the smoothed error, then measures its own
+# effective loop dead time L (audio block + error smoothing + network) and
+# computes the critically-damped gains from that measured L. All env-
+# overridable:
+#   MSYNC_PID_STEP_PPM            step size for the calibration test (ppm)
+#   MSYNC_PID_CAL_BASELINE_BLOCKS baseline blocks recorded before the step
+#   MSYNC_PID_CAL_STEP_BLOCKS     blocks recorded while the step is applied
+#   MSYNC_PID_CAL_LAG_MAX_S       max plausible dead time for the fit (s)
+#   MSYNC_PID_CAL_SETTLE_BLOCKS   max settle blocks before the step (0 = none)
+#   MSYNC_PID_CAL_SETTLE_SLOPE    err_f slope (x step) below which it is flat
+PID_STEP_PPM = float(os.environ.get("MSYNC_PID_STEP_PPM", "600"))
+PID_CAL_BASELINE_BLOCKS = int(os.environ.get("MSYNC_PID_CAL_BASELINE_BLOCKS", "7"))
+PID_CAL_STEP_BLOCKS = int(os.environ.get("MSYNC_PID_CAL_STEP_BLOCKS", "15"))
+PID_CAL_LAG_MAX_S = float(os.environ.get("MSYNC_PID_CAL_LAG_MAX_S", "1.5"))
+PID_CAL_SETTLE_BLOCKS = int(os.environ.get("MSYNC_PID_CAL_SETTLE_BLOCKS", "20"))
+PID_CAL_SETTLE_SLOPE = float(os.environ.get("MSYNC_PID_CAL_SETTLE_SLOPE", "0.3"))
