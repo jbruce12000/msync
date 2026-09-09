@@ -872,7 +872,12 @@ class SyncedServer:
                     if (config.BANG_BANG and self.song is not None and self.playing
                             and time.time() - last_status >= 2.0):
                         last_status = time.time()
-                        err = C.ts() - self.song_start - self.local_pos
+                        # Print the smoothed callback error the mode gate uses
+                        # (self.err_f), NOT a fresh ts-song_start-local_pos read:
+                        # local_pos only steps once per block, so an
+                        # instantaneous sample swings +/-one block of sawtooth
+                        # and disagrees with mode despite perfect alignment.
+                        err = self.err_f
                         print(f"[server] playing song={self.song.name}  "
                               f"err={err*1000:+7.1f}ms  "
                               f"pitch={self.local_pitch*1e6:+.0f}ppm  "

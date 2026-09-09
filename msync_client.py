@@ -999,7 +999,11 @@ class SyncClient:
                         name = buf.name
                     print(f"[client] {tracker}  song={name}  "
                           f"pos={self.local_pos:6.2f}s  target={target:6.2f}s  "
-                          f"err={(self.err_smooth)*1000:+7.1f}ms  "
+                          # err is the smoothed callback-boundary error the
+                          # controller actually gates on (self.err_f), NOT the
+                          # heavier err_smooth heartbeat metric: mode/window only
+                          # line up with the value driving the BANG/PID/PI choice.
+                          f"err={self.err_f*1000:+7.1f}ms  "
                           f"pitch={self.drift_pitch*1e6:+.0f}ppm  "
                           f"mode={self._mode}  "
                           f"window=±{config.BANG_BANG_WINDOW_MS:.0f}ms  "
