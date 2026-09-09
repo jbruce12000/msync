@@ -96,6 +96,13 @@ PLL_ALPHA     = 0.15        # PLL error EMA weight (0..1, higher = faster)
 INT_UNWIND    = 0.85        # per-callback integrator unwind when error is tiny
 INT_LIMIT     = 0.02        # integrator state clip (x PITCH_INT = <=400ppm)
 
+# PID test mode (bang-bang/PID hybrid) tuning. PID_P_EDGE_FRAC is the fraction
+# of the pitch rail the critically-damped PID's P term is designed to use at the
+# bang-window edge (see pid_tune.py). Small enough to keep the PID unsaturated
+# (genuinely linear) across the +/-window instead of railing a fraction of a
+# millisecond into it; 1.0 would pin the P output at the rail at the edge.
+PID_P_EDGE_FRAC = 0.6       # P term at window edge, as a fraction of MAX_PITCH
+
 
 def ts():
     return time.time()

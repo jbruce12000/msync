@@ -535,7 +535,8 @@ class SyncClient:
                     self._mode = "PID"
                     if self._pid is None:
                         self._pid, _ = pid_tune.load(
-                            self._pid_tag, frames / buf.sr)
+                            self._pid_tag, frames / buf.sr,
+                            config.BANG_BANG_WINDOW_MS / 1000.0)
                     g = self._pid
                     dt = frames / buf.sr
                     self._pid_int = float(np.clip(

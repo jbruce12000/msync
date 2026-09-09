@@ -8,6 +8,7 @@ import time
 import numpy as np
 import pytest
 
+import config
 import msync_common as C
 import pid_tune
 from conftest import (MUSIC, make_tagged_mp3, make_tagged_wav, wait_until)
@@ -1638,9 +1639,12 @@ def test_pid_tune_critically_damped_gains():
     assert g["ki"] == pytest.approx(g["wn"] ** 3 * g["tau"])
     assert g["kd"] >= 0.0
     assert 0.0 < g["kp"] and 0.0 < g["ki"]
-    # different hosts (different block periods) get different gains
+    # different hosts (different block periods) get different gains; the P term
+    # is window-anchored (tau-independent), so the per-host difference shows up
+    # in the integral term Ki
     g2 = pid_tune.compute_gains(8192 / 48000.0)
-    assert g["kp"] != g2["kp"]
+    assert g["kp"] == g2["kp"]
+    assert g["ki"] != g2["ki"]
 
 
 def test_pid_tune_persists_and_never_recomputes(tmp_path, monkeypatch):
@@ -1663,3 +1667,42 @@ def test_pid_tune_persists_across_calls(tmp_path, monkeypatch):
     importlib.reload(pid_tune)
     g2, _ = pid_tune.load("server", None)
     assert g1 == g2
+
+
+def test_client_pid_active_inside_window(client, monkeypatch, tmp_path):
+    # In PID test mode, the hybrid must run the critically-damped PID whenever
+    # the smoothed error is INSIDE +/-BANG_BANG_WINDOW_MS (i.e. PID active when
+    # -10ms < err < +10ms at the default window), and only apply full-power
+    # bang-bang pitch OUTSIDE that band.
+    monkeypatch.setattr(config, "BANG_BANG", True)
+    monkeypatch.setattr(config, "BANG_BANG_WINDOW_MS", 10.0)
+    monkeypatch.setenv("MSYNC_PID_FILE", str(tmp_path / "pid_client.json"))
+    h = client.client
+    wait_until(lambda: h.buffer.data is not None
+               and h.buffer.duration > 1.0 and h.stream is not None)
+    with C.stream_ops_lock:
+        h.stream.stop()          # silence the real callback: no measurement race
+    with h.lock:
+        h.playing = True
+        h._pitch_int = 0.0
+        h._pid = None
+        h._pid_int = 0.0
+        h._pid_prev = 0.0
+        h.err_f = 0.0
+        target = max(0.0, h.clock.server_now() - h.server_song_start)
+        # ~5ms behind the reference: inside the +-10ms window -> PID
+        h.local_pos = max(0.0, min(target - 0.005, h.buffer.duration - 2.0))
+    out = np.zeros((8192, 2), dtype=np.float32)
+    h._cb(out, 8192, None, None)
+    with h.lock:
+        assert h._mode == "PID"
+        assert abs(h.drift_pitch) < C.MAX_PITCH     # PID, NOT railed to +-2000
+    # ~200ms behind the reference: outside the +-10ms window -> bang-bang
+    with h.lock:
+        target = max(0.0, h.clock.server_now() - h.server_song_start)
+        h.local_pos = max(0.0, min(target - 0.200, h.buffer.duration - 2.0))
+        h.err_f = 0.0
+    h._cb(out, 8192, None, None)
+    with h.lock:
+        assert h._mode == "BANG"
+        assert h.drift_pitch == C.MAX_PITCH         # railed to +2000ppm

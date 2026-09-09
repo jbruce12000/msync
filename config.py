@@ -70,24 +70,25 @@ OUTPUT_LATENCY_MS = float(os.environ.get("MSYNC_OUTPUT_LATENCY_MS", "0"))
 # PID test mode (bang-bang outside the error window)                          #
 # --------------------------------------------------------------------------- #
 
-# EXPERIMENTAL drift-controller hybrid for testing. When enabled, whenever
-# the smoothed sync error is OUTSIDE a +/-BANG_BANG_WINDOW_MS window the
-# controller drives the actuator at FULL pitch power (+/-MAX_PITCH = +/-
-# 2000ppm) instead of the gentle PI, snapping the playhead back quickly.
-# Inside the window it runs this host's autodetected, critically-damped PID
-# (see pid_tune.py). Default is OFF, so existing behavior is unchanged; enable
-# only while testing. This is aggressive and audibly fast -- not for production.
+# EXPERIMENTAL drift-controller hybrid. PID mode is ENABLED by default in this
+# repo (current test cycle): whenever the smoothed sync error is OUTSIDE a
+# +/-BANG_BANG_WINDOW_MS window the controller drives the actuator at FULL pitch
+# power (+/-MAX_PITCH = +/-2000ppm) bang-bang, snapping the playhead back
+# quickly; INSIDE the window it runs the host's autodetected, critically-damped
+# PID (see pid_tune.py). Aggressive and audibly fast -- not for production.
+# Every value is env-overridable:
 #
-#   MSYNC_BANG_BANG=1               enable the hybrid
-#   MSYNC_BANG_BANG_WINDOW_MS=100   error window in milliseconds (default 100)
-BANG_BANG = os.environ.get("MSYNC_BANG_BANG", "0") in ("1", "true", "yes", "on")
-BANG_BANG_WINDOW_MS = float(os.environ.get("MSYNC_BANG_BANG_WINDOW_MS", "100"))
+#   MSYNC_BANG_BANG=0               disable the hybrid (back to the gentle PI)
+#   MSYNC_BANG_BANG_WINDOW_MS=10    error window in milliseconds (default 10)
+BANG_BANG = os.environ.get("MSYNC_BANG_BANG", "1") in ("1", "true", "yes", "on")
+BANG_BANG_WINDOW_MS = float(os.environ.get("MSYNC_BANG_BANG_WINDOW_MS", "10"))
 
 # Critically-damped PID tuning (used inside the window in test mode). The gains
-# are autodetected per host from its detected audio block period and this target
-# settling time, then persisted (see pid_tune.py) and never changed afterward.
-#   PID_SETTLE_MS        target 95% settling time for critical damping (ms)
+# are autodetected per host from its detected audio block period and the bang
+# window, then persisted (see pid_tune.py) and never changed afterward.
+#   PID_SETTLE_MS        target 95% settling time (ms); 0 = auto, derived from
+#                        the bang window so the PID stays unsaturated inside it
 #   PID_OMEGA_MAX_FRAC   cap on wn as a fraction of the host's block/loop rate
 #   MSYNC_PID_FILE       optional override path for this host's PID values file
-PID_SETTLE_MS = float(os.environ.get("MSYNC_PID_SETTLE_MS", "1500"))
+PID_SETTLE_MS = float(os.environ.get("MSYNC_PID_SETTLE_MS", "0"))
 PID_OMEGA_MAX_FRAC = float(os.environ.get("MSYNC_PID_OMEGA_MAX_FRAC", "0.5"))
