@@ -364,6 +364,7 @@ class SyncClient:
         self._base_pos = 0.0           # target position at that rebase
         self.drift_pitch = 0.0         # current applied pitch from PLL
         self._pitch_int = 0.0          # PI integrator state (tight clip + fast unwind)
+        self._mode = "idle"            # controller mode: BANG / PID / PI / idle
         self._pid = None               # autodetected critical PID gains (test mode)
         self._pid_int = 0.0            # PID integral state
         self._pid_prev = 0.0           # previous smoothed error for the D term
@@ -525,11 +526,13 @@ class SyncClient:
                 # next in-window phase. INSIDE the window: run the host's
                 # autodetected, critically-damped PID (see pid_tune.py).
                 if abs(ef) > config.BANG_BANG_WINDOW_MS / 1000.0:
+                    self._mode = "BANG"
                     self._pitch_int = 0.0
                     self._pid_int = 0.0
                     self.drift_pitch = float(
                         -C.MAX_PITCH if ef < 0 else C.MAX_PITCH)
                 else:
+                    self._mode = "PID"
                     if self._pid is None:
                         self._pid, _ = pid_tune.load(
                             self._pid_tag, frames / buf.sr)
@@ -547,6 +550,7 @@ class SyncClient:
                         + d,
                         -C.MAX_PITCH, C.MAX_PITCH))
             else:
+                self._mode = "PI"
                 # PI drift controller on the smoothed error, with an audible
                 # deadband: sub-DRIFT_HYSTERESIS errors are inaudible and (for
                 # this box) mostly NTP-reference noise, so don't chase them —
@@ -996,6 +1000,8 @@ class SyncClient:
                           f"pos={self.local_pos:6.2f}s  target={target:6.2f}s  "
                           f"err={(self.err_smooth)*1000:+7.1f}ms  "
                           f"pitch={self.drift_pitch*1e6:+.0f}ppm  "
+                          f"mode={self._mode}  "
+                          f"window=±{config.BANG_BANG_WINDOW_MS:.0f}ms  "
                           f"clock={self.clock.drift:+.0f}ppm")
         except KeyboardInterrupt:
             pass

@@ -123,6 +123,8 @@ class SyncedServer:
         self.stream = None          # PortAudio stream (opened in _play)
         self.local_pos = 0.0        # local playhead (seconds) in current song
         self._pitch_int = 0.0       # drift PI integrator state
+        self._mode = "idle"         # controller mode: BANG / PID / PI / idle
+        self.local_pitch = 0.0      # latest applied pitch (display only)
         self._pid = None            # autodetected critical PID gains (test mode)
         self._pid_int = 0.0         # PID integral state
         self._pid_prev = 0.0        # previous smoothed error for the D term
@@ -699,10 +701,12 @@ class SyncedServer:
             # critically-damped PID (see pid_tune.py). The server is its own
             # clock, so there is no NTP feedforward term.
             if abs(ef) > config.BANG_BANG_WINDOW_MS / 1000.0:
+                self._mode = "BANG"
                 self._pitch_int = 0.0
                 self._pid_int = 0.0
                 pitch = float(-C.MAX_PITCH if ef < 0 else C.MAX_PITCH)
             else:
+                self._mode = "PID"
                 if self._pid is None:
                     self._pid, _ = pid_tune.load(
                         self._pid_tag, frames / song.sr)
@@ -717,6 +721,7 @@ class SyncedServer:
                     g["kp"] * ef + g["ki"] * self._pid_int + d,
                     -C.MAX_PITCH, C.MAX_PITCH))
         else:
+            self._mode = "PI"
             # gentle PI drift controller on the smoothed error (server is its
             # own clock, so no FF) with an audible deadband like the client;
             # tight integrator clip + fast unwind so a stale windup can't keep
@@ -732,6 +737,8 @@ class SyncedServer:
             self._pitch_int = max(-C.INT_LIMIT, min(C.INT_LIMIT, self._pitch_int))
             pitch = max(-C.MAX_PITCH, min(C.MAX_PITCH,
                         ed * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT))
+        self.local_pitch = pitch
+        self._mode = "idle" if not self.playing else self._mode
         rate = 1.0 + pitch
         idx = max(0.0, self.local_pos * song.sr)
         n = len(song.data)
@@ -829,6 +836,7 @@ class SyncedServer:
     def monitor_loop(self):
         last_catalog = time.time()
         last_playback = 0.0
+        last_status = 0.0
         last_client_prune = 0.0
         lg = C.logger()
         last_warn = 0.0
@@ -857,6 +865,18 @@ class SyncedServer:
                     if self.song is not None and time.time() - last_playback >= 5.0:
                         self._persist_playback()
                         last_playback = time.time()
+                    # PID test mode: periodic live status so the DJ can see the
+                    # same err/pitch/mode the clients report (only in test mode
+                    # to keep the default console output untouched).
+                    if (config.BANG_BANG and self.song is not None and self.playing
+                            and time.time() - last_status >= 2.0):
+                        last_status = time.time()
+                        err = C.ts() - self.song_start - self.local_pos
+                        print(f"[server] playing song={self.song.name}  "
+                              f"err={err*1000:+7.1f}ms  "
+                              f"pitch={self.local_pitch*1e6:+.0f}ppm  "
+                              f"mode={self._mode}  "
+                              f"window=±{config.BANG_BANG_WINDOW_MS:.0f}ms")
                 self._absorb_drops()
                 # refresh the catalog periodically so freshly added albums and
                 # tracks (e.g. via the drop folder) become browsable/skippable.
