@@ -1182,6 +1182,37 @@ def test_http_pause_keeps_client_stream_open(server, client):
     wait_until(lambda: h.playing is True)
     assert h.stream.active
 
+
+def test_pause_state_broadcast_pushed_promptly(server, monkeypatch):
+    """Play/pause transitions must reach rooms immediately, not at the 10s
+    idle cadence. Clients mirror pause only on receiving a TYPE_STATE; left to
+    IDLE_STATE_INTERVAL alone, a pause would sit unseen for up to 10s.
+    (regression: udp_loop dropped state broadcasts to 10s while paused and
+    only sent the next one on the idle schedule.)
+
+    Record every state payload the udp_loop broadcasts and assert a
+    playing=False one arrives well under the idle interval after the pause
+    command."""
+    seen = []
+    orig = server._state_payload
+    def rec():
+        p = orig()
+        seen.append((time.time(), p))
+        return p
+    monkeypatch.setattr(server, "_state_payload", rec)
+
+    # udp_loop broadcasts state at 1 Hz while playing: wait for one so the
+    # loop is definitely running, then drop those pre-pause records.
+    wait_until(lambda: len(seen) >= 1, timeout=3.0, label="state broadcast seen")
+    seen.clear()
+    t0 = time.time()
+    server.play_pause()
+    ok = wait_until(
+        lambda: any(p.get("paused") and t - t0 < 2.0 for t, p in seen),
+        timeout=2.5, label="paused state broadcast")
+    assert ok, ("no playing=False TYPE_STATE within 2s of the pause; "
+                "the idle-cadence broadcast would delay it up to 10s")
+
     # The playhead must track the server firmly right after resume (no
     # stream-restart re-prime gap pushing the client behind).
     def gap():
