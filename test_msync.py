@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 import msync_common as C
+import pid_tune
 from conftest import (MUSIC, make_tagged_mp3, make_tagged_wav, wait_until)
 from msync_catalog import Catalog
 
@@ -1626,3 +1627,39 @@ def test_restart_resumes_same_song(server):
             except Exception:
                 pass
         srv2.catalog.close()
+
+# --------------------------------------------------------------------------- #
+# Per-host autodetected PID (pid_tune.py)                                      #
+# --------------------------------------------------------------------------- #
+def test_pid_tune_critically_damped_gains():
+    g = pid_tune.compute_gains(8192 / 44100.0)
+    # critical-damping relations for the integrator+lag plant
+    assert g["kp"] == pytest.approx(3 * g["wn"] ** 2 * g["tau"])
+    assert g["ki"] == pytest.approx(g["wn"] ** 3 * g["tau"])
+    assert g["kd"] >= 0.0
+    assert 0.0 < g["kp"] and 0.0 < g["ki"]
+    # different hosts (different block periods) get different gains
+    g2 = pid_tune.compute_gains(8192 / 48000.0)
+    assert g["kp"] != g2["kp"]
+
+
+def test_pid_tune_persists_and_never_recomputes(tmp_path, monkeypatch):
+    pidfile = tmp_path / "pid_client.json"
+    monkeypatch.setenv("MSYNC_PID_FILE", str(pidfile))
+    g1, path1 = pid_tune.load("client", 8192 / 44100.0)
+    assert str(pidfile) == path1
+    assert pidfile.is_file()
+    # a later, different block period must NOT change the stored values
+    g2, _ = pid_tune.load("client", 8192 / 48000.0)
+    assert g1["kp"] == g2["kp"] and g1["ki"] == g2["ki"] and g1["kd"] == g2["kd"]
+
+
+def test_pid_tune_persists_across_calls(tmp_path, monkeypatch):
+    pidfile = tmp_path / "pid_server.json"
+    monkeypatch.setenv("MSYNC_PID_FILE", str(pidfile))
+    g1, _ = pid_tune.load("server", 8192 / 48000.0)
+    # drop the in-memory result; reload fresh from disk
+    import importlib
+    importlib.reload(pid_tune)
+    g2, _ = pid_tune.load("server", None)
+    assert g1 == g2

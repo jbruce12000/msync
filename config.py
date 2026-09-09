@@ -64,3 +64,30 @@ CLIENT_STALE_AFTER = int(os.environ.get("MSYNC_CLIENT_STALE_AFTER", "86400"))
 # run the script, it prints the value), then set that value here. 0 means
 # the normal amount of buffering is fine for this room.
 OUTPUT_LATENCY_MS = float(os.environ.get("MSYNC_OUTPUT_LATENCY_MS", "0"))
+
+
+# --------------------------------------------------------------------------- #
+# PID test mode (bang-bang outside the error window)                          #
+# --------------------------------------------------------------------------- #
+
+# EXPERIMENTAL drift-controller hybrid for testing. When enabled, whenever
+# the smoothed sync error is OUTSIDE a +/-BANG_BANG_WINDOW_MS window the
+# controller drives the actuator at FULL pitch power (+/-MAX_PITCH = +/-
+# 2000ppm) instead of the gentle PI, snapping the playhead back quickly.
+# Inside the window it runs this host's autodetected, critically-damped PID
+# (see pid_tune.py). Default is OFF, so existing behavior is unchanged; enable
+# only while testing. This is aggressive and audibly fast -- not for production.
+#
+#   MSYNC_BANG_BANG=1               enable the hybrid
+#   MSYNC_BANG_BANG_WINDOW_MS=100   error window in milliseconds (default 100)
+BANG_BANG = os.environ.get("MSYNC_BANG_BANG", "0") in ("1", "true", "yes", "on")
+BANG_BANG_WINDOW_MS = float(os.environ.get("MSYNC_BANG_BANG_WINDOW_MS", "100"))
+
+# Critically-damped PID tuning (used inside the window in test mode). The gains
+# are autodetected per host from its detected audio block period and this target
+# settling time, then persisted (see pid_tune.py) and never changed afterward.
+#   PID_SETTLE_MS        target 95% settling time for critical damping (ms)
+#   PID_OMEGA_MAX_FRAC   cap on wn as a fraction of the host's block/loop rate
+#   MSYNC_PID_FILE       optional override path for this host's PID values file
+PID_SETTLE_MS = float(os.environ.get("MSYNC_PID_SETTLE_MS", "1500"))
+PID_OMEGA_MAX_FRAC = float(os.environ.get("MSYNC_PID_OMEGA_MAX_FRAC", "0.5"))

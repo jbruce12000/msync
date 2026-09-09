@@ -39,6 +39,7 @@ import miniaudio
 
 import config
 import msync_common as C
+import pid_tune
 
 # Bound the client's download cache: keep at most this many tracks on disk
 # so a long-lived client doesn't grow the cache dir without limit.
@@ -363,6 +364,10 @@ class SyncClient:
         self._base_pos = 0.0           # target position at that rebase
         self.drift_pitch = 0.0         # current applied pitch from PLL
         self._pitch_int = 0.0          # PI integrator state (tight clip + fast unwind)
+        self._pid = None               # autodetected critical PID gains (test mode)
+        self._pid_int = 0.0            # PID integral state
+        self._pid_prev = 0.0           # previous smoothed error for the D term
+        self._pid_tag = "client"
         self.err_f = 0.0               # low-passed PLL error (EMA of callback err)
         self.err_smooth = 0.0          # rolling avg of callback-boundary error
         self.queue = []                # server queue (names), from TYPE_STATE
@@ -513,25 +518,54 @@ class SyncClient:
             if abs(ef) > C.CATCHUP_THRESHOLD:
                 self.local_pos += C.CATCHUP_STEP if ef > 0 else -C.CATCHUP_STEP
                 err = target - self.local_pos
-            # PI drift controller on the smoothed error, with an audible
-            # deadband: sub-DRIFT_HYSTERESIS errors are inaudible and (for
-            # this box) mostly NTP-reference noise, so don't chase them —
-            # chasing produces a ±MAX_PITCH wobble. Errors inside the deadband
-            # only let the integrator unwind.
-            ed = float(np.copysign(max(abs(ef) - C.DRIFT_HYSTERESIS, 0.0), ef))
-            if ed:
-                self._pitch_int += np.clip(ed, -C.INT_LIMIT, C.INT_LIMIT)
-                # integral pulling against the error: unwind it now, not
-                # slowly over the next several seconds
-                if self._pitch_int * ef < 0.0:
-                    self._pitch_int *= 0.5
+            if config.BANG_BANG:
+                # PID test mode. OUTSIDE the ±window: apply FULL pitch power
+                # (±MAX_PITCH = ±2000ppm) in the direction of the error
+                # (bang-bang); drop stale windup so it can't bleed into the
+                # next in-window phase. INSIDE the window: run the host's
+                # autodetected, critically-damped PID (see pid_tune.py).
+                if abs(ef) > config.BANG_BANG_WINDOW_MS / 1000.0:
+                    self._pitch_int = 0.0
+                    self._pid_int = 0.0
+                    self.drift_pitch = float(
+                        -C.MAX_PITCH if ef < 0 else C.MAX_PITCH)
+                else:
+                    if self._pid is None:
+                        self._pid, _ = pid_tune.load(
+                            self._pid_tag, frames / buf.sr)
+                    g = self._pid
+                    dt = frames / buf.sr
+                    self._pid_int = float(np.clip(
+                        self._pid_int + ef * dt, -C.MAX_PITCH / g["ki"],
+                        C.MAX_PITCH / g["ki"]))
+                    d = g["kd"] * (ef - self._pid_prev) / dt
+                    self._pid_prev = ef
+                    self.drift_pitch = float(np.clip(
+                        self.clock.drift * 1e-6
+                        + g["kp"] * ef
+                        + g["ki"] * self._pid_int
+                        + d,
+                        -C.MAX_PITCH, C.MAX_PITCH))
             else:
-                self._pitch_int *= C.INT_UNWIND
-            self._pitch_int = np.clip(self._pitch_int, -C.INT_LIMIT, C.INT_LIMIT)
-            ff = self.clock.drift * 1e-6                      # s/s from NTP
-            self.drift_pitch = float(np.clip(
-                ff + ed * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT,
-                -C.MAX_PITCH, C.MAX_PITCH))
+                # PI drift controller on the smoothed error, with an audible
+                # deadband: sub-DRIFT_HYSTERESIS errors are inaudible and (for
+                # this box) mostly NTP-reference noise, so don't chase them —
+                # chasing produces a ±MAX_PITCH wobble. Errors inside the deadband
+                # only let the integrator unwind.
+                ed = float(np.copysign(max(abs(ef) - C.DRIFT_HYSTERESIS, 0.0), ef))
+                if ed:
+                    self._pitch_int += np.clip(ed, -C.INT_LIMIT, C.INT_LIMIT)
+                    # integral pulling against the error: unwind it now, not
+                    # slowly over the next several seconds
+                    if self._pitch_int * ef < 0.0:
+                        self._pitch_int *= 0.5
+                else:
+                    self._pitch_int *= C.INT_UNWIND
+                self._pitch_int = np.clip(self._pitch_int, -C.INT_LIMIT, C.INT_LIMIT)
+                ff = self.clock.drift * 1e-6                  # s/s from NTP
+                self.drift_pitch = float(np.clip(
+                    ff + ed * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT,
+                    -C.MAX_PITCH, C.MAX_PITCH))
             rate = 1.0 + self.drift_pitch
             # Status metric: smooth the CALLBACK-boundary error (the quantity
             # the PLL chases). An instantaneous sample taken between
@@ -675,6 +709,8 @@ class SyncClient:
                     # smoothed PLL error — it must restart from the new
                     # reference, not decay toward it.
                     self._pitch_int = 0.0
+                    self._pid_int = 0.0
+                    self._pid_prev = 0.0
                     self.err_f = 0.0
                     # The stream STAYS OPEN through pauses — the callback
                     # just fills silence. Restarting PortAudio re-primes the
@@ -694,6 +730,8 @@ class SyncClient:
                                          self.clock.server_now() - song_start)
                     self._rebase()
                     self._pitch_int = 0.0
+                    self._pid_int = 0.0
+                    self._pid_prev = 0.0
                     self.err_f = 0.0
             elif self._loading_name == name:
                 return                # already fetching this track now
@@ -738,6 +776,8 @@ class SyncClient:
             self.local_pos = max(0.0, self.clock.server_now() - song_start)
             self._rebase()
             self._pitch_int = 0.0          # fresh rebase: drop stale windup
+            self._pid_int = 0.0            # ... and the PID integral state
+            self._pid_prev = 0.0           # ... and the D-term memory
             self.err_f = 0.0               # ... and the smoothed PLL error
             self.playing = playing
             # Publish the new buffer LAST so the callback either sees the old
