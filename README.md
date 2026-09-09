@@ -45,12 +45,13 @@ few milliseconds even across Wi-Fi.
   drops 50 random tracks into the queue — hours of music, zero decisions.
 - **Album & tag support** — reads audio tags (artist, album, track number,
   title) automatically; groups tracks into albums for easy browsing.
-- **Auto-discovery** — new or removed files are picked up while the server
+- **Auto-discovery of music** — new or removed files are picked up while the server
   runs, no restart needed.
+- **Auto-discovery of clients** — new clients join the pool and sync with the server and start playing the current song
 - **No music copying** — clients download the current song from the server
   automatically; your library lives in one place.
 - **Multi-platform** — runs anywhere Python 3.9+ runs (Linux, macOS,
-  Windows).
+  Windows). only proven on linux.
 
 ---
 
