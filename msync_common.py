@@ -102,7 +102,7 @@ PREFETCH_PREWARM_S      = 2.0    # warm this many seconds of the next track
 # controller runs on a low-passed error instead; the EMA weight is per
 # callback (~tau 0.6s at 5 Hz blocks).
 PLL_ALPHA     = 0.15        # PLL error EMA weight (0..1, higher = faster)
-INT_UNWIND    = 0.85        # per-callback integrator unwind when error is tiny
+INT_UNWIND    = 1.0         # per-callback integrator unwind when error is tiny (1.0 = no decay; lets integral hold its drift correction)
 INT_LIMIT     = 0.02        # integrator state clip (x PITCH_INT = <=400ppm)
 
 # PID test mode (bang-bang/PID hybrid) tuning. PID_P_EDGE_FRAC is the fraction
