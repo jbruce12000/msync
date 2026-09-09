@@ -351,6 +351,145 @@ def test_prefetch_worker_install_supersede_failure(tmp_path, monkeypatch):
     c.buffer.close()
 
 
+def test_prefetch_in_flight_guard_and_already_prepared(tmp_path):
+    """_maybe_prefetch must not re-arm while a worker is already running, nor
+    re-fetch a track whose decoded buffer is already parked in _prefetch."""
+    import msync_client as MC
+    c = MC.SyncClient("127.0.0.1", 1, str(tmp_path))
+    picked = []
+    c._prefetch_worker = (lambda host, port, name, cache_dir:
+                          picked.append(name))
+    try:
+        with c.lock:
+            c.buffer.name = "a.wav"
+            c.queue = ["a.wav", "b.wav", "c.wav"]
+        # in-flight guard: a worker is already running for b.wav
+        c._prefetching = "b.wav"
+        c._maybe_prefetch()
+        assert c._prefetching == "b.wav"     # unchanged, nothing new launched
+        assert picked == []
+        # already-prepared guard: b.wav is decoded and ready in _prefetch
+        c._prefetching = None
+        ready = MC.SongBuffer(str(tmp_path))
+        ready.data = np.zeros((8000, 2), dtype=np.float32)
+        ready.sr = 8000
+        ready.name = "b.wav"
+        ready.duration = 1.0
+        c._prefetch = ready
+        c._maybe_prefetch()
+        assert c._prefetching is None        # not re-armed
+        assert picked == []
+    finally:
+        c.buffer.close()
+        if c._prefetch is not None:
+            c._prefetch.close()
+
+
+def test_prefetch_worker_drops_current_track(tmp_path, monkeypatch):
+    """A prefetch that lands AFTER the track became current (the on-demand
+    path adopted it first) must be dropped, not installed or leaked."""
+    import msync_client as MC
+    c = MC.SyncClient("127.0.0.1", 1, str(tmp_path))
+
+    def fake_load(self, host, port, name, duration=None):
+        self.data = np.zeros((8000, 2), dtype=np.float32)
+        self.sr = 8000
+        self.name = name
+        self.duration = 1.0
+        return True
+    monkeypatch.setattr(MC.SongBuffer, "load", fake_load)
+    try:
+        with c.lock:
+            c.buffer.name = "b.wav"   # current before the prefetch landed
+        c._prefetching = "b.wav"
+        c._prefetch_worker("host", 1, "b.wav", str(tmp_path))
+        assert c._prefetch is None            # duplicate dropped, not installed
+        assert c._prefetching is None         # marker cleared
+    finally:
+        c.buffer.close()
+
+
+def test_apply_state_grab_keeps_inflight_marker_for_newer_pick(tmp_path,
+                                                               monkeypatch):
+    """Regression: adopting a ready prefetch must NOT wipe the in-flight
+    marker of a DIFFERENT track's prefetch. A worker that is simultaneously
+    decoding the newer predicted next should still install its result when it
+    finishes (it was superseded by the announce, not by the adoption)."""
+    import msync_client as MC
+    c = MC.SyncClient("127.0.0.1", 1, str(tmp_path))
+
+    def fake_load(self, host, port, name, duration=None):
+        self.data = np.zeros((8000, 2), dtype=np.float32)
+        self.sr = 8000
+        self.name = name
+        self.duration = 1.0
+        return True
+    monkeypatch.setattr(MC.SongBuffer, "load", fake_load)
+    monkeypatch.setattr(c, "_ensure_stream", lambda: None)
+    try:
+        with c.lock:
+            c.buffer.name = "a.wav"
+            c._prefetching = "c.wav"          # newer pick still decoding
+        ready = MC.SongBuffer(str(tmp_path))
+        ready.data = np.zeros((8000, 2), dtype=np.float32)
+        ready.sr = 8000
+        ready.name = "b.wav"
+        ready.duration = 1.0
+        c._prefetch = ready
+        c._apply_state({"name": "b.wav", "playing": True,
+                        "song_start": 100.0, "duration": 1.0})
+        assert c.buffer is ready              # adopted b.wav instantly
+        assert c._prefetching == "c.wav"      # c.wav's marker survives
+        # ...and its worker still installs the result when it completes
+        c._prefetch_worker("host", 1, "c.wav", str(tmp_path))
+        assert c._prefetch is not None and c._prefetch.name == "c.wav"
+        assert c._prefetching is None
+    finally:
+        c.buffer.close()
+        if c._prefetch is not None:
+            c._prefetch.close()
+
+
+def test_warm_prefetch_gates_and_touches_pages(tmp_path):
+    """The page re-warm fires only once, only when a prefetch exists, and only
+    once the current track is within PREFETCH_PREWARM_LEAD_S of its end."""
+    import msync_client as MC
+    c = MC.SyncClient("127.0.0.1", 1, str(tmp_path))
+    try:
+        with c.lock:
+            c.buffer.name = "a.wav"
+            c.buffer.duration = 100.0
+            c.buffer.sr = 8000
+            c.buffer.data = np.zeros((800, 2), dtype=np.float32)
+            c._base_pos = 0.0
+            c._base_clock = C.ts()
+        # no prefetch yet: no-op
+        c._warm_prefetch()
+        assert c._prefetch_warmed is False
+        # prefetch present but track far from its end: still no touch
+        ready = MC.SongBuffer(str(tmp_path))
+        ready.data = np.zeros((16000, 2), dtype=np.float32)
+        ready.sr = 8000
+        ready.name = "b.wav"
+        ready.duration = 1.0
+        with c.lock:
+            c._prefetch = ready
+        c._warm_prefetch()
+        assert c._prefetch_warmed is False
+        # near the end: warm once, then idempotent
+        with c.lock:
+            c._base_pos = 95.0               # >= 100 - PREFETCH_PREWARM_LEAD_S
+            c._base_clock = C.ts()
+        c._warm_prefetch()
+        assert c._prefetch_warmed is True
+        c._warm_prefetch()                   # second call: no-op
+        assert c._prefetch_warmed is True
+    finally:
+        c.buffer.close()
+        if c._prefetch is not None:
+            c._prefetch.close()
+
+
 def test_queue_meta_tags(tmp_path):
     """Queue entries carry display metadata (artist - album - title) so the
     UI can render names instead of directory/file paths. Album entries

@@ -771,7 +771,14 @@ class SyncClient:
             if self._prefetch is not None and self._prefetch.name == name:
                 scratch = self._prefetch
                 self._prefetch = None
-                self._prefetching = None
+                # Only clear the in-flight marker if it refers to the track
+                # we're adopting. A prefetch for a DIFFERENT track may still be
+                # running (the ready one was predicted earlier, the newer pick
+                # superseded it, then a manual next announced this one): wiping
+                # the marker would make that worker discard its perfectly good
+                # result when it finishes a moment later.
+                if self._prefetching == name:
+                    self._prefetching = None
                 self._prefetch_warmed = False
         if scratch is None:
             scratch = SongBuffer(self.buffer.cache_dir)
