@@ -81,7 +81,7 @@ MAX_PITCH     = 0.002       # max drift correction pitch (0.2%)
 PITCH_GAIN    = 0.03        # proportional gain for drift correction (1/s)
 PITCH_INT     = 0.02        # integral gain (accumulated error -> pitch)
 DRIFT_HYSTERESIS = 0.010    # deadband (s): don't respond to smaller errors
-CATCHUP_THRESHOLD = 0.06    # bounded playhead nudge only when gap exceeds this (s)
+CATCHUP_THRESHOLD = 0.02    # bounded playhead nudge only when gap exceeds this (s)
 CATCHUP_STEP      = 0.005   # max nudge per audio block while catching up (s)
 
 # Next-track prefetch. The following queued song is downloaded + decoded in a
