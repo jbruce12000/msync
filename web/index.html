@@ -451,9 +451,9 @@ function renderClients() {
     }
     let html = '<h3>Rooms / output-latency offset</h3>' +
         '<div class="empty-state" style="padding:8px 0 16px;">' +
-        'Set how many ms each room must play <b>ahead</b> of the sync timeline to ' +
-        'line up with the others (negative = behind). Drag the slider or type an ' +
-        'exact value; applied live and saved to the database.</div>';
+        'If you have a client on bluetooth or hdmi, manually adjust ' +
+        'the slider until the music is sychronized. This is a one-time operation and ' +
+        'the value is saved to a local database.</div>';
     for (const c of clients) {
         const key = c.ip.replace(/\./g, '_');
         const status = clientStatus(c);
