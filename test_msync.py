@@ -1634,10 +1634,7 @@ def test_restart_resumes_same_song(server):
 # --------------------------------------------------------------------------- #
 def test_pid_tune_critically_damped_gains():
     g = pid_tune.compute_gains(8192 / 44100.0)
-    # critical-damping relations for the integrator+lag plant; with no
-    # measured lag the design falls back to the block period (L = tau)
-    assert g["method"] == "zn-fallback"
-    assert g["lag_ms"] == pytest.approx(g["tau"] * 1000.0)
+    # critical-damping relations for the integrator+lag plant
     assert g["kp"] == pytest.approx(3 * g["wn"] ** 2 * g["tau"])
     assert g["ki"] == pytest.approx(g["wn"] ** 3 * g["tau"])
     assert g["kd"] >= 0.0
@@ -1648,100 +1645,6 @@ def test_pid_tune_critically_damped_gains():
     g2 = pid_tune.compute_gains(8192 / 48000.0)
     assert g["kp"] == g2["kp"]
     assert g["ki"] != g2["ki"]
-    assert g["lag_ms"] != g2["lag_ms"]
-
-
-def test_pid_tune_measured_lag_changes_gains():
-    # A host whose reaction-curve step test measured a larger dead time L
-    # (extra smoothing/network lag) gets a gentler, still critically-damped
-    # loop: same window-anchored P term, smaller integral, lag recorded.
-    g_fb = pid_tune.compute_gains(8192 / 44100.0)
-    g_meas = pid_tune.compute_gains(8192 / 44100.0, lag_sec=0.90)
-    assert g_meas["method"] == "zn-reaction-curve"
-    assert g_meas["lag_ms"] == pytest.approx(900.0, abs=0.5)
-    L = g_meas["lag_ms"] / 1000.0
-    assert g_meas["kp"] == pytest.approx(3 * g_meas["wn"] ** 2 * L)
-    assert g_meas["ki"] == pytest.approx(g_meas["wn"] ** 3 * L)
-    assert g_meas["kp"] == g_fb["kp"]            # window anchor, still unsaturated
-    assert g_meas["ki"] < g_fb["ki"]             # slower host path: gentler I
-    assert g_meas["wn"] < g_fb["wn"]
-
-
-def test_pid_tune_zn_step_test_recovers_lag(monkeypatch):
-    # Drive a real StepTest with a synthetic reaction curve: a unit-gain
-    # integrator with drift common-mode + a +step 500 ms after the step phase
-    # begins. The two-line fit must recover that dead time and K ~ -1.
-    monkeypatch.setattr(config, "PID_CAL_BASELINE_BLOCKS", 6)
-    monkeypatch.setattr(config, "PID_CAL_STEP_BLOCKS", 15)
-    monkeypatch.setattr(config, "PID_CAL_LAG_MAX_S", 1.5)
-    monkeypatch.setattr(config, "PID_CAL_SETTLE_BLOCKS", 0)   # skip settle
-    st = pid_tune.StepTest(step_ppm=600.0)
-    assert st.phase == "baseline"
-    step = st.step_frac
-    dt = 0.19
-    L_true = 0.5                       # loop dead time (s)
-    drift = 20e-6                      # common-mode reference drift (s/s)
-    t_step = st.n_baseline * dt
-    err = 0.0
-    t = 0.0
-    finished = False
-    for i in range(st.n_baseline + st.n_step):
-        t += dt
-        rate = drift if t < t_step + L_true else drift - step
-        err += rate * dt
-        finished = st.feed(err, dt)
-    assert finished
-    assert st.done and st.lag_ok
-    # lag is measured from the first step-phase sample (t = t_step + dt)
-    assert st.lag == pytest.approx(L_true - dt, abs=0.15)
-    assert st.K == pytest.approx(-1.0, abs=0.3)
-
-
-def test_pid_tune_zn_step_test_falls_back_when_noiseless_flat(monkeypatch):
-    # If the step never shows up in the recorded error (e.g. the reference
-    # jumped the same way the step pulled), the test must be flagged unusable
-    # so the host falls back to the analytic block-period lag.
-    monkeypatch.setattr(config, "PID_CAL_BASELINE_BLOCKS", 6)
-    monkeypatch.setattr(config, "PID_CAL_STEP_BLOCKS", 15)
-    monkeypatch.setattr(config, "PID_CAL_SETTLE_BLOCKS", 0)   # skip settle
-    st = pid_tune.StepTest(step_ppm=600.0)
-    err = 0.0
-    for _ in range(st.n_baseline + st.n_step):
-        err += 0.0 * 0.19 + 0.00006   # flat: no slope response at all
-        st.feed(err, 0.19)
-    assert st.done
-    assert not st.lag_ok
-    assert st.lag is None
-
-
-def test_pid_tune_zn_settle_waits_for_flat(monkeypatch):
-    # The settle phase must hold pitch at 0, ignoring a large start-up
-    # transient (err_f converging toward an initial offset), and only move on
-    # once the error is flat -- OR time out after PID_CAL_SETTLE_BLOCKS.
-    monkeypatch.setattr(config, "PID_CAL_BASELINE_BLOCKS", 4)
-    monkeypatch.setattr(config, "PID_CAL_SETTLE_BLOCKS", 20)
-    monkeypatch.setattr(config, "PID_CAL_SETTLE_SLOPE", 0.3)
-    st = pid_tune.StepTest(step_ppm=600.0)
-    assert st.phase == "settle"
-    # converging transient: 5ms per block for the first 5 blocks
-    err = -0.005
-    for i in range(5):
-        st.feed(err - 0.005 * i, 0.19)
-        assert st.phase == "settle", "must not leave settle during transient"
-        assert st.pitch == 0.0
-    # now flat at a steady offset; settle should finish on the next checks
-    err = -0.040
-    for _ in range(12):
-        st.feed(err, 0.19)
-        if st.phase != "settle":
-            break
-    assert st.phase == "baseline", "settle must end once the error is flat"
-    # and a persistently-sloping error still times out into baseline
-    monkeypatch.setattr(config, "PID_CAL_SETTLE_BLOCKS", 3)
-    st2 = pid_tune.StepTest(step_ppm=600.0)
-    for i in range(3):
-        st2.feed(-0.005 - 0.005 * i, 0.19)
-    assert st2.phase == "baseline", "settle must time out after max blocks"
 
 
 def test_pid_tune_persists_and_never_recomputes(tmp_path, monkeypatch):
@@ -1775,9 +1678,6 @@ def test_client_pid_active_inside_window(client, monkeypatch, tmp_path):
     monkeypatch.setattr(config, "BANG_BANG_WINDOW_MS", 10.0)
     monkeypatch.setenv("MSYNC_PID_FILE", str(tmp_path / "pid_client.json"))
     h = client.client
-    pid_tune.load("client", 8192 / 44100.0)   # pre-seed pid file (skips the
-                                              # first-run ZN step test before
-                                              # the live stream starts)
     wait_until(lambda: h.buffer.data is not None
                and h.buffer.duration > 1.0 and h.stream is not None)
     with C.stream_ops_lock:
@@ -1786,7 +1686,6 @@ def test_client_pid_active_inside_window(client, monkeypatch, tmp_path):
         h.playing = True
         h._pitch_int = 0.0
         h._pid = None
-        h._calib = None
         h._pid_int = 0.0
         h._pid_prev = 0.0
         h.err_f = 0.0

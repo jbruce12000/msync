@@ -368,7 +368,6 @@ class SyncClient:
         self._pid = None               # autodetected critical PID gains (test mode)
         self._pid_int = 0.0            # PID integral state
         self._pid_prev = 0.0           # previous smoothed error for the D term
-        self._calib = None             # ZN reaction-curve step test (first run)
         self._pid_tag = "client"
         self.err_f = 0.0               # low-passed PLL error (EMA of callback err)
         self.err_smooth = 0.0          # rolling avg of callback-boundary error
@@ -511,123 +510,67 @@ class SyncClient:
             # smoothed error instead.
             self.err_f += C.PLL_ALPHA * (err - self.err_f)
             ef = self.err_f
-            # PID test mode, first run: no pid file yet -> run the per-host
-            # Ziegler-Nichols reaction-curve step test (pid_tune.StepTest).
-            # It measures THIS host's effective loop dead time L (audio block
-            # + err_f smoothing + network/reference path) before any control
-            # engages, so the critically-damped gains are designed on the real
-            # lag. Catch-up nudges and the BANG/PID gate are bypassed while it
-            # runs so the reaction curve stays clean.
-            if (config.BANG_BANG and self._pid is None
-                    and self._calib is None
-                    and not os.path.isfile(
-                        pid_tune.pid_file_path(self._pid_tag))):
-                self._calib = pid_tune.StepTest()
-                st0 = self._calib
-                C.logger().info(
-                    "[pid] no %s yet - ZN reaction-curve calibration "
-                    "(+%.0fppm step, %d baseline + %d step blocks, "
-                    "up to %d settle blocks, ~%.1fs)",
-                    os.path.basename(pid_tune.pid_file_path(self._pid_tag)),
-                    st0.step_ppm, st0.n_baseline, st0.n_step, st0.n_settle,
-                    (st0.n_baseline + st0.n_step + st0.n_settle)
-                    * frames / buf.sr)
-            if config.BANG_BANG and self._calib is not None:
-                self._mode = "CAL"
-                st = self._calib
-                dt = frames / buf.sr
-                done = st.feed(ef, dt)
-                self.drift_pitch = float(st.pitch)
-                self._pid_int = 0.0
-                self._pid_prev = 0.0
-                if done:
-                    lag = st.lag if st.lag_ok else None
-                    self._pid, _ = pid_tune.load(
-                        self._pid_tag, frames / buf.sr,
-                        config.BANG_BANG_WINDOW_MS / 1000.0, lag_sec=lag)
-                    self._calib = None
-                    if st.lag_ok:
-                        C.logger().info(
-                            "[pid] calibrated on THIS host: measured lag "
-                            "=%.0fms (K=%.2f) -> Kp=%.4f Ki=%.4f Kd=%.4f "
-                            "wn=%.3f rad/s",
-                            st.lag * 1000.0, st.K,
-                            self._pid["kp"], self._pid["ki"], self._pid["kd"],
-                            self._pid["wn"])
-                    else:
-                        C.logger().info(
-                            "[pid] step test unusable (K=%s) - falling back "
-                            "to block-period lag -> Kp=%.4f Ki=%.4f Kd=%.4f "
-                            "wn=%.3f rad/s",
-                            "%.2f" % st.K if st.K is not None else "None",
-                            self._pid["kp"], self._pid["ki"], self._pid["kd"],
-                            self._pid["wn"])
-            else:
-                # Bounded fast re-alignment: right after a pause/resume, a
-                # busy server stall, or a seek, a rate-only PLL capped at
-                # MAX_PITCH would take tens of seconds to close a large gap.
-                # Nudge the playhead toward the target by a few ms per block
-                # instead (a sub-block skip/repeat that is effectively
-                # inaudible). Gated on the smoothed error so reference jitter
-                # can't trip it.
-                if abs(ef) > C.CATCHUP_THRESHOLD:
-                    self.local_pos += C.CATCHUP_STEP if ef > 0 else -C.CATCHUP_STEP
-                    err = target - self.local_pos
-                if config.BANG_BANG:
-                    # PID test mode. OUTSIDE the ±window: apply FULL pitch
-                    # power (±MAX_PITCH = ±2000ppm) in the direction of the
-                    # error (bang-bang); drop stale windup so it can't bleed
-                    # into the next in-window phase. INSIDE the window: run
-                    # the host's autodetected, critically-damped PID (see
-                    # pid_tune.py).
-                    if abs(ef) > config.BANG_BANG_WINDOW_MS / 1000.0:
-                        self._mode = "BANG"
-                        self._pitch_int = 0.0
-                        self._pid_int = 0.0
-                        self.drift_pitch = float(
-                            -C.MAX_PITCH if ef < 0 else C.MAX_PITCH)
-                    else:
-                        self._mode = "PID"
-                        if self._pid is None:
-                            self._pid, _ = pid_tune.load(
-                                self._pid_tag, frames / buf.sr,
-                                config.BANG_BANG_WINDOW_MS / 1000.0)
-                        g = self._pid
-                        dt = frames / buf.sr
-                        self._pid_int = float(np.clip(
-                            self._pid_int + ef * dt, -C.MAX_PITCH / g["ki"],
-                            C.MAX_PITCH / g["ki"]))
-                        d = g["kd"] * (ef - self._pid_prev) / dt
-                        self._pid_prev = ef
-                        self.drift_pitch = float(np.clip(
-                            self.clock.drift * 1e-6
-                            + g["kp"] * ef
-                            + g["ki"] * self._pid_int
-                            + d,
-                            -C.MAX_PITCH, C.MAX_PITCH))
+            # Bounded fast re-alignment: right after a pause/resume, a busy
+            # server stall, or a seek, a rate-only PLL capped at MAX_PITCH
+            # would take tens of seconds to close a large gap. Nudge the
+            # playhead toward the target by a few ms per block instead (a
+            # sub-block skip/repeat that is effectively inaudible). Gated on
+            # the smoothed error so reference jitter can't trip it.
+            if abs(ef) > C.CATCHUP_THRESHOLD:
+                self.local_pos += C.CATCHUP_STEP if ef > 0 else -C.CATCHUP_STEP
+                err = target - self.local_pos
+            if config.BANG_BANG:
+                # PID test mode. OUTSIDE the ±window: apply FULL pitch power
+                # (±MAX_PITCH = ±2000ppm) in the direction of the error
+                # (bang-bang); drop stale windup so it can't bleed into the
+                # next in-window phase. INSIDE the window: run the host's
+                # autodetected, critically-damped PID (see pid_tune.py).
+                if abs(ef) > config.BANG_BANG_WINDOW_MS / 1000.0:
+                    self._mode = "BANG"
+                    self._pitch_int = 0.0
+                    self._pid_int = 0.0
+                    self.drift_pitch = float(
+                        -C.MAX_PITCH if ef < 0 else C.MAX_PITCH)
                 else:
-                    self._mode = "PI"
-                    # PI drift controller on the smoothed error, with an audible
-                    # deadband: sub-DRIFT_HYSTERESIS errors are inaudible and (for
-                    # this box) mostly NTP-reference noise, so don't chase them —
-                    # chasing produces a ±MAX_PITCH wobble. Errors inside the
-                    # deadband only let the integrator unwind.
-                    ed = float(np.copysign(max(abs(ef) - C.DRIFT_HYSTERESIS,
-                                               0.0), ef))
-                    if ed:
-                        self._pitch_int += np.clip(ed, -C.INT_LIMIT, C.INT_LIMIT)
-                        # integral pulling against the error: unwind it now, not
-                        # slowly over the next several seconds
-                        if self._pitch_int * ef < 0.0:
-                            self._pitch_int *= 0.5
-                    else:
-                        self._pitch_int *= C.INT_UNWIND
-                    self._pitch_int = np.clip(self._pitch_int,
-                                              -C.INT_LIMIT, C.INT_LIMIT)
-                    ff = self.clock.drift * 1e-6              # s/s from NTP
+                    self._mode = "PID"
+                    if self._pid is None:
+                        self._pid, _ = pid_tune.load(
+                            self._pid_tag, frames / buf.sr,
+                            config.BANG_BANG_WINDOW_MS / 1000.0)
+                    g = self._pid
+                    dt = frames / buf.sr
+                    self._pid_int = float(np.clip(
+                        self._pid_int + ef * dt, -C.MAX_PITCH / g["ki"],
+                        C.MAX_PITCH / g["ki"]))
+                    d = g["kd"] * (ef - self._pid_prev) / dt
+                    self._pid_prev = ef
                     self.drift_pitch = float(np.clip(
-                        ff + ed * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT,
+                        self.clock.drift * 1e-6
+                        + g["kp"] * ef
+                        + g["ki"] * self._pid_int
+                        + d,
                         -C.MAX_PITCH, C.MAX_PITCH))
+            else:
+                self._mode = "PI"
+                # PI drift controller on the smoothed error, with an audible
+                # deadband: sub-DRIFT_HYSTERESIS errors are inaudible and (for
+                # this box) mostly NTP-reference noise, so don't chase them —
+                # chasing produces a ±MAX_PITCH wobble. Errors inside the deadband
+                # only let the integrator unwind.
+                ed = float(np.copysign(max(abs(ef) - C.DRIFT_HYSTERESIS, 0.0), ef))
+                if ed:
+                    self._pitch_int += np.clip(ed, -C.INT_LIMIT, C.INT_LIMIT)
+                    # integral pulling against the error: unwind it now, not
+                    # slowly over the next several seconds
+                    if self._pitch_int * ef < 0.0:
+                        self._pitch_int *= 0.5
+                else:
+                    self._pitch_int *= C.INT_UNWIND
+                self._pitch_int = np.clip(self._pitch_int, -C.INT_LIMIT, C.INT_LIMIT)
+                ff = self.clock.drift * 1e-6                  # s/s from NTP
+                self.drift_pitch = float(np.clip(
+                    ff + ed * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT,
+                    -C.MAX_PITCH, C.MAX_PITCH))
             rate = 1.0 + self.drift_pitch
             # Status metric: smooth the CALLBACK-boundary error (the quantity
             # the PLL chases). An instantaneous sample taken between
@@ -774,7 +717,6 @@ class SyncClient:
                     self._pid_int = 0.0
                     self._pid_prev = 0.0
                     self.err_f = 0.0
-                    self._calib = None   # restart calibration after rebase
                     # The stream STAYS OPEN through pauses — the callback
                     # just fills silence. Restarting PortAudio re-primes the
                     # device buffer, pushing this client audibly behind the
@@ -796,7 +738,6 @@ class SyncClient:
                     self._pid_int = 0.0
                     self._pid_prev = 0.0
                     self.err_f = 0.0
-                    self._calib = None   # restart calibration after rebase
             elif self._loading_name == name:
                 return                # already fetching this track now
             prev_name = self.buffer.name    # how we tell a newer state "took over"
