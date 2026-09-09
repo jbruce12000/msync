@@ -1064,12 +1064,22 @@ class SyncedServer:
         print(f"[server] UDP sync on port {self.port}")
         last_bcast, last_state = 0.0, 0.0
         last_warn = 0.0
+        last_playing = self.playing
 
         while not self._stop.is_set():
             try:
                 t = C.ts()
-                sync_int = C.SYNC_INTERVAL if self.playing else C.IDLE_SYNC_INTERVAL
-                state_int = C.STATE_INTERVAL if self.playing else C.IDLE_STATE_INTERVAL
+                playing = self.playing
+                # A play/pause/stop transition must reach the rooms promptly:
+                # left to the idle cadence alone, a pause would sit unseen for
+                # up to IDLE_STATE_INTERVAL (10s). Detect the change here (the
+                # loop wakes often enough — the receive timeout is capped below
+                # even when idle) and force the next broadcast pair.
+                if playing != last_playing:
+                    last_playing = playing
+                    last_bcast = last_state = 0.0
+                sync_int = C.SYNC_INTERVAL if playing else C.IDLE_SYNC_INTERVAL
+                state_int = C.STATE_INTERVAL if playing else C.IDLE_STATE_INTERVAL
                 if t - last_bcast >= sync_int:
                     sock.sendto(C.make_packet(C.TYPE_SYNC, **self._sync_payload()), bcast)
                     last_bcast = t
@@ -1077,7 +1087,10 @@ class SyncedServer:
                     sock.sendto(C.make_packet(C.TYPE_STATE, **self._state_payload()), bcast)
                     last_state = t
                 # handle incoming (NTP requests, registers)
-                sock.settimeout(sync_int / 2)
+                # Cap the receive wait so a transition is caught quickly even
+                # while idle: sync_int/2 would otherwise be 5s here, delaying a
+                # play/pause/stop push well past the broadcast epoch it drives.
+                sock.settimeout(min(sync_int / 2, 0.5))
                 try:
                     data, addr = sock.recvfrom(2048)
                 except socket.timeout:
