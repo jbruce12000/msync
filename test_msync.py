@@ -1647,36 +1647,26 @@ def test_pid_tune_critically_damped_gains():
     assert g["ki"] != g2["ki"]
 
 
-def test_pid_tune_persists_and_never_recomputes(tmp_path, monkeypatch):
-    pidfile = tmp_path / "pid_client.json"
-    monkeypatch.setenv("MSYNC_PID_FILE", str(pidfile))
-    g1, path1 = pid_tune.load("client", 8192 / 44100.0)
-    assert str(pidfile) == path1
-    assert pidfile.is_file()
-    # a later, different block period must NOT change the stored values
-    g2, _ = pid_tune.load("client", 8192 / 48000.0)
-    assert g1["kp"] == g2["kp"] and g1["ki"] == g2["ki"] and g1["kd"] == g2["kd"]
-
-
-def test_pid_tune_persists_across_calls(tmp_path, monkeypatch):
-    pidfile = tmp_path / "pid_server.json"
-    monkeypatch.setenv("MSYNC_PID_FILE", str(pidfile))
-    g1, _ = pid_tune.load("server", 8192 / 48000.0)
-    # drop the in-memory result; reload fresh from disk
-    import importlib
-    importlib.reload(pid_tune)
-    g2, _ = pid_tune.load("server", None)
+def test_pid_tune_startup_values_are_deterministic():
+    # Gains are computed once at start-up (compute_gains), equal across hosts
+    # with the same block period, and never read from / written to disk.
+    g1 = pid_tune.compute_gains()
+    g2 = pid_tune.compute_gains(8192 / 44100.0)
     assert g1 == g2
+    assert set(g1) == {"kp", "ki", "kd", "wn", "tau", "block_period",
+                       "window_ms"}
+    assert g1["kp"] == pytest.approx(3 * g1["wn"] ** 2 * g1["tau"])
+    assert g1["ki"] == pytest.approx(g1["wn"] ** 3 * g1["tau"])
+    assert g1["window_ms"] == pytest.approx(config.BANG_BANG_WINDOW_MS)
 
 
-def test_client_pid_active_inside_window(client, monkeypatch, tmp_path):
+def test_client_pid_active_inside_window(client, monkeypatch):
     # In PID test mode, the hybrid must run the critically-damped PID whenever
     # the smoothed error is INSIDE +/-BANG_BANG_WINDOW_MS (i.e. PID active when
     # -10ms < err < +10ms at the default window), and only apply full-power
     # bang-bang pitch OUTSIDE that band.
     monkeypatch.setattr(config, "BANG_BANG", True)
     monkeypatch.setattr(config, "BANG_BANG_WINDOW_MS", 10.0)
-    monkeypatch.setenv("MSYNC_PID_FILE", str(tmp_path / "pid_client.json"))
     h = client.client
     wait_until(lambda: h.buffer.data is not None
                and h.buffer.duration > 1.0 and h.stream is not None)
@@ -1685,7 +1675,6 @@ def test_client_pid_active_inside_window(client, monkeypatch, tmp_path):
     with h.lock:
         h.playing = True
         h._pitch_int = 0.0
-        h._pid = None
         h._pid_int = 0.0
         h._pid_prev = 0.0
         h.err_f = 0.0

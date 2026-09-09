@@ -19,8 +19,3 @@ music/*.wav
 
 # Editor swap files
 *.swp
-
-# Per-host autodetected PID values (runtime artifacts, machine-specific)
-pid_client.json
-pid_server.json
-pid_*.json

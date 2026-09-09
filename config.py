@@ -84,11 +84,10 @@ BANG_BANG = os.environ.get("MSYNC_BANG_BANG", "1") in ("1", "true", "yes", "on")
 BANG_BANG_WINDOW_MS = float(os.environ.get("MSYNC_BANG_BANG_WINDOW_MS", "10"))
 
 # Critically-damped PID tuning (used inside the window in test mode). The gains
-# are autodetected per host from its detected audio block period and the bang
-# window, then persisted (see pid_tune.py) and never changed afterward.
+# are computed once at start-up from the bang window and the host's audio block
+# period, and held in memory — nothing is persisted (see pid_tune.py).
 #   PID_SETTLE_MS        target 95% settling time (ms); 0 = auto, derived from
 #                        the bang window so the PID stays unsaturated inside it
 #   PID_OMEGA_MAX_FRAC   cap on wn as a fraction of the host's block/loop rate
-#   MSYNC_PID_FILE       optional override path for this host's PID values file
 PID_SETTLE_MS = float(os.environ.get("MSYNC_PID_SETTLE_MS", "0"))
 PID_OMEGA_MAX_FRAC = float(os.environ.get("MSYNC_PID_OMEGA_MAX_FRAC", "0.5"))

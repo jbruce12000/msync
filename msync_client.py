@@ -365,10 +365,10 @@ class SyncClient:
         self.drift_pitch = 0.0         # current applied pitch from PLL
         self._pitch_int = 0.0          # PI integrator state (tight clip + fast unwind)
         self._mode = "idle"            # controller mode: BANG / PID / PI / idle
-        self._pid = None               # autodetected critical PID gains (test mode)
+        self._pid = pid_tune.compute_gains()   # critical PID gains, computed
+                                               # once at start-up (test mode)
         self._pid_int = 0.0            # PID integral state
         self._pid_prev = 0.0           # previous smoothed error for the D term
-        self._pid_tag = "client"
         self.err_f = 0.0               # low-passed PLL error (EMA of callback err)
         self.err_smooth = 0.0          # rolling avg of callback-boundary error
         self.queue = []                # server queue (names), from TYPE_STATE
@@ -523,8 +523,8 @@ class SyncClient:
                 # PID test mode. OUTSIDE the ±window: apply FULL pitch power
                 # (±MAX_PITCH = ±2000ppm) in the direction of the error
                 # (bang-bang); drop stale windup so it can't bleed into the
-                # next in-window phase. INSIDE the window: run the host's
-                # autodetected, critically-damped PID (see pid_tune.py).
+                # next in-window phase. INSIDE the window: run the host's critically-
+                # damped PID, computed once at start-up (see pid_tune.py).
                 if abs(ef) > config.BANG_BANG_WINDOW_MS / 1000.0:
                     self._mode = "BANG"
                     self._pitch_int = 0.0
@@ -533,10 +533,6 @@ class SyncClient:
                         -C.MAX_PITCH if ef < 0 else C.MAX_PITCH)
                 else:
                     self._mode = "PID"
-                    if self._pid is None:
-                        self._pid, _ = pid_tune.load(
-                            self._pid_tag, frames / buf.sr,
-                            config.BANG_BANG_WINDOW_MS / 1000.0)
                     g = self._pid
                     dt = frames / buf.sr
                     self._pid_int = float(np.clip(
