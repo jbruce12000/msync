@@ -247,6 +247,8 @@ class ClientHarness:
         except Exception:
             pass
         self.client.close_audio()
+        if self.client._prefetch is not None:
+            self.client._prefetch.close()
         self.client.buffer.close()
 
 

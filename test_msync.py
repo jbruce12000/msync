@@ -244,6 +244,113 @@ def test_queue_add(server, client):
     assert client.client.queue_size == 1
 
 
+def test_prefetch_predicts_next_queue_entry(tmp_path):
+    """The prefetch candidate is the first queued track that isn't the one
+    currently playing — which also absorbs the ~1s of stale TYPE_STATE queue
+    right after a swap (STATE lags SYNC, so the just-adopted track may still
+    sit at the front of the client's queue)."""
+    import msync_client as MC
+    c = MC.SyncClient("127.0.0.1", 1, str(tmp_path))
+    picked = []
+    c._prefetch_worker = lambda host, port, name, cache_dir: picked.append(name)
+    try:
+        with c.lock:
+            c.buffer.name = "a.wav"
+            c.queue = ["a.wav", "b.wav", "c.wav"]   # stale pre-pop view
+        c._maybe_prefetch()
+        assert c._prefetching == "b.wav"
+        with c.lock:
+            c._prefetching = None
+            c.queue = ["b.wav", "c.wav"]            # refreshed post-pop view
+        c._maybe_prefetch()
+        assert c._prefetching == "b.wav"
+        with c.lock:
+            c._prefetching = None
+            c.queue = []
+        c._maybe_prefetch()
+        assert c._prefetching is None               # nothing upcoming
+        with c.lock:
+            c.queue = ["c.wav"]
+            c.buffer.name = "c.wav"                 # only current in queue
+        c._maybe_prefetch()
+        assert c._prefetching is None
+    finally:
+        c.buffer.close()
+
+
+def test_apply_state_adopts_prefetched_buffer_without_download(tmp_path,
+                                                               monkeypatch):
+    """When the announced track is already prefetched, _apply_state must swap
+    it in with zero network/decode work on the critical path (SongBuffer.load
+    would raise if a fallback download were attempted)."""
+    import msync_client as MC
+    c = MC.SyncClient("127.0.0.1", 1, str(tmp_path))
+
+    def boom(self, *a, **k):
+        raise AssertionError("fallback download attempted despite prefetch")
+    monkeypatch.setattr(MC.SongBuffer, "load", boom)
+    monkeypatch.setattr(c, "_ensure_stream", lambda: None)   # no real audio
+    monkeypatch.setattr(c, "_maybe_prefetch", lambda: None)  # keep it hermetic
+
+    ready = MC.SongBuffer(str(tmp_path))
+    ready.data = np.zeros((8000 * 2, 2), dtype=np.float32)
+    ready.sr = 8000
+    ready.name = "t.wav"
+    ready.duration = 2.0
+    c._prefetch = ready
+    try:
+        c._apply_state({"name": "t.wav", "playing": True,
+                        "song_start": 100.0, "duration": 2.0})
+        assert c.buffer is ready            # adopted the prefetched buffer
+        assert c.buffer.name == "t.wav"
+        assert c._prefetch is None          # consumed
+        assert c.playing is True
+    finally:
+        ready.close()
+        c.buffer.close()
+
+
+def test_prefetch_worker_install_supersede_failure(tmp_path, monkeypatch):
+    """A completed prefetch is installed under the lock; a worker whose pick
+    was superseded discards its scratch without clobbering the newer one; a
+    failed fetch clears the in-flight marker so a later attempt can re-arm."""
+    import msync_client as MC
+    c = MC.SyncClient("127.0.0.1", 1, str(tmp_path))
+
+    def fake_load(self, host, port, name, duration=None):
+        self.data = np.zeros((8000, 2), dtype=np.float32)
+        self.sr = 8000
+        self.name = name
+        self.duration = 1.0
+        return True
+    monkeypatch.setattr(MC.SongBuffer, "load", fake_load)
+
+    # install
+    c._prefetching = "b.wav"
+    c._prefetch_worker("host", 1, "b.wav", str(tmp_path))
+    assert c._prefetch is not None and c._prefetch.name == "b.wav"
+    assert c._prefetching is None
+
+    # superseded: the in-flight slot already points at a newer pick
+    c._prefetching = "c.wav"
+    before = c._prefetch
+    c._prefetch_worker("host", 1, "b.wav", str(tmp_path))
+    assert c._prefetch is before            # stale result not installed
+    assert c._prefetching == "c.wav"
+
+    # failure clears the in-flight marker
+    def fail(self, host, port, name, duration=None):
+        return False
+    monkeypatch.setattr(MC.SongBuffer, "load", fail)
+    c._prefetching = "d.wav"
+    c._prefetch_worker("host", 1, "d.wav", str(tmp_path))
+    assert c._prefetching is None
+
+    if c._prefetch is not None:
+        c._prefetch.close()
+    c.buffer.close()
+
+
 def test_queue_meta_tags(tmp_path):
     """Queue entries carry display metadata (artist - album - title) so the
     UI can render names instead of directory/file paths. Album entries

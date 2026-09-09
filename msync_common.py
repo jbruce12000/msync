@@ -84,6 +84,15 @@ DRIFT_HYSTERESIS = 0.010    # deadband (s): don't respond to smaller errors
 CATCHUP_THRESHOLD = 0.06    # bounded playhead nudge only when gap exceeds this (s)
 CATCHUP_STEP      = 0.005   # max nudge per audio block while catching up (s)
 
+# Next-track prefetch. The following queued song is downloaded + decoded in a
+# background thread right after each adoption so a normal auto-advance can be
+# swapped in with zero HTTP/decode latency, and its front pages are re-warmed
+# just before the current song ends so the swap's first callbacks never stall
+# on cold mmap reads (the source of the post-switch err excursion).
+PREFETCH_PREWARM_LEAD_S = 10.0   # warm the prefetched buffer this many seconds
+                                 # before the current track is expected to end
+PREFETCH_PREWARM_S      = 2.0    # warm this many seconds of the next track
+
 # PLL error smoothing. The error seen by the rate controller is the raw
 # difference between the (block-quantized) local playhead and the
 # NTP-derived reference, which carries tens of ms of reference jitter and a

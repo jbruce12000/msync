@@ -374,6 +374,15 @@ class SyncClient:
         self.queue = []                # server queue (names), from TYPE_STATE
         self.queue_size = 0            # from TYPE_SYNC (cheap field)
 
+        # Next-track prefetch: the following queued song is downloaded +
+        # decoded in a background thread right after each adoption, so a
+        # normal auto-advance can swap it in with zero HTTP/decode latency.
+        # Prediction is best-effort (server TYPE_STATE queue); a miss falls
+        # back to the on-demand download path.
+        self._prefetch = None          # ready decoded buffer for the next track
+        self._prefetching = None       # name currently being prefetched (if any)
+        self._prefetch_warmed = False  # front pages of _prefetch warmed for swap
+
         self.stream = None
         self.chunk_size = 2048
         self._stop = threading.Event()   # set to leave the run() loop
@@ -734,8 +743,8 @@ class SyncClient:
                     self._pid_int = 0.0
                     self._pid_prev = 0.0
                     self.err_f = 0.0
-            elif self._loading_name == name:
-                return                # already fetching this track now
+            elif self._loading_name == name or self._prefetching == name:
+                return                # already fetching this track (download or prefetch)
             prev_name = self.buffer.name    # how we tell a newer state "took over"
 
         # Play/pause toggles are applied outside the lock: stream.stop()
@@ -752,20 +761,30 @@ class SyncClient:
         if same_song:
             return
 
-        # New track: download + decode into a SCRATCH buffer WITHOUT holding
-        # self.lock, so the current track keeps playing while the next one
-        # downloads (previously this froze the music for the whole transfer).
-        scratch = SongBuffer(self.buffer.cache_dir)
-        self._loading_name = name
-        try:
-            if not scratch.load(self.host, self.port, name, duration):
-                scratch.close()     # clean up any partial decoded file
-                return
-        finally:
-            # clear the in-flight marker (a false "loading" only ever skips a
-            # redundant fetch, it never breaks playback)
-            if self._loading_name == name:
-                self._loading_name = None
+        # New track: if the next track was prefetched, adopt it instantly —
+        # no HTTP, no decode, warm pages. Otherwise download + decode into a
+        # SCRATCH buffer WITHOUT holding self.lock, so the current track keeps
+        # playing while the next one downloads (previously this froze the
+        # music for the whole transfer).
+        scratch = None
+        with self.lock:
+            if self._prefetch is not None and self._prefetch.name == name:
+                scratch = self._prefetch
+                self._prefetch = None
+                self._prefetching = None
+                self._prefetch_warmed = False
+        if scratch is None:
+            scratch = SongBuffer(self.buffer.cache_dir)
+            self._loading_name = name
+            try:
+                if not scratch.load(self.host, self.port, name, duration):
+                    scratch.close()     # clean up any partial decoded file
+                    return
+            finally:
+                # clear the in-flight marker (a false "loading" only ever skips a
+                # redundant fetch, it never breaks playback)
+                if self._loading_name == name:
+                    self._loading_name = None
         with self.lock:
             # only adopt if no newer state swapped in a different track while
             # we were downloading (the buffer still holds `prev_name`, the
@@ -797,6 +816,102 @@ class SyncClient:
                         self.stream.start()
             except Exception:
                 pass
+        # Get a head start on the track after this one so the next
+        # auto-advance can be swapped in with zero HTTP/decode latency.
+        self._maybe_prefetch()
+
+    # ------------------------------------------------------------------ #
+    def _maybe_prefetch(self):
+        """Decode the next queued track in a background thread so a normal
+        auto-advance can be swapped in with zero HTTP/decode latency on the
+        critical path.
+
+        Prediction is best-effort, from the server's TYPE_STATE queue
+        (refreshed every STATE_INTERVAL): prepare the first queue entry that
+        isn't the track currently playing, which also absorbs the ~1s of
+        stale queue around a swap (STATE lags SYNC). Only one prefetch runs
+        at a time; a miss (manual prev/next/pick) simply falls back to the
+        on-demand download path. Callers never hold self.lock here.
+        """
+        with self.lock:
+            if self._prefetching is not None:
+                return                       # one is already in flight
+            if not self.queue:
+                return
+            # Candidate: first queued track that isn't currently playing or
+            # already prepared.
+            name = next((q for q in self.queue if q != self.buffer.name),
+                        None)
+            if not name:
+                return
+            if self._prefetch is not None and self._prefetch.name == name:
+                return                       # already prepared
+            cache_dir = self.buffer.cache_dir
+            host, port = self.host, self.port
+            self._prefetching = name
+        threading.Thread(target=self._prefetch_worker,
+                         args=(host, port, name, cache_dir),
+                         daemon=True).start()
+
+    def _prefetch_worker(self, host, port, name, cache_dir):
+        """Background fetch + decode of the predicted next track."""
+        try:
+            scratch = SongBuffer(cache_dir)
+            if not scratch.load(host, port, name):
+                scratch.close()              # partial / failed fetch
+                with self.lock:
+                    if self._prefetching == name:
+                        self._prefetching = None
+                return
+            with self.lock:
+                if self._prefetching != name:
+                    scratch.close()          # superseded by an even newer pick
+                    return
+                if self.buffer.name == name:
+                    # The track became current before the prefetch landed
+                    # (the on-demand path already adopted it): drop the copy.
+                    self._prefetching = None
+                    scratch.close()
+                    return
+                old = self._prefetch
+                self._prefetch = scratch
+                self._prefetching = None
+                self._prefetch_warmed = False   # a fresh buffer: warm again
+                if old is not None:
+                    old.close()
+        except Exception as exc:
+            with self.lock:
+                if self._prefetching == name:
+                    self._prefetching = None
+            print(f"[client] prefetch failed for {name}: {exc!r}")
+
+    def _warm_prefetch(self):
+        """Touch the front pages of the prefetched buffer shortly before the
+        current track ends, so the swap's first callbacks never stall on cold
+        mmap reads. Best-effort and idempotent. The touch happens OUTSIDE the
+        lock because a cold read can take tens of ms and must not delay the
+        audio callback (which waits on the same lock every block)."""
+        with self.lock:
+            b = self.buffer
+            p = self._prefetch
+            if p is None or p.data is None or self._prefetch_warmed:
+                return
+            if b.duration <= 0:
+                return
+            # Same pinned reference the callback chases.
+            pos = (self._base_pos
+                   + (1.0 + self.clock.drift * 1e-6)
+                   * (C.ts() - self._base_clock))
+            if pos < b.duration - C.PREFETCH_PREWARM_LEAD_S:
+                return
+            data, sr = p.data, p.sr
+            self._prefetch_warmed = True
+        try:
+            n = int(min(C.PREFETCH_PREWARM_S * sr, len(data)))
+            if n > 0:
+                _ = data[:n]                 # pull the front pages into cache
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Interactive console (select tracks, control playback via HTTP)      #
@@ -919,6 +1034,9 @@ class SyncClient:
                         with self.lock:
                             self.queue = list(body.get("queue", []))
                             self.queue_size = len(self.queue)
+                        # A queue change may invalidate the predicted next
+                        # track (something was added/removed): re-arm.
+                        self._maybe_prefetch()
                     elif ptype == C.TYPE_LATENCY:
                         # Server-set output-latency offset (ms) for this room.
                         try:
@@ -1004,11 +1122,16 @@ class SyncClient:
                           f"mode={self._mode}  "
                           f"window=±{config.BANG_BANG_WINDOW_MS:.0f}ms  "
                           f"clock={self.clock.drift:+.0f}ppm")
+                # Keep the prefetched buffer's front pages resident for the
+                # imminent swap (cheap, idempotent, no lock held on touch).
+                self._warm_prefetch()
         except KeyboardInterrupt:
             pass
         finally:
             self.close_audio()
-            self.buffer.close()        # release memmap + temp file
+            if self._prefetch is not None:
+                self._prefetch.close()   # release prefetched memmap + temp
+            self.buffer.close()          # release memmap + temp file
             try:
                 sock.close()
             except Exception:
