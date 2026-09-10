@@ -42,13 +42,15 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 .configure { padding: 16px; overflow-y: auto; }
 .configure h3 { font-size: 13px; margin: 12px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
 .client-row { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; }
-.client-row .client-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+.client-row .client-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.client-row .head-left { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
 .client-row .client-name { font-size: 15px; font-weight: 600; }
 .client-row .client-ip { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
-.client-row .client-status { margin-left: auto; font-size: 11px; color: var(--muted); }
+.client-row .client-status { flex: 1; text-align: right; font-size: 11px; color: var(--muted); }
 .client-row .client-status.online { color: var(--green); }
 .client-row .client-status.offline { color: var(--red); }
 .client-row .client-err { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; cursor: help; }
+.client-row .client-head .vol-row { flex: 1; justify-content: center; margin: 0; }
 .slider-row { display: flex; align-items: center; gap: 14px; }
 .slider-row input[type=range] { flex: 1; -webkit-appearance: none; height: 4px; border-radius: 2px; background: var(--border); outline: none; }
 .slider-row input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: var(--accent); cursor: pointer; border: none; }
@@ -60,14 +62,14 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 .slider-row .lat-num input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 .slider-row .lat-num input[type=number] { -moz-appearance: textfield; appearance: textfield; }
 .slider-row .lat-unit { font-size: 12px; color: var(--muted); }
-.vol-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
-.vol-row .vol-btn { width: 30px; height: 30px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; font-size: 13px; flex: none; display: flex; align-items: center; justify-content: center; transition: border-color .15s, color .15s; }
+.vol-row { display: flex; align-items: center; justify-content: center; gap: 10px; margin: 0 0 12px; }
+.vol-row .vol-btn { width: 34px; height: 34px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; font-size: 24px; line-height: 1; flex: none; display: flex; align-items: center; justify-content: center; transition: border-color .15s, color .15s; }
 .vol-row .vol-btn:hover { border-color: var(--accent); }
 .vol-row .vol-btn.muted { color: var(--red); border-color: var(--red); }
-.vol-row input[type=range] { flex: 1; -webkit-appearance: none; height: 4px; border-radius: 2px; background: var(--border); outline: none; }
-.vol-row input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: var(--accent); cursor: pointer; border: none; }
-.vol-row input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: var(--accent); cursor: pointer; border: none; }
-.vol-row .vol-num { width: 44px; text-align: right; font-size: 12px; color: var(--text); font-variant-numeric: tabular-nums; flex: none; }
+.vol-row .vol-btn .vol-ico { display: block; flex: none; margin: auto; }
+.vol-row .vol-btn .mute-slash { opacity: 0; }
+.vol-row .vol-btn.muted .mute-slash { opacity: 1; }
+.vol-row .vol-num { min-width: 40px; text-align: center; font-size: 12px; color: var(--text); font-variant-numeric: tabular-nums; flex: none; }
 .slider-centre { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-top: 2px; }
 .empty-state { color: var(--muted); text-align: center; padding: 24px; font-size: 12px; }
 
@@ -425,14 +427,33 @@ async function fetchClients() {
     const prev = clients;
     const next = d.clients || [];
     for (const c of next) {
-        currentLatency[c.ip] = Math.round(c.latency_ms || 0);
+        const clat = Math.round(c.latency_ms || 0);
         const p = pendingLatency[c.ip];
-        if (p && p.v === currentLatency[c.ip]) delete pendingLatency[c.ip];
-        currentVolume[c.ip] = clampVol((c.volume ?? 1.0));
-        currentMuted[c.ip] = !!c.muted;
+        if (p && (Date.now() - p.t) < 4000) {
+            if (p.v === clat) {          // server caught up
+                currentLatency[c.ip] = clat;
+                delete pendingLatency[c.ip];
+            }
+            // else keep optimistic value; the server echo hasn't landed
+        } else {
+            if (p) delete pendingLatency[c.ip];   // expired
+            currentLatency[c.ip] = clat;
+        }
+        const cvol = clampVol(c.volume ?? 1.0);
+        const cmut = !!c.muted;
         const pv = pendingVolume[c.ip];
-        if (pv && pv.v === currentVolume[c.ip] && pv.m === currentMuted[c.ip])
-            delete pendingVolume[c.ip];
+        if (pv && (Date.now() - pv.t) < 4000) {
+            if (pv.v === cvol && pv.m === cmut) {   // server caught up
+                currentVolume[c.ip] = cvol;
+                currentMuted[c.ip] = cmut;
+                delete pendingVolume[c.ip];
+            }
+            // else keep optimistic; a quick click means the server is behind
+        } else {
+            if (pv) delete pendingVolume[c.ip];     // expired
+            currentVolume[c.ip] = cvol;
+            currentMuted[c.ip] = cmut;
+        }
     }
     // Full rebuild only when the room SET changes; otherwise update rows in
     // place so an in-flight drag or a half-typed number is never interrupted.
@@ -469,23 +490,42 @@ function renderClients() {
         '<div class="empty-state" style="padding:8px 0 16px;">' +
         'If you have a client on bluetooth or hdmi, manually adjust ' +
         'the latency slider until the music is sychronized. The mute button silences ' +
-        'that room; the volume slider and −/+ control its level. Values are saved to a local database.</div>';
+        'that room; the − and + buttons control its level. Values are saved to a local database.</div>';
     for (const c of clients) {
         const key = c.ip.replace(/\./g, '_');
         const status = clientStatus(c);
         const name = c.hostname || c.ip;
         const lat = Math.round(c.latency_ms || 0);
-        const pv = pendingVolume[c.ip];
-        const vol = (pv && (Date.now() - pv.t) < 4000) ? pv.v : (c.volume ?? 1.0);
+        const pv = (pendingVolume[c.ip] &&
+                (Date.now() - pendingVolume[c.ip].t) < 4000)
+            ? pendingVolume[c.ip] : null;
+        const vol = pv ? pv.v : (c.volume ?? 1.0);
         const muted = pv ? pv.m : !!c.muted;
         const volPct = Math.round(clampVol(vol) * 100);
         html += `
         <div class="client-row">
             <div class="client-head">
-                <span class="client-name">${esc(name)}</span>
-                <span class="client-ip">${esc(c.ip)}</span>
-                <span class="client-err" id="err-${key}"
-                    title="Sync error: how far this room's playback is from the server timeline (updates on each 10 s re-register)">${errText(c, status)}</span>
+                <div class="head-left">
+                    <span class="client-name">${esc(name)}</span>
+                    <span class="client-ip">${esc(c.ip)}</span>
+                    <span class="client-err" id="err-${key}"
+                        title="Sync error: how far this room's playback is from the server timeline (updates on each 10 s re-register)">${errText(c, status)}</span>
+                </div>
+                <div class="vol-row">
+                    <button class="vol-btn${muted ? ' muted' : ''}" id="mute-${key}"
+                        onclick="toggleMute('${esc(c.ip)}')"
+                        title="${muted ? 'Unmute this room' : 'Mute this room'}">
+                        <svg class="vol-ico" viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">
+                            <path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor"/>
+                            <path class="mute-slash" d="M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        </svg>
+                    </button>
+                    <button class="vol-btn" onclick="volStep('${esc(c.ip)}', -10)"
+                        title="Volume down">−</button>
+                    <span class="vol-num" id="volnum-${key}">${volPct}%</span>
+                    <button class="vol-btn" onclick="volStep('${esc(c.ip)}', 10)"
+                        title="Volume up">+</button>
+                </div>
                 <span class="client-status ${status}" id="status-${key}">● ${status}</span>
             </div>
             <div class="slider-row">
@@ -505,19 +545,6 @@ function renderClients() {
                 </div>
             </div>
             <div class="slider-centre"><span>← plays late · plays ahead →</span><span class="lat-unit">offset (ms)</span></div>
-            <div class="vol-row">
-                <button class="vol-btn${muted ? ' muted' : ''}" id="mute-${key}"
-                    onclick="toggleMute('${esc(c.ip)}')"
-                    title="${muted ? 'Unmute this room' : 'Mute this room'}">${muted ? '🔇' : '🔊'}</button>
-                <button class="vol-btn" onclick="volStep('${esc(c.ip)}', -10)" title="Volume down">−</button>
-                <input type="range" id="volslider-${key}" min="0" max="150" step="1" value="${volPct}"
-                    oninput="volSliderInput('${esc(c.ip)}', this)"
-                    onchange="volSliderCommit('${esc(c.ip)}', this)"
-                    onmousedown="this.dataset.active='1'" ontouchstart="this.dataset.active='1'"
-                    onkeydown="this.dataset.active='1'" onblur="this.dataset.active='0'">
-                <button class="vol-btn" onclick="volStep('${esc(c.ip)}', 10)" title="Volume up">+</button>
-                <span class="vol-num" id="volnum-${key}">${volPct}%</span>
-            </div>
         </div>`;
     }
     el.innerHTML = html;
@@ -552,19 +579,16 @@ function updateClientRows() {
             const txt = errText(c, cls);
             if (er.textContent !== txt) er.textContent = txt;
         }
-        const pv = pendingVolume[c.ip];
-        const vol = (pv && (Date.now() - pv.t) < 4000) ? pv.v : (c.volume ?? 1.0);
+        const pv = (pendingVolume[c.ip] &&
+                (Date.now() - pendingVolume[c.ip].t) < 4000)
+            ? pendingVolume[c.ip] : null;
+        const vol = pv ? pv.v : (c.volume ?? 1.0);
         const muted = pv ? pv.m : !!c.muted;
         const volPct = Math.round(clampVol(vol) * 100);
-        const vsl = document.getElementById('volslider-' + key);
-        if (vsl && vsl.dataset.active !== '1' &&
-            String(vsl.value) !== String(volPct)) vsl.value = volPct;
         const vn = document.getElementById('volnum-' + key);
         if (vn && vn.textContent !== volPct + '%') vn.textContent = volPct + '%';
         const mb = document.getElementById('mute-' + key);
         if (mb && mb.dataset.active !== '1') {
-            const want = muted ? '🔇' : '🔊';
-            if (mb.textContent !== want) mb.textContent = want;
             if (mb.classList.contains('muted') !== muted)
                 mb.classList.toggle('muted', muted);
             const wantT = muted ? 'Unmute this room' : 'Mute this room';
@@ -613,10 +637,12 @@ function clampLatency(ms) {
 // Debounced per-room push to the server (drag/keyboard chatter -> one send).
 const latencyTimers = {};
 function commitLatency(ip, ms) {
+    // Set the pending value NOW (not when the timer fires) so the 1s poll
+    // can't flash the stale server value back between a click and its send.
+    currentLatency[ip] = ms;
+    pendingLatency[ip] = { v: ms, t: Date.now() };
     clearTimeout(latencyTimers[ip]);
     latencyTimers[ip] = setTimeout(async () => {
-        currentLatency[ip] = ms;
-        pendingLatency[ip] = { v: ms, t: Date.now() };
         await api('POST', '/api/clients/latency', { ip, ms });
     }, 250);
 }
@@ -631,62 +657,41 @@ function volKey(ip) { return ip.replace(/\./g, '_'); }
 // Debounced per-room volume/mute push. The server stores both together and
 // pushes them live to the client via TYPE_VOLUME.
 const volumeTimers = {};
-function commitVolume(ip, mutedOverride) {
-    const vsl = document.getElementById('volslider-' + volKey(ip));
-    const pct = clampVol((parseInt(vsl && vsl.value, 10) || 100) / 100) * 100;
-    const vol = pct / 100;
-    const muted = (mutedOverride !== undefined) ? mutedOverride
-        : currentMuted[ip];
-    if (mutedOverride !== undefined) currentMuted[ip] = muted;
-    currentVolume[ip] = vol;
+function commitVolume(ip) {
+    const vol = currentVolume[ip] === undefined ? 1.0 : currentVolume[ip];
+    const muted = currentMuted[ip] === undefined ? false : currentMuted[ip];
+    // Pending is set NOW, not when the timer fires: the 1s poll re-reads the
+    // server, and between a click and its send the server still has the OLD
+    // value. Clearing/overwriting here would make a quick click visibly snap
+    // back and forth.
+    pendingVolume[ip] = { v: vol, m: muted, t: Date.now() };
     clearTimeout(volumeTimers[ip]);
     volumeTimers[ip] = setTimeout(async () => {
-        pendingVolume[ip] = { v: vol, m: muted, t: Date.now() };
         await api('POST', '/api/clients/volume', { ip, vol, muted });
     }, 200);
 }
 
+// Mute toggle: optimistic - flip the icon immediately, let the server echo
+// settle it (the 1s tick() refetch reconciles).
 function toggleMute(ip) {
     const mb = document.getElementById('mute-' + volKey(ip));
     if (mb) mb.dataset.active = '1';
-    // Optimistic: flip immediately, let the server echo settle it.
-    const muted = !currentMuted[ip];
-    currentMuted[ip] = muted;
+    currentMuted[ip] = !currentMuted[ip];
     if (mb) {
-        mb.textContent = muted ? '🔇' : '🔊';
-        mb.title = muted ? 'Unmute this room' : 'Mute this room';
-        mb.classList.toggle('muted', muted);
+        mb.classList.toggle('muted', currentMuted[ip]);
+        mb.title = currentMuted[ip] ? 'Unmute this room' : 'Mute this room';
     }
-    commitVolume(ip, muted);
+    commitVolume(ip);
     if (mb) setTimeout(() => { mb.dataset.active = '0'; }, 150);
 }
 
-// − / + stepper buttons: nudge the slider by ±10% and commit.
+// − / + stepper buttons: nudge the level by ±10% and commit.
 function volStep(ip, delta) {
-    const vsl = document.getElementById('volslider-' + volKey(ip));
-    if (!vsl) return;
-    vsl.dataset.active = '1';
-    const pct = clampVol(((parseInt(vsl.value, 10) || 100) + delta) / 100) * 100;
-    vsl.value = pct;
+    const cur = currentVolume[ip] === undefined ? 1.0 : currentVolume[ip];
+    const v = clampVol(cur + delta / 100);
+    currentVolume[ip] = v;
     const vn = document.getElementById('volnum-' + volKey(ip));
-    if (vn) vn.textContent = pct + '%';
-    commitVolume(ip);
-    setTimeout(() => { vsl.dataset.active = '0'; }, 150);
-}
-
-function volSliderInput(ip, el) {
-    el.dataset.active = '1';
-    const vn = document.getElementById('volnum-' + volKey(ip));
-    if (vn) vn.textContent = el.value + '%';
-    commitVolume(ip);   // debounced; keeps this room live while dragging
-}
-
-function volSliderCommit(ip, el) {
-    el.dataset.active = '0';
-    const pct = clampVol((parseInt(el.value, 10) || 100) / 100) * 100;
-    el.value = pct;
-    const vn = document.getElementById('volnum-' + volKey(ip));
-    if (vn) vn.textContent = pct + '%';
+    if (vn) vn.textContent = Math.round(v * 100) + '%';
     commitVolume(ip);
 }
 
