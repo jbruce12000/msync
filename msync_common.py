@@ -60,6 +60,7 @@ TYPE_REGISTER  = 5   # client -> server handshake
 TYPE_PROBE     = 6   # client -> server discovery probe; server answers unicast
 TYPE_STATE     = 7   # server broadcast (1 Hz): full state incl. queue list
 TYPE_LATENCY   = 8   # server -> client: set output-latency offset (ms)
+TYPE_VOLUME    = 9   # server -> client: set this room's volume (0..1.5) + mute
 
 DEFAULT_PORT = 9770
 SYNC_INTERVAL = 0.05        # server sync broadcast period (s) = 20 Hz

@@ -394,6 +394,10 @@ class SyncClient:
         # Tune live from the console with: latency <ms>
         self._out_latency = config.OUTPUT_LATENCY_MS / 1000.0
         self._out_latency_ms = config.OUTPUT_LATENCY_MS  # for display
+        # Per-room volume/mute, pushed from the server's Configure tab via
+        # TYPE_VOLUME (and persisted server-side per room IP).
+        self._volume = 1.0               # gain 0.0..1.5
+        self._muted = False
 
     # ------------------------------------------------------------------ #
     # HTTP API to the server (state, library, queue, playback control)    #
@@ -606,7 +610,15 @@ class SyncClient:
             i1 = min(int(idx + frames), n)
             out = np.zeros((frames, 2), dtype=np.float32)
             out[: i1 - i0] = buf.data[i0:i1]
-            outdata[:] = out
+            # Per-room volume/mute (server-pushed). A mute is gain 0, so it
+            # silences this room without touching its remembered volume.
+            gain = 0.0 if self._muted else self._volume
+            if gain >= 1.0:
+                outdata[:] = out
+            elif gain > 0.0:
+                outdata[:] = out * gain
+            else:
+                outdata.fill(0)
             if self._fade_out:
                 nf = min(frames, int(0.15 * buf.sr))
                 if nf > 0:
@@ -1053,6 +1065,19 @@ class SyncClient:
                         with self.lock:
                             self._out_latency = ms / 1000.0
                             self._out_latency_ms = ms
+                    elif ptype == C.TYPE_VOLUME:
+                        # Server-set volume (0..1.5) and mute state for this
+                        # room (Configure tab). Mute silences the output
+                        # without touching the volume level so unmute restores
+                        # it.
+                        try:
+                            vol = float(body.get("vol", 1.0))
+                            muted = bool(body.get("muted", 0))
+                        except (TypeError, ValueError):
+                            vol, muted = 1.0, False
+                        with self.lock:
+                            self._volume = max(0.0, min(1.5, vol))
+                            self._muted = muted
                 except socket.timeout:
                     pass
                 except Exception as exc:

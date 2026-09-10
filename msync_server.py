@@ -1051,6 +1051,18 @@ class SyncedServer:
         except OSError as e:
             print(f"[server] send_latency {ip}: {e}")
 
+    def send_volume(self, ip, vol, muted):
+        """Tell a client to set its volume (0..1.5) and mute state now."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(2)
+            sock.sendto(C.make_packet(C.TYPE_VOLUME, vol=vol,
+                                      muted=int(bool(muted))),
+                        (ip, self.port))
+            sock.close()
+        except OSError as e:
+            print(f"[server] send_volume {ip}: {e}")
+
     def udp_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -1130,6 +1142,10 @@ class SyncedServer:
                     # never set) so a freshly-connected client starts tuned.
                     lat = self.catalog.client_latency(ip)
                     sock.sendto(C.make_packet(C.TYPE_LATENCY, ms=lat), addr)
+                    # ... and its stored volume/mute (§ per-room volume).
+                    vol, muted = self.catalog.client_volume(ip)
+                    sock.sendto(C.make_packet(C.TYPE_VOLUME, vol=vol,
+                                              muted=int(muted)), addr)
                 elif ptype == C.TYPE_PROBE:
                     # Discovery ping from a client looking for a server.
                     # Answer DIRECTLY to the sender (unicast) so discovery
@@ -1170,6 +1186,8 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
       POST /api/queue/remove  -> remove by index (?index=N) or name
       POST /api/queue/clear   -> empty the queue
       POST /api/control/toggle|stop|next|prev|volume
+      POST /api/clients/latency   -> set a room's output offset (?ip=&ms= or JSON)
+      POST /api/clients/volume    -> set a room's volume/mute (?ip=&vol=&muted= or JSON)
       everything else         -> music file download (client fetches songs)
     """
 
@@ -1383,6 +1401,45 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
                 srv.catalog.set_client_latency(ip, ms)
                 srv.send_latency(ip, ms)   # apply live to the client
                 self._json({"ip": ip, "latency_ms": ms})
+            elif path == "/api/clients/volume":
+                ip = (qs.get("ip") or [None])[0] or body.get("ip")
+                vol = None
+                muted = None
+                if "vol" in qs:
+                    try:
+                        vol = float(qs["vol"][0])
+                    except ValueError:
+                        pass
+                elif "vol" in body:
+                    try:
+                        vol = float(body["vol"])
+                    except (TypeError, ValueError):
+                        pass
+                if "muted" in qs:
+                    try:
+                        muted = bool(int(qs["muted"][0]))
+                    except ValueError:
+                        pass
+                elif "muted" in body:
+                    raw = body["muted"]
+                    if isinstance(raw, bool):
+                        muted = raw
+                    elif isinstance(raw, (int, float)):
+                        muted = bool(raw)
+                    else:
+                        try:
+                            muted = bool(int(str(raw).strip()))
+                        except (ValueError, TypeError):
+                            pass
+                if not ip or vol is None or muted is None:
+                    self._json({"error": "ip, vol and muted required"}, 400)
+                    return
+                if not 0.0 <= vol <= 1.5:
+                    self._json({"error": "vol out of range (0..1.5)"}, 400)
+                    return
+                srv.catalog.set_client_volume(ip, vol, muted)
+                srv.send_volume(ip, vol, muted)   # apply live to the client
+                self._json({"ip": ip, "volume": vol, "muted": muted})
             else:
                 self._json({"error": "not found"}, 404)
 

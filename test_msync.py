@@ -914,6 +914,23 @@ def test_catalog_client_heartbeat_refreshes_last_seen(tmp_path):
     assert row["last_seen"] > 1000.0                # heartbeat refreshed it
 
 
+def test_catalog_client_volume_roundtrip(tmp_path):
+    c = Catalog(str(tmp_path), str(tmp_path / "c.db"))
+    c.upsert_client("10.0.0.4", "room4")
+    assert c.client_volume("10.0.0.4") == (1.0, False)   # defaults
+    c.set_client_volume("10.0.0.4", 0.35, True)
+    assert c.client_volume("10.0.0.4") == (0.35, True)
+    # unknown IP defaults to (1.0, False)
+    assert c.client_volume("10.0.0.9") == (1.0, False)
+    # list includes volume + mute for the web Configure tab
+    rows = {r["ip"]: r for r in c.list_clients()}
+    assert rows["10.0.0.4"]["volume"] == 0.35
+    assert rows["10.0.0.4"]["muted"] is True
+    # a later heartbeat must not wipe the stored volume/mute
+    c.upsert_client("10.0.0.4", "room4", last_seen=2000.0)
+    assert c.client_volume("10.0.0.4") == (0.35, True)
+
+
 def test_catalog_heartbeat_wins_against_concurrent_writer(tmp_path):
     """A client heartbeat (upsert_client, sent ~every second) must not crash
     the sync thread when another DB writer (queue add, playback persist, scan)
@@ -1092,6 +1109,38 @@ def test_http_clients_list_and_set_latency(server):
     assert status == 400
 
 
+def test_http_clients_set_volume_roundtrip(server):
+    # The web Configure tab's mute button + volume slider hit this endpoint.
+    server.catalog.upsert_client("192.168.1.5", "bedroom")
+    # query-string form (step buttons / direct calls)
+    d = _http(server.port + 1000, "POST",
+              "/api/clients/volume?ip=192.168.1.5&vol=0.6&muted=0")
+    assert d["volume"] == 0.6 and d["muted"] is False
+    assert server.catalog.client_volume("192.168.1.5") == (0.6, False)
+
+    # JSON-boolean form (what the web UI's api() actually sends when muting)
+    conn = http.client.HTTPConnection("127.0.0.1", server.port + 1000, timeout=5)
+    conn.request("POST", "/api/clients/volume",
+                 body=json.dumps({"ip": "192.168.1.5", "vol": 0.6, "muted": True}),
+                 headers={"Content-Type": "application/json"})
+    r = conn.getresponse()
+    data = json.loads(r.read())
+    conn.close()
+    assert r.status == 200
+    assert data["muted"] is True
+    assert server.catalog.client_volume("192.168.1.5") == (0.6, True)
+
+    # list_clients exposes volume/muted so the Configure tab can render them
+    d = _http(server.port + 1000, "GET", "/api/clients")
+    row = next(c for c in d["clients"] if c["ip"] == "192.168.1.5")
+    assert row["volume"] == 0.6 and row["muted"] is True
+
+    # out-of-range volume is rejected
+    status, _ = _http_status(server.port + 1000, "POST",
+                             "/api/clients/volume?ip=192.168.1.5&vol=2&muted=0")
+    assert status == 400
+
+
 def test_client_latency_packet_sets_out_latency(client):
     # The client's UDP loop applies TYPE_LATENCY by setting _out_latency.
     # Simulate that inline (as msync_client.run() does) and confirm the
@@ -1107,6 +1156,46 @@ def test_client_latency_packet_sets_out_latency(client):
         h._out_latency = 0.0
         h._out_latency_ms = 0.0
     assert h._out_latency_ms == 0.0
+
+
+def test_client_callback_applies_volume_and_mute(client):
+    # Volume scales the callback's output; mute silences it without touching
+    # the remembered level (the Configure tab's per-room mute).
+    h = client.client
+    h.playing = True
+    h._out_latency = 0.0
+    h._volume = 1.0
+    h._muted = False
+    h.local_pos = 0.2
+    h.err_f = 0.0
+    frames = 2048
+    base = np.zeros((frames, 2), dtype=np.float32)
+    # Pin the PLL reference to local_pos so err==0 and the catchup nudge
+    # (which advances local_pos by CATCHUP_STEP) can't shift the window; the
+    # callback advances local_pos by one block per call, so re-pin each time.
+    h._base_pos = h.local_pos
+    h._base_clock = C.ts()
+    h._cb(base, frames, None, None)
+
+    h.local_pos = 0.2
+    h.err_f = 0.0
+    h._base_pos = h.local_pos
+    h._base_clock = C.ts()
+    h._volume = 0.5
+    half = np.zeros((frames, 2), dtype=np.float32)
+    h._cb(half, frames, None, None)
+    assert np.allclose(half, base * 0.5)
+
+    h.local_pos = 0.2
+    h.err_f = 0.0
+    h._base_pos = h.local_pos
+    h._base_clock = C.ts()
+    h._volume = 0.5
+    h._muted = True              # mute = gain 0, but volume remembered
+    silent = np.zeros((frames, 2), dtype=np.float32)
+    h._cb(silent, frames, None, None)
+    assert not silent.any()
+    assert h._volume == 0.5      # unmute restores the level
 
 
 def test_http_library(server):

@@ -152,6 +152,8 @@ class Catalog:
                     hostname    TEXT NOT NULL DEFAULT '',
                     latency_ms  REAL NOT NULL DEFAULT 0,  -- output offset
                     err_ms      REAL NOT NULL DEFAULT 0,  -- sync error reported
+                    volume      REAL NOT NULL DEFAULT 1.0,  -- room gain (0..1.5)
+                    muted       INTEGER NOT NULL DEFAULT 0, -- room silenced
                     last_seen   REAL NOT NULL DEFAULT 0
                 )""")
             # Migrate databases created before per-client sync-error reporting.
@@ -160,6 +162,15 @@ class Catalog:
             if "err_ms" not in cols:
                 self._conn.execute(
                     "ALTER TABLE clients ADD COLUMN err_ms REAL NOT NULL "
+                    "DEFAULT 0")
+            # ... and before per-room volume/mute.
+            if "volume" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE clients ADD COLUMN volume REAL NOT NULL "
+                    "DEFAULT 1.0")
+            if "muted" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE clients ADD COLUMN muted INTEGER NOT NULL "
                     "DEFAULT 0")
 
     # ------------------------------------------------------------------ #
@@ -214,14 +225,36 @@ class Catalog:
                     ON CONFLICT(ip) DO UPDATE SET latency_ms = excluded.latency_ms
                     """, (ip, ms, time.time()))
 
+    def client_volume(self, ip):
+        """Stored (volume, muted) for a client, (1.0, False) if unknown."""
+        with self.lock:
+            row = self._conn.execute(
+                "SELECT volume, muted FROM clients WHERE ip = ?",
+                (ip,)).fetchone()
+            return (float(row[0]), bool(row[1])) if row else (1.0, False)
+
+    def set_client_volume(self, ip, vol, muted):
+        with self.lock:
+            with self._conn:
+                self._conn.execute("""
+                    INSERT INTO clients (ip, hostname, volume, muted, last_seen)
+                    VALUES (?, '', ?, ?, ?)
+                    ON CONFLICT(ip) DO UPDATE SET
+                        volume = excluded.volume,
+                        muted  = excluded.muted
+                    """, (ip, vol, int(bool(muted)), time.time()))
+
     def list_clients(self):
-        """Every known client: ip, hostname, latency_ms, err_ms, last_seen."""
+        """Every known client: ip, hostname, latency_ms, err_ms, volume, muted,
+        last_seen."""
         with self.lock:
             rows = self._conn.execute("""
-                SELECT ip, hostname, latency_ms, err_ms, last_seen FROM clients
+                SELECT ip, hostname, latency_ms, err_ms, volume, muted,
+                       last_seen FROM clients
                 ORDER BY hostname, ip""").fetchall()
         return [{"ip": r[0], "hostname": r[1], "latency_ms": r[2],
-                 "err_ms": r[3], "last_seen": r[4]} for r in rows]
+                 "err_ms": r[3], "volume": r[4], "muted": bool(r[5]),
+                 "last_seen": r[6]} for r in rows]
 
     def prune_clients(self, stale_after):
         """Delete rooms that haven't been seen for ``stale_after`` seconds
