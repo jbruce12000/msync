@@ -113,6 +113,12 @@ INT_LIMIT     = 0.02        # integrator state clip (x PITCH_INT = <=400ppm)
 # millisecond into it; 1.0 would pin the P output at the rail at the edge.
 PID_P_EDGE_FRAC = 0.6       # P term at window edge, as a fraction of MAX_PITCH
 
+# Loud state transitions (pause/resume, mute/volume changes, track starts/ends)
+# are ramped over this many seconds in the audio callback. A hard step from
+# full program level to silence (or back) is a click; a few-ms ramp is
+# inaudible and removes it.
+AUDIO_FADE_SEC = 0.010
+
 
 def ts():
     return time.time()
@@ -156,22 +162,41 @@ _AUDIO_BOOST_LOCK = threading.Lock()
 stream_ops_lock = threading.Lock()
 
 
+def _current_tid():
+    """Native OS thread id of the calling thread (works even on Pythons where
+    ``os.gettid`` is absent; ``threading.get_native_id`` is 3.8+)."""
+    if hasattr(os, "gettid"):
+        try:
+            return os.gettid()
+        except OSError:
+            pass
+    try:
+        return threading.get_native_id()
+    except (AttributeError, OSError):
+        return None
+
+
 def boost_audio_thread():
     """Best-effort: give the calling thread (PortAudio's callback thread)
     the highest real-time scheduling priority the system permits.
 
     Tries SCHED_FIFO (then SCHED_RR) from the highest allowed priority
-    downward. Requires CAP_SYS_NICE / an RT rlimit; otherwise the thread
-    silently keeps its normal priority. Each OS thread is only attempted
-    once, so placing this at the top of an audio callback is cheap.
+    downward. Requires CAP_SYS_NICE / an RT rlimit (see the installed units'
+    ``LimitRTPRIO=99``); otherwise the thread keeps its normal priority and a
+    one-time warning is logged so the journal shows the boost's outcome.
+    Each OS thread is only attempted once, so placing this at the top of an
+    audio callback is cheap.
     """
-    if not hasattr(os, "gettid") or not hasattr(os, "sched_setscheduler"):
+    if not hasattr(os, "sched_setscheduler"):
         return
-    tid = os.gettid()
+    tid = _current_tid()
+    if tid is None:
+        return
     with _AUDIO_BOOST_LOCK:
         if tid in _AUDIO_BOOST_TRIED:
             return
         _AUDIO_BOOST_TRIED.add(tid)
+    outcome = None
     try:
         for policy_name in ("SCHED_FIFO", "SCHED_RR"):
             policy = getattr(os, policy_name, None)
@@ -183,11 +208,32 @@ def boost_audio_thread():
             for prio in (pmax, pmin):
                 try:
                     os.sched_setscheduler(tid, policy, os.sched_param(prio))
-                    return
+                    outcome = "%s @ priority %d" % (policy_name, prio)
+                    break
                 except (OSError, ValueError):
                     continue
+            if outcome is not None:
+                break
     except Exception:
         pass
+    if outcome is not None:
+        logger().info("audio callback thread tid=%d: scheduling %s",
+                      tid, outcome)
+    else:
+        logger().warning(
+            "audio callback thread tid=%d: could NOT get real-time "
+            "scheduling (need LimitRTPRIO in the unit, or root)", tid)
+
+
+def _rt_rlimit():
+    """Current RLIMIT_RTPRIO (the cap on sched_setscheduler priority), or None
+    if the platform doesn't expose it."""
+    try:
+        import resource
+        cur, _ = resource.getrlimit(resource.RLIMIT_RTPRIO)
+        return cur
+    except (ImportError, AttributeError, OSError, ValueError):
+        return None
 
 
 def tune_process():
@@ -196,15 +242,38 @@ def tune_process():
     - ``sys.setswitchinterval(0.002)``: the GIL is handed off every 2 ms
       instead of 5 ms, so the audio callback thread waits less behind the
       scan/HTTP/download threads that collectively hold the GIL.
-    - ``os.nice(-10)``: raise the whole process's priority (needs root /
-      CAP_SYS_NICE; silently ignored otherwise).
+    - Raise the process's nice value to -10 (best-effort). An unprivileged
+      service user is usually barred from this by RLIMIT_NICE (systemd's
+      default is `Max nice priority 0`), so the installed systemd units set
+      `Nice=-10` themselves and this call is just for manual runs.
+    - Logs the resulting nice value and real-time rlimit, so `journalctl`
+      can confirm whether the boosts actually took effect (an rlimit of 0,
+      or a nice of 0, means the unit needs `Nice=-10` / `LimitRTPRIO=99`).
     """
     try:
         sys.setswitchinterval(0.002)
     except Exception:
         pass
-    if hasattr(os, "nice"):
-        try:
-            os.nice(-10)
-        except OSError:
-            pass
+    try:
+        if os.getpriority(os.PRIO_PROCESS, 0) > -10:
+            os.setpriority(os.PRIO_PROCESS, 0, -10)
+    except (AttributeError, OSError):
+        if hasattr(os, "nice"):
+            try:
+                os.nice(-10)
+            except OSError:
+                pass
+    # Read back and report what actually took effect.
+    try:
+        nice = os.getpriority(os.PRIO_PROCESS, 0)
+    except (AttributeError, OSError):
+        nice = None
+    rt = _rt_rlimit()
+    if nice is None:
+        logger().info("priority: nice readback unavailable")
+    elif rt is None:
+        logger().info("priority: nice=%d (RT rlimit not exposed)", nice)
+    else:
+        logger().info("priority: nice=%d, realtime rlimit=%d%s",
+                      nice, rt, "" if rt > 0 else
+                      "  -> audio RT boost will NOT apply")

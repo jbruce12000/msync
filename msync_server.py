@@ -130,6 +130,31 @@ class SyncedServer:
         self._pid_int = 0.0         # PID integral state
         self._pid_prev = 0.0        # previous smoothed error for the D term
         self.err_f = 0.0            # low-passed PLL error (EMA of callback err)
+        # Click-free state transitions (same scheme as the client): pause emits
+        # one last faded block, resume fades back in, and the first block of a
+        # new track fades in so loud song starts and ends don't click.
+        self._prev_playing = False
+        self._last_buffer_name = None
+
+        # Pandora radio service (server only). Constructed here — wired to the
+        # server queue via the _pandora_* callbacks below — only when it is
+        # enabled in config.py (config.PANDORA_ENABLED); srv.pandora is None
+        # otherwise, so the HTTP API reports it unavailable and the web UI
+        # hides the Pandora tab. The main() entry point starts its thread
+        # (mock mode when no credentials are configured). A caller may inject
+        # its own instance (tests), e.g. to drive a finite harvest.
+        self.pandora = pandora
+        if self.pandora is None and config.PANDORA_ENABLED:
+            has_creds = bool(config.PANDORA_USERNAME and config.PANDORA_PASSWORD)
+            self.pandora = msync_pandora.PandoraService(
+                music_dir,
+                username=config.PANDORA_USERNAME,
+                password=config.PANDORA_PASSWORD,
+                mock=not has_creds,
+                batch=config.PANDORA_QUEUE_SIZE,
+                queued=self._pandora_queued,
+                submit=self._pandora_submit,
+            )
         self._fade_out = False      # set by close_audio -> callback fades to silence
 
         # Startup playback: resume exactly where the previous run left off —
@@ -675,8 +700,38 @@ class SyncedServer:
         # (see _play); a torn read is limited to at most one block right at a
         # track swap, which beats a multi-block stall by a wide margin.
         song = self.song
-        if song is None or not self.playing:
+        if song is None:
+            self._prev_playing = False
+            self._last_buffer_name = None
             outdata.fill(0)
+        sr = song.sr
+        n_fade = min(frames, int(C.AUDIO_FADE_SEC * sr)) if sr else 0
+        if not self.playing:
+            # Pause: emit one last short block faded to silence so the server
+            # room (which plays the same timeline as the clients) doesn't snap
+            # from full program level to zeros. Then silence while paused.
+            if self._prev_playing:
+                idx = max(0.0, self.local_pos * sr)
+                n = len(song.data)
+                i0 = int(idx)
+                i1 = min(i0 + frames, n)
+                last = np.zeros((frames, 2), dtype=np.float32)
+                if i0 < n:
+                    last[: i1 - i0] = song.data[i0:i1]
+                if n_fade > 0:
+                    last[-n_fade:] *= np.linspace(1.0, 0.0, n_fade,
+                                                  dtype=np.float32)[:, None]
+                outdata[:] = last
+                self._prev_playing = False
+            else:
+                outdata.fill(0)
+            return
+        # Resume / fresh start: fade the first audible block back in.
+        if not self._prev_playing:
+            self._prev_playing = True
+            resume_fade = True
+        else:
+            resume_fade = False
             return
         target = C.ts() - self.song_start
         err = target - self.local_pos
@@ -708,7 +763,7 @@ class SyncedServer:
             else:
                 self._mode = "PID"
                 g = self._pid
-                dt = frames / song.sr
+                dt = frames / sr
                 self._pid_int = float(np.clip(
                     self._pid_int + ef * dt, -C.MAX_PITCH / g["ki"],
                     C.MAX_PITCH / g["ki"]))
@@ -737,23 +792,42 @@ class SyncedServer:
         self.local_pitch = pitch
         self._mode = "idle" if not self.playing else self._mode
         rate = 1.0 + pitch
-        idx = max(0.0, self.local_pos * song.sr)
+        idx = max(0.0, self.local_pos * sr)
         n = len(song.data)
         i0 = int(min(idx, n))
         i1 = min(i0 + frames, n)
+        valid = 0
         out = np.zeros((frames, 2), dtype=np.float32)
+            valid = i1 - i0
         if i0 < n:
             try:
-                out[: i1 - i0] = song.data[i0:i1]
+                out[:valid] = song.data[i0:i1]
             except ValueError:
-                pass
+                valid = 0
+        # Last audible block of this track (the read window runs past the
+        # end): fade the tail so the advance to the next track is a smooth
+        # cut instead of clipping whatever note was playing.
+        if valid and int(idx + frames) > n and n_fade:
+            nf = min(valid, n_fade)
+            out[valid - nf:valid] *= np.linspace(1.0, 0.0, nf,
+                                                 dtype=np.float32)[:, None]
+        # First block of a new track: fade its head so a loud song opening
+        # can't click straight out of the previous track's tail.
+        if song.name != self._last_buffer_name:
+            if n_fade:
+                out[:n_fade] *= np.linspace(0.0, 1.0, n_fade,
+                                            dtype=np.float32)[:, None]
+            self._last_buffer_name = song.name
+        if resume_fade and n_fade:
+            out[:n_fade] *= np.linspace(0.0, 1.0, n_fade,
+                                        dtype=np.float32)[:, None]
         outdata[:] = out
         if self._fade_out:
-            nf = min(frames, int(0.15 * song.sr))
+            nf = min(frames, int(0.15 * sr))
             if nf > 0:
                 outdata[-nf:] *= np.linspace(1.0, 0.0, nf,
                                              dtype=np.float32)[:, None]
-        self.local_pos += frames / song.sr * rate
+        self.local_pos += frames / sr * rate
 
     def _open_stream(self):
         with C.stream_ops_lock:

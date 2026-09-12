@@ -70,17 +70,18 @@ OUTPUT_LATENCY_MS = float(os.environ.get("MSYNC_OUTPUT_LATENCY_MS", "0"))
 # PID test mode (bang-bang outside the error window)                          #
 # --------------------------------------------------------------------------- #
 
-# EXPERIMENTAL drift-controller hybrid. PID mode is ENABLED by default in this
-# repo (current test cycle): whenever the smoothed sync error is OUTSIDE a
-# +/-BANG_BANG_WINDOW_MS window the controller drives the actuator at FULL pitch
-# power (+/-MAX_PITCH = +/-2000ppm) bang-bang, snapping the playhead back
-# quickly; INSIDE the window it runs the host's autodetected, critically-damped
-# PID (see pid_tune.py). Aggressive and audibly fast -- not for production.
-# Every value is env-overridable:
+# EXPERIMENTAL drift-controller hybrid, OFF BY DEFAULT. When enabled, any
+# smoothed sync error OUTSIDE a +/-BANG_BANG_WINDOW_MS window drives the
+# actuator at FULL pitch power (+/-MAX_PITCH = +/-2000ppm) bang-bang; INSIDE
+# the window it runs a critically-damped PID (see pid_tune.py). Because the
+# audio paths realize pitch by dropping/repeating raw samples at block
+# boundaries (no interpolation), such large pitches are AUDIBLY CLICKY, so
+# production hygiene is the gentle PI controller below. Enable only for the
+# PID test cycle. Every value is env-overridable:
 #
-#   MSYNC_BANG_BANG=0               disable the hybrid (back to the gentle PI)
+#   MSYNC_BANG_BANG=1               enable the hybrid (bang-bang + PID)
 #   MSYNC_BANG_BANG_WINDOW_MS=10    error window in milliseconds (default 10)
-BANG_BANG = os.environ.get("MSYNC_BANG_BANG", "1") in ("1", "true", "yes", "on")
+BANG_BANG = os.environ.get("MSYNC_BANG_BANG", "0") in ("1", "true", "yes", "on")
 BANG_BANG_WINDOW_MS = float(os.environ.get("MSYNC_BANG_BANG_WINDOW_MS", "10"))
 
 # Critically-damped PID tuning (used inside the window in test mode). The gains

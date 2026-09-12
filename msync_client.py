@@ -388,6 +388,15 @@ class SyncClient:
         self._stop = threading.Event()   # set to leave the run() loop
         self._loading_name = None        # track currently being downloaded
         self._fade_out = False           # set by close_audio -> callback fades
+        # Click-free state transitions. _prev_playing lets the callback emit
+        # one last faded block when the server pauses (instead of snapping
+        # from full program level to silence) and fade the first block back in
+        # on resume; _last_buffer_name flags the first block of a new track
+        # for a fade-in; _gain_env ramps server-pushed volume/mute changes
+        # instead of stepping the gain mid-sample.
+        self._prev_playing = False
+        self._last_buffer_name = None
+        self._gain_env = 1.0
         # If this room's audio path (HDMI -> TV/AVR, ...) delays the output
         # by OUTPUT_LATENCY_MS, play that far ahead of the synced playhead
         # so the sound reaching the listeners lines up with the server room.
@@ -493,13 +502,64 @@ class SyncClient:
     # ------------------------------------------------------------------ #
     # Playhead advance + drift correction in callback                     #
     # ------------------------------------------------------------------ #
+    def _apply_gain(self, out):
+        """Apply this room's volume/mute (server-pushed) with a short linear
+        ramp whenever the gain level changes. A mute toggle or a volume move
+        is a hard step in the waveform if applied instantly (a click); ramping
+        over a few ms makes it inaudible."""
+        tg = 0.0 if self._muted else self._volume
+        current = self._gain_env
+        if tg == current:
+            out *= current
+            return
+        n = min(out.shape[0], int(C.AUDIO_FADE_SEC * self.buffer.sr) or 1)
+        if n < out.shape[0]:
+            out[:n] *= np.linspace(current, tg, n, dtype=np.float32)[:, None]
+            out[n:] *= tg
+        else:
+            out *= tg
+        self._gain_env = tg
+
+    # ------------------------------------------------------------------ #
     def _cb(self, outdata, frames, time_info, status):
         C.boost_audio_thread()
         with self.lock:
             buf = self.buffer
-            if buf.data is None or not self.playing:
+            if buf.data is None:
+                self._prev_playing = False
+                self._last_buffer_name = None
                 outdata.fill(0)
                 return
+            sr = buf.sr
+            n_fade = min(frames, int(C.AUDIO_FADE_SEC * sr)) if sr else 0
+            pl = self.playing
+            # Pause: emit one last short block faded to silence, so the
+            # speakers don't snap from full program level to zeros between
+            # callbacks. The stream stays open; from here on we fill silence.
+            if not pl and self._prev_playing:
+                idx = max(0.0, (self.local_pos + self._out_latency) * sr)
+                n = len(buf.data)
+                i0 = int(idx)
+                i1 = min(i0 + frames, n)
+                last = np.zeros((frames, 2), dtype=np.float32)
+                if i0 < n:
+                    last[: i1 - i0] = buf.data[i0:i1]
+                self._apply_gain(last)
+                if n_fade > 0:
+                    last[-n_fade:] *= np.linspace(1.0, 0.0, n_fade,
+                                                  dtype=np.float32)[:, None]
+                outdata[:] = last
+                self._prev_playing = False
+                return
+            if not pl:
+                outdata.fill(0)
+                return
+            # Resume / fresh start: fade the first audible block back in.
+            if not self._prev_playing:
+                self._prev_playing = True
+                resume_fade = True
+            else:
+                resume_fade = False
             # Target position: pinned to the last rebase and advanced by the
             # local clock at the (NTP-measured) server clock rate, NOT
             # re-derived from a fresh `server_now() - song_start`. This bakes
@@ -593,7 +653,7 @@ class SyncClient:
             # so pull the samples from that much further ahead on the timeline.
             # (The PLL still chases the raw playhead; only what we emit is
             # offset, so sync/control logic is unchanged.)
-            idx = max(0.0, (self.local_pos + self._out_latency) * buf.sr)
+            idx = max(0.0, (self.local_pos + self._out_latency) * sr)
             n = len(buf.data)
             if idx >= n:
                 # This track's data is exhausted. Normally the server has
@@ -604,28 +664,41 @@ class SyncClient:
                 # PLL to ±MAX_PITCH. Advancing keeps us locked to the server
                 # timeline; the next track's adoption re-bases it exactly.
                 outdata.fill(0)
-                self.local_pos += frames / buf.sr * rate
+                self.local_pos += frames / sr * rate
                 return
             i0 = int(idx)
             i1 = min(int(idx + frames), n)
             out = np.zeros((frames, 2), dtype=np.float32)
-            out[: i1 - i0] = buf.data[i0:i1]
-            # Per-room volume/mute (server-pushed). A mute is gain 0, so it
-            # silences this room without touching its remembered volume.
-            gain = 0.0 if self._muted else self._volume
-            if gain >= 1.0:
-                outdata[:] = out
-            elif gain > 0.0:
-                outdata[:] = out * gain
-            else:
-                outdata.fill(0)
+            valid = i1 - i0
+            out[:valid] = buf.data[i0:i1]
+            # Last audible block of this track (the read window runs past the
+            # end): fade the tail so the cut to download-gap silence is smooth
+            # instead of clipping whatever note was playing.
+            if valid and int(idx + frames) > n and n_fade:
+                nf = min(valid, n_fade)
+                out[valid - nf:valid] *= np.linspace(1.0, 0.0, nf,
+                                                     dtype=np.float32)[:, None]
+            # Per-room volume/mute (server-pushed), ramped on changes.
+            self._apply_gain(out)
+            # First block of a new (or restarted, sample-rate change) track:
+            # fade its head so a loud song opening can't click straight out of
+            # the previous track's tail or the download-gap silence.
+            if buf.name != self._last_buffer_name:
+                if n_fade:
+                    out[:n_fade] *= np.linspace(0.0, 1.0, n_fade,
+                                                dtype=np.float32)[:, None]
+                self._last_buffer_name = buf.name
+            if resume_fade and n_fade:
+                out[:n_fade] *= np.linspace(0.0, 1.0, n_fade,
+                                            dtype=np.float32)[:, None]
+            outdata[:] = out
             if self._fade_out:
-                nf = min(frames, int(0.15 * buf.sr))
+                nf = min(frames, int(0.15 * sr))
                 if nf > 0:
                     outdata[-nf:] *= np.linspace(1.0, 0.0, nf,
                                                  dtype=np.float32)[:, None]
             # advance local playhead by physical samples * pitch correction
-            self.local_pos += frames / buf.sr * rate
+            self.local_pos += frames / sr * rate
 
     # ------------------------------------------------------------------ #
     def _ensure_stream(self):

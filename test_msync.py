@@ -1160,7 +1160,10 @@ def test_client_latency_packet_sets_out_latency(client):
 
 def test_client_callback_applies_volume_and_mute(client):
     # Volume scales the callback's output; mute silences it without touching
-    # the remembered level (the Configure tab's per-room mute).
+    # the remembered level (the Configure tab's per-room mute). Level and mute
+    # changes ramp over AUDIO_FADE_SEC instead of stepping the gain mid-sample
+    # (a hard gain step is an audible click), so the "allclose" checks look at
+    # the steady tail after the ramp window.
     h = client.client
     h.playing = True
     h._out_latency = 0.0
@@ -1169,6 +1172,13 @@ def test_client_callback_applies_volume_and_mute(client):
     h.local_pos = 0.2
     h.err_f = 0.0
     frames = 2048
+    ramp = min(frames, int(C.AUDIO_FADE_SEC * h.buffer.sr))
+    assert ramp < frames
+    # The signal the callback reads at local_pos==0.2 (before any gain/fade).
+    i0 = int(h.local_pos * h.buffer.sr)
+    raw = np.zeros((frames, 2), dtype=np.float32)
+    k = min(i0 + frames, len(h.buffer.data))
+    raw[: k - i0] = h.buffer.data[i0:k]
     base = np.zeros((frames, 2), dtype=np.float32)
     # Pin the PLL reference to local_pos so err==0 and the catchup nudge
     # (which advances local_pos by CATCHUP_STEP) can't shift the window; the
@@ -1184,7 +1194,11 @@ def test_client_callback_applies_volume_and_mute(client):
     h._volume = 0.5
     half = np.zeros((frames, 2), dtype=np.float32)
     h._cb(half, frames, None, None)
-    assert np.allclose(half, base * 0.5)
+    # after the 10ms ramp the gain is exactly 0.5 ...
+    assert np.allclose(half[ramp:], base[ramp:] * 0.5)
+    # ... and the ramp is monotone from 1.0 down to 0.5 (no gain step)
+    assert np.all(np.abs(half[:ramp]) <= np.abs(raw[:ramp]) * 1.0 + 1e-6)
+    assert np.all(np.abs(half[:ramp]) >= np.abs(raw[:ramp]) * 0.5 - 1e-6)
 
     h.local_pos = 0.2
     h.err_f = 0.0
@@ -1194,7 +1208,8 @@ def test_client_callback_applies_volume_and_mute(client):
     h._muted = True              # mute = gain 0, but volume remembered
     silent = np.zeros((frames, 2), dtype=np.float32)
     h._cb(silent, frames, None, None)
-    assert not silent.any()
+    assert np.allclose(silent[ramp:], 0)   # fully silent after the ramp
+    assert np.all(np.abs(silent[:ramp]) <= np.abs(raw[:ramp]) * 0.5 + 1e-6)
     assert h._volume == 0.5      # unmute restores the level
 
 
