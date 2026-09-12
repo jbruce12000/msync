@@ -17,5 +17,18 @@ venv/
 # Music files (large binaries)
 music/*.wav
 
+# Pandora downloads (get queued automatically; never committed)
+Pandora - */
+
+# Debris guard: if a bug ever writes audio into the repo root again, never commit it
+/*.flac
+/*.m4a
+/*.aac
+/*.opus
+
+# Local scratch / credentials — never commit (contains real Pandora creds)
+go
+secrets
+
 # Editor swap files
 *.swp

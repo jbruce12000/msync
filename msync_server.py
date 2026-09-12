@@ -12,6 +12,10 @@ Responsibilities:
   * Maintain a FIFO queue. Songs are added interactively / via HTTP / by
     dropping files in the <music_dir>/.queue folder; the queue is played on
     the server and therefore on every connected client.
+  * Pandora radio (optional): a daemon thread fetches station playlists,
+    downloads the streams into <music_dir>/"Pandora - <Station>"/, and
+    queues each track as it finishes (see msync_pandora.py). Mock mode with
+    no account configured.
 
 Usage:
     msync_server.py [music_dir] [--port N]
@@ -22,6 +26,7 @@ Controls (stdin/HTTP):
     +/-        : volume
     add <name|glob...> : queue songs (e.g. add "Foo.mp3" or "add *.wav")
     queue      : show the queue      clear : empty the queue
+    pandora [station|stations|stop] : Pandora radio control
 
 Drop-to-queue:
     Copy any audio file into <music_dir>/.queue while the server runs.
@@ -44,6 +49,7 @@ import numpy as np
 
 import config
 import msync_common as C
+import msync_pandora
 import pid_tune
 from msync_catalog import (Catalog, abs_path, is_audio_name,
                            relpath_norm)
@@ -80,7 +86,7 @@ class Song:
 
 
 class SyncedServer:
-    def __init__(self, music_dir, port, db_path=None):
+    def __init__(self, music_dir, port, db_path=None, pandora=None):
         lg = C.logger()
         self.port = port
         self.lock = threading.RLock()
@@ -130,6 +136,7 @@ class SyncedServer:
         self._pid_int = 0.0         # PID integral state
         self._pid_prev = 0.0        # previous smoothed error for the D term
         self.err_f = 0.0            # low-passed PLL error (EMA of callback err)
+        self._fade_out = False      # set by close_audio -> callback fades to silence
         # Click-free state transitions (same scheme as the client): pause emits
         # one last faded block, resume fades back in, and the first block of a
         # new track fades in so loud song starts and ends don't click.
@@ -155,7 +162,6 @@ class SyncedServer:
                 queued=self._pandora_queued,
                 submit=self._pandora_submit,
             )
-        self._fade_out = False      # set by close_audio -> callback fades to silence
 
         # Startup playback: resume exactly where the previous run left off —
         # the last-played track starts again (same song, roughly the same
@@ -704,6 +710,7 @@ class SyncedServer:
             self._prev_playing = False
             self._last_buffer_name = None
             outdata.fill(0)
+            return
         sr = song.sr
         n_fade = min(frames, int(C.AUDIO_FADE_SEC * sr)) if sr else 0
         if not self.playing:
@@ -732,7 +739,6 @@ class SyncedServer:
             resume_fade = True
         else:
             resume_fade = False
-            return
         target = C.ts() - self.song_start
         err = target - self.local_pos
         # Low-pass the error (same as the client): the raw err carries the
@@ -796,10 +802,10 @@ class SyncedServer:
         n = len(song.data)
         i0 = int(min(idx, n))
         i1 = min(i0 + frames, n)
-        valid = 0
         out = np.zeros((frames, 2), dtype=np.float32)
-            valid = i1 - i0
+        valid = 0
         if i0 < n:
+            valid = i1 - i0
             try:
                 out[:valid] = song.data[i0:i1]
             except ValueError:
@@ -1064,6 +1070,79 @@ class SyncedServer:
         return self.volume
 
     # ------------------------------------------------------------------ #
+    # Pandora radio (drives the PandoraService thread against this queue) #
+    # ------------------------------------------------------------------ #
+    def _pandora_queued(self):
+        """# of tracks belonging to the active Pandora station that are
+        still sitting in the play queue. Called from the Pandora thread
+        (which already holds the Pandora lock) on its ~1s top-up loop, so
+        this must stay a quick shared-lock read."""
+        folder = self.pandora.station_dir if self.pandora else None
+        if not folder:
+            return 0
+        folder = os.path.abspath(folder) + os.sep
+        count = 0
+        with self.lock:
+            for e in self.queue:
+                if e.get("type") == "song":
+                    if (e.get("path") or "").startswith(folder):
+                        count += 1
+                elif e.get("type") == "album":
+                    for p in e.get("paths", []):
+                        if (p or "").startswith(folder):
+                            count += 1
+        return count
+
+    def _pandora_submit(self, path):
+        """Append a freshly-downloaded Pandora track to the play queue.
+        Called from the Pandora thread; per the PandoraService callback
+        contract it hands the path to the server's queue under the server
+        lock (and never calls back into Pandora)."""
+        path = os.path.abspath(path)
+        with self.lock:
+            if path in self._queued_paths():
+                return
+            rel = self._relpath(path)
+            self.queue.append({"type": "song", "path": path, "relpath": rel})
+            C.logger().info("queued: %s", rel)
+            if self.song is None and self.queue:
+                self._start_next()     # nothing playing: start the radio now
+            self._persist_queue()
+
+    def pandora_status(self):
+        """Snapshot of the Pandora service for the API/UI. Takes only the
+        Pandora lock, so call it WITHOUT holding the server lock — the Pandora
+        thread may be blocked waiting for that same lock in _pandora_queued."""
+        if self.pandora is None:
+            return None
+        try:
+            return self.pandora.status()
+        except Exception as exc:
+            C.logger().warning("pandora: status error: %r", exc)
+            return {"error": str(exc)}
+
+    def pandora_play(self, station):
+        """Start a Pandora station (name or token). Queues a finite batch of
+        config.PANDORA_QUEUE_SIZE tracks and stops there; the Pandora tab's
+        "Queue more" button (pandora_more) adds another batch on demand."""
+        if self.pandora is None:
+            return {"ok": False, "error": "pandora not available"}
+        ok = self.pandora.play_station(station, want=config.PANDORA_QUEUE_SIZE)
+        return {"ok": ok, "station": station}
+
+    def pandora_more(self):
+        """Queue another PANDORA_QUEUE_SIZE batch for the active station."""
+        if self.pandora is None:
+            return {"ok": False, "error": "pandora not available"}
+        return {"ok": bool(self.pandora.fetch_more()),
+                "batch": config.PANDORA_QUEUE_SIZE}
+
+    def pandora_stop(self):
+        """Stop the active station; already-downloaded tracks keep playing."""
+        if self.pandora is not None:
+            self.pandora.stop_station()
+
+    # ------------------------------------------------------------------ #
     # UDP sync + NTP + state broadcast                                   #
     # ------------------------------------------------------------------ #
     def _sync_payload(self):
@@ -1262,6 +1341,12 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
       POST /api/control/toggle|stop|next|prev|volume
       POST /api/clients/latency   -> set a room's output offset (?ip=&ms= or JSON)
       POST /api/clients/volume    -> set a room's volume/mute (?ip=&vol=&muted= or JSON)
+      GET  /api/pandora           -> Pandora service status
+      GET  /api/pandora/stations  -> list of Pandora stations
+      POST /api/pandora/play      -> start a station (?station= or JSON); queues
+                                    PANDORA_QUEUE_SIZE tracks then stops
+      POST /api/pandora/more      -> queue another batch for the active station
+      POST /api/pandora/stop      -> stop the active station (downloads halt)
       everything else         -> music file download (client fetches songs)
     """
 
@@ -1318,7 +1403,21 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
                 # _state_payload() and shouldn't carry UI-progress chatter.
                 payload = srv._state_payload()
                 payload["catalog_scan"] = srv.catalog.scan_progress()
+                # pandora_status() takes only the Pandora lock — call it OUTSIDE
+                # _state_payload's server lock, or the Pandora thread (which
+                # holds its own lock while waiting on the server lock in
+                # _pandora_queued) could deadlock with this handler.
+                payload["pandora"] = srv.pandora_status()
                 self._json(payload)
+            elif path == "/api/pandora":
+                status = srv.pandora_status()
+                if status is None:
+                    self._json({"error": "pandora unavailable"}, 404)
+                else:
+                    self._json(status)
+            elif path == "/api/pandora/stations":
+                stations = srv.pandora.stations() if srv.pandora else []
+                self._json({"stations": stations})
             elif path == "/api/library":
                 self._json({"songs": srv.library_list(),
                             "albums": srv.album_list_full(),
@@ -1514,6 +1613,18 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
                 srv.catalog.set_client_volume(ip, vol, muted)
                 srv.send_volume(ip, vol, muted)   # apply live to the client
                 self._json({"ip": ip, "volume": vol, "muted": muted})
+            elif path == "/api/pandora/play":
+                station = body.get("station") if "station" in body \
+                    else (qs.get("station") or qs.get("name") or [None])[0]
+                if not station:
+                    self._json({"error": "station required"}, 400)
+                else:
+                    self._json(srv.pandora_play(station))
+            elif path == "/api/pandora/more":
+                self._json(srv.pandora_more())
+            elif path == "/api/pandora/stop":
+                srv.pandora_stop()
+                self._json({"ok": True})
             else:
                 self._json({"error": "not found"}, 404)
 
@@ -1557,9 +1668,15 @@ def main():
     # Start inotify watcher for the music directory
     watcher = MusicWatcher(music_dir, srv.catalog, srv._stop)
     watcher.start()
+    # Pandora radio thread. Only started when Pandora is enabled in config.py
+    # (PANDORA_ENABLED); mock mode (no credentials configured) connects to fake
+    # stations instantly and idles until a station is selected.
+    if srv.pandora is not None:
+        srv.pandora.start()
 
     print("\nServer controls: space=play/pause  n=next  p=prev  +/-=vol  q=quit")
-    print("                 add <song...> | queue | clear | drop files in .queue/\n")
+    print("                 add <song...> | queue | clear | drop files in .queue/")
+    print("                 pandora [station] | pandora stations | pandora stop\n")
     headless = args.headless
     if headless:
         try:
@@ -1605,6 +1722,35 @@ def main():
             elif cmd == "add" and rest:
                 added = srv.add_to_queue([s.strip() for s in rest.split(",")])
                 print("  added:", ", ".join(added))
+            elif cmd == "pandora":
+                if srv.pandora is None:
+                    print("  pandora: disabled (set PANDORA_ENABLED=True in config.py)")
+                else:
+                    parts = (rest or "").strip().split()
+                    if not parts:
+                        st = srv.pandora_status() or {}
+                        print(f"  station={st.get('station') or '(none)'}"
+                              f"  connected={st.get('connected')}"
+                              f"  mock={st.get('mock')}"
+                              f"  downloaded={st.get('downloaded')}"
+                              f"  pending={st.get('pending')}"
+                              f"  error={st.get('error') or 'none'}")
+                    elif parts[0] in ("stations", "list"):
+                        for st in srv.pandora.stations():
+                            print(f"  {st['stationToken']:<18} {st['stationName']}")
+                    elif parts[0] in ("stop", "off"):
+                        srv.pandora_stop()
+                        print("  pandora: stopped")
+                    elif parts[0] in ("more", "fill", "next"):
+                        res = srv.pandora_more()
+                        if res.get("ok"):
+                            print(f"  pandora: queueing {res.get('batch')} more")
+                        else:
+                            print(f"  pandora: {res.get('error', 'no station active')}")
+                    else:
+                        res = srv.pandora_play(" ".join(parts))
+                        verb = "queuing" if res.get("ok") else "unknown station"
+                        print(f"  pandora: {verb}: {res.get('station')}")
             else:
                 print("  ?:", line)
     except (EOFError, KeyboardInterrupt):

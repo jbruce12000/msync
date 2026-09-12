@@ -25,6 +25,36 @@ MUSIC_DIR = "/home/jbruce/music"
 # Sub-folder inside MUSIC_DIR: drop audio files here to queue them.
 QUEUE_SUBDIR = ".queue"
 
+# Pandora radio (server only). DISABLED by default: set PANDORA_ENABLED = True
+# (or MSYNC_PANDORA_ENABLED=1) to switch it on, then either set your account
+# credentials below for your real stations, or leave both blank to run in mock
+# mode (fabricated stations/tracks) for development. When enabled, the server's
+# Pandora thread (msync_pandora.PandoraService) logs in, fetches station
+# playlists, and downloads the streams into MUSIC_DIR/"Pandora - <Station>"/,
+# queuing each one as it finishes. The web UI's Pandora tab appears only while
+# this is enabled.
+#
+# To use your real account, type your credentials directly into the two lines
+# below — the repo's git clean filter (tools/setup-msync-secret-filter.sh)
+# scrubs them from every commit automatically, so they never leave this
+# machine. Alternatively, leave the defaults untouched and set
+# MSYNC_PANDORA_USERNAME / MSYNC_PANDORA_PASSWORD env vars in the service
+# environment instead. Blank credentials (the default) runs mock mode.
+#
+# Caveat: `git checkout -- config.py` replaces your local credentials with the
+# scrubbed version from git — re-type them after any checkout or stash.
+#
+#PANDORA_ENABLED = os.environ.get("MSYNC_PANDORA_ENABLED", "0") in ("1", "true", "yes", "on")
+PANDORA_ENABLED = True
+PANDORA_USERNAME = os.environ.get("MSYNC_PANDORA_USERNAME", "")
+PANDORA_PASSWORD = os.environ.get("MSYNC_PANDORA_PASSWORD", "")
+
+# Pandora radio batch size: how many songs a station queues in one go. When
+# you start a station (or click the Pandora tab's "Queue N more" button) the
+# radio downloads exactly this many tracks into the queue and then stops —
+# it never auto-refills. Env override: MSYNC_PANDORA_QUEUE_SIZE.
+PANDORA_QUEUE_SIZE = int(os.environ.get("MSYNC_PANDORA_QUEUE_SIZE", "10"))
+
 # Client's local cache for downloaded tracks.
 CACHE_DIR = os.environ.get(
     "MSYNC_CACHE_DIR", os.path.join(tempfile.gettempdir(), "msync-cache"))

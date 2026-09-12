@@ -191,6 +191,23 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 
 .empty { text-align: center; padding: 24px; color: var(--muted); font-size: 12px; }
 
+/* Pandora radio tab */
+.pandora { padding: 16px; overflow-y: auto; }
+.pandora h3 { font-size: 13px; margin: 16px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.pd-status { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; }
+.pd-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+.pd-dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.pd-station-name { font-size: 15px; font-weight: 600; }
+.pd-meta { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; flex: 1; min-width: 120px; }
+.pd-status .head-btn { margin-left: auto; }
+.pd-banner { margin-top: 8px; padding: 8px 12px; border: 1px solid #d9a20b; background: rgba(217,162,11,0.12); border-radius: 8px; color: #e3b341; font-size: 12.5px; line-height: 1.4; }
+.pd-station-list { display: flex; flex-direction: column; gap: 8px; }
+.pd-station { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; display: flex; align-items: center; gap: 12px; cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+.pd-station:hover { border-color: var(--accent); }
+.pd-station.active { border-color: var(--accent); background: rgba(88,166,255,0.08); }
+.pd-station .pd-name { flex: 1; min-width: 0; font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pd-station .pd-state { font-size: 11px; color: var(--accent); font-weight: 600; letter-spacing: 0.5px; flex: none; }
+
 /* Scrollbar visible on hover */
 .scroll:hover::-webkit-scrollbar-thumb { background: #484f58; }
 
@@ -276,6 +293,10 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
     .slider-centre { font-size: 12px; }
     .slider-row .lat-unit { font-size: 13px; }
     .head-btn { font-size: 16px; }
+    .pd-station-name { font-size: 17px; }
+    .pd-station .pd-name { font-size: 16px; }
+    .pd-station .pd-state { font-size: 12px; }
+    .pd-meta { font-size: 13px; }
 }
 /* Extra legibility on phones */
 @media (max-width: 640px) {
@@ -310,6 +331,9 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 <div class="tabbar">
     <button class="tab active" data-tab="search" onclick="setTab('search')">Search</button>
     <button class="tab" data-tab="queue" onclick="setTab('queue')">Queue</button>
+    <!-- Pandora appears only when the server has it enabled (config.PANDORA_ENABLED);
+         updatePandoraTabVis() reveals it based on state.pandora. -->
+    <button class="tab" id="tab-pandora" data-tab="pandora" onclick="setTab('pandora')" style="display:none;">Pandora</button>
     <button class="tab" data-tab="config" onclick="setTab('config')">Configure</button>
 </div>
 
@@ -350,6 +374,11 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 <!-- Configure view: per-room latency -->
 <div class="main" id="view-config" style="display:none;">
     <div class="configure" id="configure"></div>
+</div>
+
+<!-- Pandora view: stations + radio status -->
+<div class="main" id="view-pandora" style="display:none;">
+    <div class="pandora" id="pandora"></div>
 </div>
 
 <script src="static/sortable.min.js"></script>
@@ -410,7 +439,9 @@ function setTab(name) {
     document.getElementById('view-search').style.display = name === 'search' ? '' : 'none';
     document.getElementById('view-queue').style.display = name === 'queue' ? '' : 'none';
     document.getElementById('view-config').style.display = name === 'config' ? '' : 'none';
+    document.getElementById('view-pandora').style.display = name === 'pandora' ? '' : 'none';
     if (name === 'config') fetchClients();
+    if (name === 'pandora') fetchPandora(true);
 }
 
 // ── Configure: per-room latency ──────────────────────────────────────
@@ -722,6 +753,7 @@ async function fetchState() {
     state = d;
     updateHeader();
     updateScanStatus();
+    updatePandoraTabVis();
     renderQueue();
 }
 
@@ -1158,10 +1190,106 @@ document.getElementById('search').addEventListener('input', () => {
     searchTimer = setTimeout(renderLibrary, 120);
 });
 
+// ── Pandora radio tab ────────────────────────────────────────────────
+// The tab only shows when the server runs the Pandora service: state.pandora
+// (from /api/state) is a status object when config.PANDORA_ENABLED is on and
+// null when it's off. Station list/status come from the same /api/pandora*
+// endpoints the server console uses. The 1s poll refreshes status from
+// /api/pandora; the station list is refetched on tab open or ~every 10s (it's
+// static until stations change server-side, so a lighter cadence keeps the
+// poll cheap).
+let pandoraStatus = null;      // last /api/pandora snapshot
+let pandoraStations = [];      // [{stationToken, stationName}]
+let pandoraStationsAt = 0;     // last station-list fetch timestamp
+
+function updatePandoraTabVis() {
+    const tab = document.getElementById('tab-pandora');
+    const show = !!state.pandora;
+    if (tab && tab.style.display !== (show ? '' : 'none')) {
+        tab.style.display = show ? '' : 'none';
+    }
+    // If Pandora turns off while we're looking at its tab, bail to Search
+    // so the user isn't stranded on an empty panel.
+    if (!show && currentTab === 'pandora') setTab('search');
+}
+
+async function fetchPandora(forceStations) {
+    const d = await api('GET', '/api/pandora');
+    if (!d.error) pandoraStatus = d;
+    if (forceStations || Date.now() - pandoraStationsAt > 10000) {
+        pandoraStationsAt = Date.now();
+        const s = await api('GET', '/api/pandora/stations');
+        if (!s.error) pandoraStations = s.stations || [];
+    }
+    renderPandora();
+}
+
+function renderPandora() {
+    const el = document.getElementById('pandora');
+    const st = pandoraStatus;
+    let html = '';
+
+    if (!st) {
+        html += '<div class="empty-state">Pandora service unavailable (not running on this server).</div>';
+    } else if (st.error) {
+        html += `<div class="empty-state">${esc(st.error)}</div>`;
+    } else {
+        const dotCls = st.connected ? ' on' : '';
+        const activeName = st.station
+            ? `<span class="pd-station-name">${esc(st.station)}</span>`
+            : `<span class="pd-station-name" style="color:var(--muted)">${st.mock ? 'Mock mode — pick a station' : 'Pick a station to queue a batch'}</span>`;
+        html += `<div class="pd-status">
+            <span class="pd-dot${dotCls}" title="${st.connected ? 'Connected to Pandora' : 'Not connected'}"></span>
+            ${activeName}
+            <span class="pd-meta">${st.mock ? 'mock · ' : ''}downloaded ${st.downloaded || 0} · queued ${st.pending ?? 0}</span>
+            ${st.station ? `<button class="head-btn accent" onclick="pandoraMore()" title="Download another batch of ${st.batch || 10} songs into the queue">＋ Queue ${st.batch || 10} more</button>` : ''}
+        </div>`;
+        if (st.warn) {
+            html += `<div class="pd-banner" title="${esc(st.warn)}">⚠ ${esc(st.warn)}</div>`;
+        }
+    }
+
+    html += '<h3>Stations</h3>';
+    if (!pandoraStations.length) {
+        html += '<div class="empty-state">No stations yet. With an account configured in config.py the server lists your real stations; with none it runs mock stations for testing.</div>';
+    } else {
+        html += '<div class="pd-station-list">';
+        for (const s of pandoraStations) {
+            const active = st && st.station_token === s.stationToken;
+            html += `<div class="pd-station${active ? ' active' : ''}" onclick="pandoraPlay('${esc(s.stationName)}')" title="Play ${esc(s.stationName)}">
+                <span class="pd-name">${esc(s.stationName)}</span>
+                <span class="pd-state">${active ? '▶ ON AIR' : ''}</span>
+            </div>`;
+        }
+        html += '</div>';
+    }
+
+    // Diff-guard: don't rebuild the DOM unless the content changed (prevents
+    // flicker on the 1s poll).
+    if (el.innerHTML !== html) el.innerHTML = html;
+}
+
+async function pandoraPlay(name) {
+    const d = await api('POST', '/api/pandora/play', { station: name });
+    if (d.error) { toast(d.error, 'error'); return; }
+    if (!d.ok) { toast(`Station not found: ${name}`, 'warn'); return; }
+    toast(`Queueing a fresh batch from ${name}…`);
+    await fetchPandora(true);
+}
+
+async function pandoraMore() {
+    const d = await api('POST', '/api/pandora/more');
+    if (d.error) { toast(d.error, 'error'); return; }
+    if (!d.ok) { toast('No station active — pick one below first', 'warn'); return; }
+    toast(`Queueing ${d.batch || 10} more — downloads stop when the batch is full`);
+    await fetchPandora(true);
+}
+
 // ── Polling ──────────────────────────────────────────────────────────
 async function tick() {
     await fetchState();
     if (currentTab === 'config') fetchClients();
+    if (currentTab === 'pandora') fetchPandora();
 }
 tick();
 setInterval(tick, 1000);

@@ -386,6 +386,106 @@ the scripts — the server and every client read it:
   value wins as soon as the client registers). Env override:
   `MSYNC_OUTPUT_LATENCY_MS`.
 
+## Pandora radio (optional)
+
+Pick a Pandora station and the server turns into a radio + DJ: a background
+thread logs into your account, fetches the station's playlist, and downloads
+each track into `MUSIC_DIR/Pandora - <Station>/`, queuing it the moment it
+finishes — so it plays on the server and every synced client, exactly like
+any other track.
+
+Radio is **batch-based, never a firehose**: starting a station (or clicking
+the Pandora tab's **＋ Queue N more** button) pulls exactly
+`PANDORA_QUEUE_SIZE` tracks (default **10**) into the queue and then stops.
+When the batch has played and you want more, go back to the Pandora tab and
+click the button for another 10. It never auto-refills.
+
+**Enable it** in `config.py` (server machine only): set `PANDORA_ENABLED = True`
+(env: `MSYNC_PANDORA_ENABLED=1`), then add your account via `PANDORA_USERNAME`
+/ `PANDORA_PASSWORD` (or the `MSYNC_PANDORA_USERNAME` /
+`MSYNC_PANDORA_PASSWORD` env vars). Enabled with blank credentials runs in
+**mock mode**: three fake stations, tiny generated WAVs, same plumbing —
+handy for development without an account. The web UI's Pandora tab only
+appears while Pandora is enabled.
+
+`PANDORA_QUEUE_SIZE` (env: `MSYNC_PANDORA_QUEUE_SIZE`, default `10`) sets how
+many songs each batch downloads — both the initial one when you start a
+station and every later "Queue N more" click.
+
+**Playback needs ffmpeg.** Pandora streams are AAC, which the server's decoder
+can't read, so every download is transcoded in place to FLAC the moment it
+lands (the server keeps the folder looking clean — just the playable FLACs).
+Install it with `sudo apt install ffmpeg`; without it the radio still
+downloads, but nothing will decode and the Pandora tab shows a warning
+banner.
+
+**Storing your credentials without leaking them.** `config.py` is tracked in
+git (and this repo has a remote), so a password typed there must never reach a
+commit. Safe local setup — run once on the server machine, then type the
+credentials straight into `config.py`:
+
+```bash
+./tools/setup-msync-secret-filter.sh   # installs a per-clone git "clean" filter
+```
+
+The filter rewrites `PANDORA_USERNAME` / `PANDORA_PASSWORD` lines to their
+env-var form **every time you stage** (`git add`) — committed git never sees
+the values, only this machine's working tree does. Nothing is configured via
+the remote repo, so other clones are unaffected. Verify with:
+
+```bash
+git add config.py && git diff --cached   # creds shown scrubbed, never real
+```
+
+Alternative without a filter: keep the env-var lines and set
+`MSYNC_PANDORA_USERNAME` / `MSYNC_PANDORA_PASSWORD` in the service
+environment (e.g. a root-only systemd `EnvironmentFile`). Either way, restart
+the service after changing credentials:
+
+```bash
+sudo systemctl restart msync-server
+```
+
+**Pick a station** either from the server console or the HTTP API:
+
+```bash
+# on the server console
+pandora stations            # list stations
+pandora "Deep Cuts Rock"    # queue a batch (default 10) from a station, then stop
+pandora more                # queue another batch for the current station
+pandora                     # status: station, downloaded, queued
+pandora stop                # stop fetching (already-downloaded tracks keep playing)
+
+# or over HTTP from anywhere on the network
+curl http://<server-ip>:10770/api/pandora/stations
+curl -X POST -d '{"station":"Lite Pop"}' http://<server-ip>:10770/api/pandora/play
+curl -X POST http://<server-ip>:10770/api/pandora/more   # another batch
+curl http://<server-ip>:10770/api/pandora          # status
+curl -X POST http://<server-ip>:10770/api/pandora/stop
+```
+
+Downloads land in a folder named `Pandora - <Station>`, so they show up in
+the web UI's Library as an album you can browse, play, or queue like any
+other. Once a batch finishes, downloads stop until you ask for another —
+the **Pandora tab** in the web UI has a status card (connected / station /
+downloaded / queued) and a station list: click any station to queue its first
+batch, then use the **＋ Queue N more** button whenever you want another.
+The queue and now-playing header work exactly like any other tracks.
+
+**Standalone CLI** (for testing the pipeline without the server):
+
+```bash
+./venv/bin/python msync_pandora.py --mock --list-stations
+./venv/bin/python msync_pandora.py --mock --harvest "Lite Pop" 6
+./venv/bin/python msync_pandora.py --mock --serve "Deep Cuts Rock" --duration 30
+```
+
+The thread shares nothing with the audio/sync/catalog threads — the server
+only injects two callbacks (`queued()` / `submit(path)`).
+
+> Note: `pandora_blowfish.py` is GPLv3 (ported from the Kodi addon); the rest
+> of the Pandora code follows msync's license.
+
 ## The Configure tab — rooms with a slow audio path (HDMI, Bluetooth, …)
 
 If one room sounds **late** even though every client reports `err` ≈ 0ms, its
@@ -489,6 +589,9 @@ msync_client.py    the listener: downloads + syncs + plays (+ picks tracks)
 msync_catalog.py   the SQLite album/track catalog
 msync_inotify.py   watches the music folder and refreshes the catalog
 msync_common.py    shared sync protocol (you can ignore this)
+msync_pandora.py   Pandora radio thread (experimental; see the section above)
+pandora_api.py     Pandora tuner API client (ported from kodi-pandora-slim)
+pandora_blowfish.py Blowfish-ECB cipher used by pandora_api (GPLv3)
 make_test_music.py generates demo songs (--with-albums for sample albums)
 web/               the web UI (index.html + vendored sortable.min.js drag lib)
 music/             your music (config.MUSIC_DIR); sub-folders are albums
