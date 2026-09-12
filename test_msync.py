@@ -614,15 +614,47 @@ def test_next_while_stopped_does_not_start_playlist_song(server):
     assert server.song is None
 
 
-def test_next_while_playing_still_advances_playlist(server):
-    """Pressing next during active playback with an empty queue still
-    advances the alphabetically-ordered playlist — only a paused/stopped
-    advance goes idle."""
+def test_next_with_empty_queue_stops_playback(server):
+    """'next' with an empty pending queue idles the server even during
+    active playback — a track that wasn't queued never plays. The current
+    song fades out (the audio callback's pause path) before it's dropped."""
     assert server.playing
     assert server.queue_list() == []
     res = server.next()
-    assert res["source"] == "playlist"
-    assert server.song.name == "track_02_B494.wav"
+    assert res["source"] == "stopped"
+    assert server.playing is False
+    wait_until(lambda: server.song is None)      # fade block played, track dropped
+    assert server.queue_list() == []
+
+
+def test_prev_restarts_current_track(server):
+    """'previous' rewinds the currently playing track to the beginning; it
+    never navigates the library or the queue."""
+    assert server.playing
+    before = server.song.name
+    with server.lock:
+        server.local_pos = 7.5
+        server.seek = 7.5
+        server.song_start = C.ts() - 7.5
+    res = server.prev()
+    assert res["source"] == "restart"
+    assert res["file"] == before
+    assert server.song.name == before      # same track, not the "previous"
+    assert server.local_pos == 0.0
+    assert server.seek == 0.0
+    assert server.playing is True          # still playing, just rewound
+    assert abs((C.ts() - server.song_start) - 0.0) < 0.5
+
+
+def test_prev_when_idle_is_stopped(server):
+    """'previous' with no current song leaves the server idle."""
+    server.next()                          # empty queue -> goes idle (fade)
+    wait_until(lambda: server.song is None)
+    res = server.prev()
+    assert res["source"] == "stopped"
+    assert res["file"] is None
+    assert server.song is None
+    assert server.playing is False
 
 
 def test_queue_case_insensitive_lookup(server):
@@ -1505,8 +1537,27 @@ def test_client_queue_add(client):
 
 
 def test_client_next_song(client):
-    name = client.client.next_song()
-    assert name == "track_02_B494.wav"
+    """Playing track_01 with nothing queued: 'next' idles the server —
+    no track that wasn't queued ever plays."""
+    assert client.client.next_song() is None
+
+
+def test_client_next_starts_queued_song(client):
+    """Queue two songs while the current track is still playing, then
+    'next' starts the first of them."""
+    client.client.queue_add("track_02_B494.wav")
+    client.client.queue_add("track_03_C554.wav")
+    wait_until(lambda: client.client.queue_size >= 2)
+    assert client.client.next_song() == "track_02_B494.wav"
+
+
+def test_client_prev_restarts_current_track(client):
+    """The client's prev() rewinds the current track to the beginning."""
+    assert client.client.buffer.name == "track_01_A440.wav"
+    d = client.client.prev_song()
+    assert d and d["source"] == "restart"
+    assert d["file"] == "track_01_A440.wav"
+    assert client.client.buffer.name == "track_01_A440.wav"
 
 
 def test_client_set_volume(client):

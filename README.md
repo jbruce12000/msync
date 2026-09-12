@@ -247,8 +247,8 @@ HTTP.
 | Key / command | What it does |
 |---|---|
 | `space` | play / pause |
-| `n` | next song (plays anything in the queue first) |
-| `p` | previous song |
+| `n` | next song (anything queued plays first; idle if the queue is empty) |
+| `p` | restart the current track from the beginning |
 | `+` / `-` | louder / quieter |
 | `add <name>` | add a song to the play queue |
 | `queue` | show what's queued |
@@ -304,7 +304,7 @@ from the web UI instead). While a client is running in a terminal, type:
 | `add "song.mp3"` | add a song to the queue |
 | `add "Album Name"` | queue every track in the album |
 | `pause` / `resume` | pause or resume everyone |
-| `next` / `prev` | skip forward / back |
+| `next` / `prev` | next queued song / restart the current track (idle when the queue is empty / nothing playing) |
 | `vol 0.7` | set volume (0.0 – 1.5) |
 | `latency 120` | tune this room's output-latency offset live (ms); the web UI's Configure tab saves it permanently |
 | `queue` | show what's queued |

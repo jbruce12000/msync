@@ -142,6 +142,10 @@ class SyncedServer:
         # new track fades in so loud song starts and ends don't click.
         self._prev_playing = False
         self._last_buffer_name = None
+        # Forced stop mid-song ('next' with an empty queue): the audio
+        # callback's pause path fades out the current block; once it has, the
+        # monitor loop clears the song. Mirrors the natural end-of-song idle.
+        self._stopping_mid_song = False
 
         # Pandora radio service (server only). Constructed here — wired to the
         # server queue via the _pandora_* callbacks below — only when it is
@@ -258,6 +262,7 @@ class SyncedServer:
         self._pid_int = 0.0
         self._pid_prev = 0.0
         self.err_f = 0.0
+        self._stopping_mid_song = False
         # Publish the song ref LAST: the audio callback reads it without the
         # lock, so it either sees the fully-updated old state or the fully-
         # updated new state (at most one torn block at a track swap).
@@ -271,9 +276,10 @@ class SyncedServer:
         self._persist_playback()
 
     def _start_next(self):
-        """Pop the next thing to play from the queue, else advance the
-        alphabetical playlist. Albums in the queue play their tracks one at
-        a time; the album entry shrinks until it's exhausted, then pops."""
+        """Pop the next thing to play from the queue. Albums in the queue
+        play their tracks one at a time; the album entry shrinks until it's
+        exhausted, then pops. An empty queue leaves the server idle —
+        nothing outside the queue ever plays."""
         with self.lock:
             self.seek = 0.0
             while self.queue:
@@ -295,25 +301,26 @@ class SyncedServer:
                 self._play(entry["path"], announce="queue")
                 self._persist_queue()
                 return {"source": "queue", "file": entry["relpath"]}
-            if not self.playing:
-                # Nothing is actively playing and the queue is empty: an
-                # advance (the web UI's ✕ on the now-playing slot, or 'next'
-                # while stopped) must leave the server idle rather than start
-                # an arbitrary playlist track the user didn't ask for.
+            # The queue is the only source of played audio. When it runs dry,
+            # playback ends (idle): 'next' while actively playing, the web
+            # UI's ✕ on the now-playing slot, and the end-of-song monitor
+            # must never fall through into the alphabetical whole-library
+            # playlist — a track that wasn't queued never plays.
+            if self.song is not None and self.playing:
+                # Forced stop mid-song: flip playback off and let the audio
+                # callback's pause path emit one short faded block so the cut
+                # to silence doesn't click. The monitor loop clears the song
+                # once that block has run (after exactly one block
+                # _prev_playing flips back to False).
+                self.playing = False
+                self._stopping_mid_song = True
+                self._persist_playback()
+            else:
                 if self.song is not None:
                     self._clear_playback()
                 self.song = None
                 self.local_pos = 0.0
-                return {"source": "stopped", "file": None}
-            if not self.playlist:
-                # Every track was removed while running: nothing to advance to.
-                self._clear_playback()
-                self.song = None
-                self.local_pos = 0.0
-                return {"source": "stopped", "file": None}
-            self.index = (self.index + 1) % len(self.playlist)
-            self._play(self.playlist[self.index], announce="playlist")
-            return {"source": "playlist", "file": self.song.name}
+            return {"source": "stopped", "file": None}
 
     def _song_entries(self, files):
         """Build song entries from a list of absolute file paths, skipping
@@ -937,6 +944,15 @@ class SyncedServer:
                             self.playing = False
                             self.song = None
                             self._persist_playback()
+                    # Finish an idle-from-mid-song transition ('next' with an
+                    # empty queue) now that the audio callback has emitted its
+                    # one faded block (_prev_playing has flipped back to False).
+                    if (self._stopping_mid_song and not self._prev_playing
+                            and self.song is not None):
+                        self._stopping_mid_song = False
+                        self._clear_playback()
+                        self.song = None
+                        self.local_pos = 0.0
                     # Track where we are so a restart resumes the same song at
                     # roughly the same position (also covers clean shutdowns).
                     if self.song is not None and time.time() - last_playback >= 5.0:
@@ -1020,13 +1036,25 @@ class SyncedServer:
         return self._start_next()
 
     def prev(self):
+        """Restart the currently playing track from its beginning. 'Previous'
+        never navigates the library or the queue — it just rewinds the song
+        that is on now."""
         with self.lock:
-            if not self.playlist:
+            if self.song is None:
                 return {"source": "stopped", "file": None}
+            self.local_pos = 0.0
             self.seek = 0.0
-            self.index = (self.index - 1) % len(self.playlist)
-            self._play(self.playlist[self.index], announce="playlist")
-            return {"source": "playlist", "file": self.song.name}
+            self.song_start = C.ts()
+            # A fresh restart invalidates stale drift/PLL alignment.
+            self._pitch_int = 0.0
+            self._pid_int = 0.0
+            self._pid_prev = 0.0
+            self.err_f = 0.0
+            if self.playlist:
+                self.index = max(0, self._index_of(self._abs(self.song.name)))
+            self._persist_playback()
+            C.logger().info("restart: %s", self.song.name)
+            return {"source": "restart", "file": self.song.name}
 
     def play_song(self, name):
         """Play immediately by name or album name (case-insensitive). A plain

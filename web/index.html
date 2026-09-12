@@ -835,7 +835,7 @@ async function queueRemove(index) {
 function removeNowPlaying() {
     // The current track is never in the pending queue (it's popped before
     // playback starts), so removing it means skipping it: the next queued
-    // song starts, or the next playlist track if the queue is empty — the
+    // song starts, or the server goes idle if the queue is empty — the
     // same as when a track ends naturally.
     api('POST', '/api/control/next');
 }
