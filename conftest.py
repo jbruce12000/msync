@@ -238,6 +238,10 @@ class ClientHarness:
                 with self.client.lock:
                     self.client.queue = list(body.get("queue", []))
                     self.client.queue_size = len(self.client.queue)
+            elif ptype == C.TYPE_START_ACK:
+                # Quorum consensus for the current track start (same as the
+                # production run() loop): adopt the agreed clock offset.
+                self.client._apply_start_ack(body)
             time.sleep(0.02)
 
     def stop(self):

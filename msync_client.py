@@ -351,6 +351,20 @@ class SyncClient:
         self.lock = threading.RLock()
         self.playing = False
         self.server_song_start = 0.0   # server wall time song started
+        self._epoch = 0                # server's track-start counter (in SYNC)
+        # Fresh-track-start quorum. When a new track (or a restart) starts,
+        # every connected room casts an "offset vote" for the server's round;
+        # the server closes the round with the consensus offset (median of the
+        # voters' NTP estimates) and broadcasts it as TYPE_START_ACK. Each room
+        # then lays the playhead onto the server timeline with that SAME
+        # consensus offset, so the song opening is ONE shared start instead of
+        # each room's own estimate — bang-bang (and the PLL generally) sees a
+        # single small bias on the first blocks instead of per-room jitter.
+        self._consensus_offset_ms = None   # quorum offset (ms) for the epoch
+        self._consensus_for_epoch = None   # epoch that offset belongs to
+        self._vote_round_epoch = None      # epoch whose round we are voting in
+        self._vote_until = 0.0             # when our vote round closes (local)
+        self._last_vote = 0.0              # last time we cast a vote
         self.local_pos = 0.0           # local playhead (seconds)
         # Anchor for the err / PLL reference. `err` must never be computed by
         # comparing `local_pos` against a *fresh* `server_now() - song_start`
@@ -749,6 +763,76 @@ class SyncClient:
             self._fade_out = False
 
     # ------------------------------------------------------------------ #
+    def _note_epoch(self, epoch):
+        """React to the server's track-start counter (part of every SYNC):
+        when a new track (or restart) begins while we are connected, join its
+        fresh-start-quorum round so _anchor_offset() can use the consensus.
+        A client that first connects mid-song sees the current epoch without
+        it being a start: it simply tracks it (its own NTP offset anchors the
+        song, as before)."""
+        with self.lock:
+            if epoch == self._epoch:
+                return
+            if self._epoch != 0:
+                self._vote_round_epoch = epoch
+                self._vote_until = time.time() + C.START_ROUND_SEC
+                self._last_vote = 0.0
+            self._epoch = epoch
+            # A consensus only applies to its own start: forget a stale one
+            # until the server agrees this round.
+            self._consensus_for_epoch = None
+            self._consensus_offset_ms = None
+
+    # ------------------------------------------------------------------ #
+    def _anchor_offset(self, epoch):
+        """The clock offset to use when laying the playhead onto the server
+        timeline: the quorum consensus the server agreed at track start where
+        one exists, else this room's own NTP estimate. Every room using the
+        SAME consensus offset anchors a new song at the SAME content position,
+        killing the per-room +-10ms+ start jitter that used to bang the pitch
+        rail right on song open."""
+        if (self._consensus_for_epoch == epoch
+                and self._consensus_offset_ms is not None):
+            return self._consensus_offset_ms / 1000.0
+        return self.clock.offset
+
+    # ------------------------------------------------------------------ #
+    def _apply_start_ack(self, body):
+        """Apply the server's quorum consensus for a track start: the agreed
+        clock offset for `epoch`, used by _anchor_offset() on song open."""
+        ack_epoch = body.get("epoch")
+        ack_offset = body.get("offset_ms")
+        if ack_epoch is None or ack_offset is None:
+            return
+        with self.lock:
+            if ack_epoch == self._epoch:
+                self._consensus_offset_ms = float(ack_offset)
+                self._consensus_for_epoch = ack_epoch
+
+    # ------------------------------------------------------------------ #
+    def _maybe_vote(self, sock):
+        """Cast our offset vote for the open track-start round (called every
+        run() loop turn). The server keeps the last vote per room and closes
+        the round with the consensus once a quorum has voted or its deadline
+        passes. A dropped vote is harmless: the round closes by deadline or
+        the room falls back to its own NTP estimate."""
+        now = time.time()
+        if self._vote_round_epoch is None or now >= self._vote_until:
+            self._vote_round_epoch = None
+            return
+        if now - self._last_vote < C.START_VOTE_INTERVAL:
+            return
+        self._last_vote = now
+        try:
+            sock.sendto(C.make_packet(C.TYPE_START_VOTE,
+                                      epoch=self._vote_round_epoch,
+                                      offset_ms=round(self.clock.offset * 1000.0,
+                                                     3)),
+                        (self.host, self.port))
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------ #
     def _rebase(self):
         """Pin the PLL's target reference to the just-committed playhead.
 
@@ -782,6 +866,14 @@ class SyncClient:
             song_start = st.get("song_start", 0.0)
             duration = st.get("duration", 0.0)
             self.queue_size = st.get("queue_size", self.queue_size)
+            # Fresh track start? The server bumps `epoch` on every new track
+            # (and restart): join its start-quorum round so every room anchors
+            # this song at the same consensus start time. The LOCAL `epoch`
+            # stays bound to this state all the way down to the adopt site:
+            # a newer sync arriving mid-download must not re-anchor this
+            # track against the newer track's consensus.
+            epoch = st.get("epoch", self._epoch)
+            self._note_epoch(epoch)
 
             same_song = (not name or name == self.buffer.name)
             stream_cmd = None
@@ -795,8 +887,8 @@ class SyncClient:
                 if playing != self.playing:
                     self.playing = playing
                     if playing:
-                        self.local_pos = max(0.0,
-                                             self.clock.server_now() - song_start)
+                        self.local_pos = max(
+                            0.0, C.ts() + self._anchor_offset(epoch) - song_start)
                         self._rebase()
                     # A fresh rebase (or a long pause) invalidates the old
                     # integral: stale windup keeps drift_pitch pinned at
@@ -821,8 +913,8 @@ class SyncClient:
                     # to the new song_start so this room doesn't keep playing
                     # the pre-seek position (a stale `_base_pos` would hold the
                     # err reference on the old timeline).
-                    self.local_pos = max(0.0,
-                                         self.clock.server_now() - song_start)
+                    self.local_pos = max(
+                        0.0, C.ts() + self._anchor_offset(epoch) - song_start)
                     self._rebase()
                     self._pitch_int = 0.0
                     self._pid_int = 0.0
@@ -885,7 +977,8 @@ class SyncClient:
                 scratch.close()     # discard: a newer track superseded this one
                 return
             self.server_song_start = song_start
-            self.local_pos = max(0.0, self.clock.server_now() - song_start)
+            self.local_pos = max(
+                0.0, C.ts() + self._anchor_offset(epoch) - song_start)
             self._rebase()
             self._pitch_int = 0.0          # fresh rebase: drop stale windup
             self._pid_int = 0.0            # ... and the PID integral state
@@ -1151,6 +1244,10 @@ class SyncClient:
                         with self.lock:
                             self._volume = max(0.0, min(1.5, vol))
                             self._muted = muted
+                    elif ptype == C.TYPE_START_ACK:
+                        # Quorum consensus for the current track start: the
+                        # agreed clock offset every room will anchor with.
+                        self._apply_start_ack(body)
                 except socket.timeout:
                     pass
                 except Exception as exc:
@@ -1163,6 +1260,9 @@ class SyncClient:
 
                 now = time.time()
                 ntp_int = C.NTP_INTERVAL if self.playing else C.IDLE_NTP_INTERVAL
+                # Cast our offset vote for the open track-start round (no-op
+                # unless a fresh track/restart just began).
+                self._maybe_vote(sock)
                 # How long a server is allowed to go silent before we call it
                 # lost. Sync lands every SYNC_INTERVAL (0.05s) while playing
                 # but only every IDLE_SYNC_INTERVAL (10s) when paused, so the

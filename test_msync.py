@@ -37,6 +37,22 @@ def test_latency_packet_roundtrip():
     assert body["ms"] == 75
 
 
+def test_start_vote_packet_roundtrip():
+    p = C.make_packet(C.TYPE_START_VOTE, epoch=4, offset_ms=12.5)
+    ptype, body = C.parse_packet(p)
+    assert ptype == C.TYPE_START_VOTE
+    assert body["epoch"] == 4
+    assert body["offset_ms"] == 12.5
+
+
+def test_start_ack_packet_roundtrip():
+    p = C.make_packet(C.TYPE_START_ACK, epoch=4, offset_ms=-3.75)
+    ptype, body = C.parse_packet(p)
+    assert ptype == C.TYPE_START_ACK
+    assert body["epoch"] == 4
+    assert body["offset_ms"] == -3.75
+
+
 # --------------------------------------------------------------------------- #
 # Stereo playback (server + client)                                            #
 # --------------------------------------------------------------------------- #
@@ -2127,3 +2143,245 @@ def test_client_pid_active_inside_window(client, monkeypatch):
     with h.lock:
         assert h._mode == "BANG"
         assert h.drift_pitch == C.MAX_PITCH         # railed to +2000ppm
+
+
+# --------------------------------------------------------------------------- #
+# Fresh-track-start quorum                                                     #
+#                                                                              #
+# A track (or restart) opens a short round where every room casts an "offset   #
+# vote" (its NTP estimate of the server clock). The server closes the round    #
+# once a quorum of distinct rooms has voted or the deadline passes, and        #
+# broadcasts the consensus (median offset) as TYPE_START_ACK. Every room then  #
+# anchors the new song with that SAME offset, so bang-bang never sees a big    #
+# per-room start error on the song's first blocks (the source of the           #
+# start-of-song clicks the pure-PI default was hiding).                        #
+# --------------------------------------------------------------------------- #
+def _quorum_server(tmp_path, port=9937):
+    """A bare SyncedServer (no udp_loop/HTTP threads) for deterministic round
+    bookkeeping tests."""
+    import msync_server as MS
+    return MS.SyncedServer(MUSIC, port, str(tmp_path / "quorum.db"))
+
+
+def _scanned_then_closed(srv):
+    """Let the background catalog scan finish, then close its catalog (the
+    scan thread keeps a handle open, so closing early errors/logs)."""
+    srv._scan_done.wait(timeout=10.0)
+    srv.catalog.close()
+
+
+def test_server_start_round_closes_with_quorum_median(tmp_path):
+    srv = _quorum_server(tmp_path)
+    try:
+        srv._note_start_vote("10.0.0.1", 0, 5.0)
+        assert srv._check_start_round() is None       # still collecting
+        srv._note_start_vote("10.0.0.2", 0, -7.0)
+        # quorum (2 distinct rooms) reached: the round closes immediately and
+        # the consensus is the median of the votes
+        assert srv._check_start_round() == (0, -1.0)
+        assert srv._start_round is None               # ...and only once
+        assert srv._check_start_round() is None
+    finally:
+        _scanned_then_closed(srv)
+
+
+def test_server_start_round_keeps_last_vote_per_room(tmp_path):
+    # A room that re-votes during the round only counts once (last vote wins),
+    # so a single flaky sample can't dominate the median.
+    srv = _quorum_server(tmp_path)
+    try:
+        srv._note_start_vote("10.0.0.1", 0, 3.0)
+        srv._note_start_vote("10.0.0.1", 0, 9.0)      # same room re-votes
+        srv._note_start_vote("10.0.0.2", 0, -1.0)
+        assert srv._check_start_round() == (0, 4.0)   # median(9, -1)
+    finally:
+        _scanned_then_closed(srv)
+
+
+def test_server_start_round_ignores_stale_and_malformed_votes(tmp_path):
+    # The udp_loop always hands over a real source IP; only the epoch and the
+    # offset can be bad.
+    srv = _quorum_server(tmp_path)
+    try:
+        srv._note_start_vote("10.0.0.1", 999, 5.0)    # a different epoch
+        srv._note_start_vote("10.0.0.2", 0, None)     # missing offset
+        assert srv._start_round is None
+    finally:
+        _scanned_then_closed(srv)
+
+
+def test_server_start_round_closes_by_deadline(tmp_path):
+    # A single room can't reach the quorum: the round still closes when the
+    # START_ROUND_SEC deadline passes (a 1-room house must not stall).
+    srv = _quorum_server(tmp_path)
+    try:
+        srv._note_start_vote("10.0.0.1", 0, 3.0)
+        assert srv._check_start_round() is None       # no quorum, no deadline
+        with srv.lock:
+            srv._start_round["deadline"] = C.ts() - 0.01   # force the deadline
+        assert srv._check_start_round() == (0, 3.0)
+    finally:
+        _scanned_then_closed(srv)
+
+
+def test_server_broadcasts_start_ack_over_udp(server):
+    """The udp_loop turns a vote into a broadcast consensus ACK (round closes
+    by deadline with a single voter)."""
+    import socket as _socket
+    ep = server._epoch
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    s.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
+    try:
+        s.bind(("", server.port))
+        s.settimeout(0.25)
+        for _ in range(3):
+            s.sendto(C.make_packet(C.TYPE_START_VOTE, epoch=ep, offset_ms=11.0),
+                     ("255.255.255.255", server.port))
+            time.sleep(0.1)
+        got = None
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            try:
+                data, _ = s.recvfrom(4096)
+            except _socket.timeout:
+                continue
+            p = C.parse_packet(data)
+            if p and p[0] == C.TYPE_START_ACK and p[1].get("epoch") == ep:
+                got = p[1]
+                break
+        assert got is not None, "no TYPE_START_ACK broadcast"
+        assert got["offset_ms"] == 11.0
+    finally:
+        s.close()
+
+
+# --------------------------- client side ---------------------------------- #
+def _qclient(tmp_path):
+    """A bare SyncClient (no run() loop) for quorum bookkeeping tests."""
+    import msync_client as MC
+    return MC.SyncClient("127.0.0.1", 1, str(tmp_path))
+
+
+def test_client_note_epoch_arms_vote_round(tmp_path):
+    c = _qclient(tmp_path)
+    try:
+        c._note_epoch(1)              # first-ever epoch (fresh boot / join
+        assert c._epoch == 1          # mid-song): tracked, not voted
+        assert c._vote_round_epoch is None
+        c._note_epoch(2)              # a connected room sees a fresh start
+        assert c._epoch == 2
+        assert c._vote_round_epoch == 2
+        assert c._vote_until > time.time()
+        assert c._last_vote == 0.0
+        c._note_epoch(2)              # steady state: no re-arm, no reset
+        assert c._vote_round_epoch == 2
+    finally:
+        c.buffer.close()
+
+
+def test_client_start_ack_sets_consensus_for_current_epoch(tmp_path):
+    c = _qclient(tmp_path)
+    try:
+        c._note_epoch(1)
+        c._apply_start_ack({"epoch": 1, "offset_ms": -4.25})
+        assert c._consensus_for_epoch == 1
+        assert c._consensus_offset_ms == -4.25
+        # an ACK for an epoch that isn't current is ignored
+        c._apply_start_ack({"epoch": 2, "offset_ms": 99.0})
+        assert c._consensus_for_epoch == 1
+        assert c._consensus_offset_ms == -4.25
+        # malformed ACKs are safe no-ops
+        c._apply_start_ack({})
+        assert c._consensus_for_epoch == 1
+    finally:
+        c.buffer.close()
+
+
+def test_client_anchor_offset_prefers_quorum_consensus(tmp_path):
+    c = _qclient(tmp_path)
+    try:
+        c._note_epoch(3)
+        own = c.clock.offset
+        assert c._anchor_offset(3) == own        # no consensus yet: own NTP
+        assert c._anchor_offset(4) == own        # other epoch: own NTP
+        c._apply_start_ack({"epoch": 3, "offset_ms": 25.0})
+        assert c._anchor_offset(3) == 0.025      # consensus wins for its epoch
+        assert c._anchor_offset(4) == own        # ...but only for its epoch
+    finally:
+        c.buffer.close()
+
+
+def test_client_maybe_vote_sends_start_vote(tmp_path):
+    c = _qclient(tmp_path)
+    try:
+        c._note_epoch(1)
+        c._note_epoch(2)                          # open a vote round
+        sent = []
+
+        class FakeSock:
+            def sendto(self, data, addr):
+                sent.append((data, addr))
+
+        fake = FakeSock()
+        c._maybe_vote(fake)
+        assert len(sent) == 1, "one vote per interval"
+        ptype, body = C.parse_packet(sent[0][0])
+        assert ptype == C.TYPE_START_VOTE
+        assert body["epoch"] == 2
+        assert abs(body["offset_ms"] - c.clock.offset * 1000.0) < 0.01
+        assert sent[0][1] == (c.host, c.port)
+        c._maybe_vote(fake)                       # rate-limited: no second
+        assert len(sent) == 1
+        c._vote_until = time.time() - 1.0         # round expired
+        c._maybe_vote(fake)
+        assert len(sent) == 1
+        assert c._vote_round_epoch is None
+    finally:
+        c.buffer.close()
+
+
+def test_start_quorum_round_trip(server, client, monkeypatch):
+    """The whole wire protocol for a fresh-track start: the room votes, the
+    server closes the round with a consensus, and the room anchors with it."""
+    monkeypatch.setattr(C, "START_ROUND_SEC", 2.0)   # generous voting window
+    c = client.client
+    ep_before = server._epoch
+    server.add_to_queue(["track_02_B494.wav"])
+    server.next()
+    ok = wait_until(lambda: server.song is not None
+                    and server.song.name == "track_02_B494.wav"
+                    and server._epoch >= ep_before + 1,
+                    timeout=5.0, label="second track starting")
+    assert ok, "server never started the second track"
+    ep2 = server._epoch
+    wait_until(lambda: c._vote_round_epoch == ep2, timeout=5.0,
+               label="room joined start round")
+    # Cast votes through the room's own socket exactly like run() does, until
+    # the round closes (deadline) and the consensus ACK is applied. The test
+    # harness co-locates the client and server on one host, both bound to the
+    # same port (SO_REUSEADDR), and Linux delivers a loopback unicast to the
+    # LAST socket bound — so a plain unicast vote would be swallowed by the
+    # room's own socket and never reach the server. Production runs each room
+    # on its own host, where the unicast lands on the server normally. The
+    # wrapper only rewrites the transmit ADDRESS to the broadcast group; the
+    # vote logic (packet, epoch, cadence) is the real _maybe_vote() path.
+    class BroadcastSock:
+        def __init__(self, sock):
+            self._sock = sock
+
+        def sendto(self, data, addr):
+            return self._sock.sendto(data, ("255.255.255.255", addr[1]))
+
+    bcast = BroadcastSock(client.sock)
+    t0 = time.time()
+    while time.time() - t0 < 0.7:
+        c._maybe_vote(bcast)
+        time.sleep(0.05)
+    ok = wait_until(lambda: c._consensus_for_epoch == ep2, timeout=6.0,
+                    label="room applied consensus ACK")
+    assert ok, "consensus ACK never applied"
+    assert c._consensus_offset_ms is not None
+    # single room: the consensus is its own (rounded) NTP offset
+    assert abs(c._consensus_offset_ms
+               - round(c.clock.offset * 1000.0, 3)) < 5.0

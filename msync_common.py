@@ -61,6 +61,14 @@ TYPE_PROBE     = 6   # client -> server discovery probe; server answers unicast
 TYPE_STATE     = 7   # server broadcast (1 Hz): full state incl. queue list
 TYPE_LATENCY   = 8   # server -> client: set output-latency offset (ms)
 TYPE_VOLUME    = 9   # server -> client: set this room's volume (0..1.5) + mute
+TYPE_START_VOTE = 10 # client -> server: offset vote for the fresh-track-start
+                     # quorum (epoch, offset_ms) — each room offers its current
+                     # NTP offset estimate when a new track (re)starts
+TYPE_START_ACK  = 11 # server -> all: agreed (consensus) clock offset for the
+                     # epoch that just started (epoch, offset_ms): the median of
+                     # the voters' estimates, used to anchor everyone to the
+                     # SAME start time so bang-bang (and the whole suite) hears
+                     # a clean song opening instead of per-room start jitter
 
 DEFAULT_PORT = 9770
 SYNC_INTERVAL = 0.05        # server sync broadcast period (s) = 20 Hz
@@ -75,6 +83,18 @@ REGISTER_INTERVAL = 10.0    # client re-registration period (s): keeps the
 IDLE_SYNC_INTERVAL  = 10.0  # server sync broadcast period when paused/stopped
 IDLE_STATE_INTERVAL = 10.0  # server state broadcast period when paused/stopped
 IDLE_NTP_INTERVAL   = 10.0  # client NTP resync period when paused/stopped
+
+# Fresh-track-start quorum. A track (or restart) opens a short round where every
+# client reports its NTP offset estimate; the server closes the round with the
+# median of the voters' estimates (a consensus start time) once START_QUORUM
+# distinct rooms have voted or the deadline passes, then broadcasts
+# TYPE_START_ACK. All rooms then anchor the new track to that SAME offset, so
+# the initial playhead error right at the beginning of a song is one shared
+# bias instead of each room's own (often +-10ms+) estimate — bang-bang stays
+# inside its error window instead of slamming the pitch rail on song open.
+START_ROUND_SEC    = 0.6    # how long the server collects offset votes (s)
+START_QUORUM       = 2      # distinct voters that close the round early
+START_VOTE_INTERVAL = 0.1   # client vote cadence while the round is open (s)
 
 # Playback tuning
 LATENCY_SEC   = 0.20        # client start latency per song (schedule ahead)

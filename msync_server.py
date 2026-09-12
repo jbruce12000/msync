@@ -21,8 +21,8 @@ Usage:
     msync_server.py [music_dir] [--port N]
 
 Controls (stdin/HTTP):
-    space      : play/pause          n : next (queue first, then playlist)
-    p          : prev                q : quit
+    space      : play/pause          n : next (queue first; idle if queue empty)
+    p          : prev (restart current track)   q : quit
     +/-        : volume
     add <name|glob...> : queue songs (e.g. add "Foo.mp3" or "add *.wav")
     queue      : show the queue      clear : empty the queue
@@ -38,6 +38,7 @@ import glob
 import json
 import os
 import socket
+import statistics
 import threading
 import time
 import urllib.parse
@@ -146,6 +147,17 @@ class SyncedServer:
         # callback's pause path fades out the current block; once it has, the
         # monitor loop clears the song. Mirrors the natural end-of-song idle.
         self._stopping_mid_song = False
+
+        # Fresh-track-start quorum. Every _play() bumps `epoch`; the epoch is
+        # broadcast in every SYNC payload so clients can recognise a fresh
+        # track (or restart). Each client then casts an offset vote
+        # (TYPE_START_VOTE); once a quorum has voted or the round deadline
+        # passes we close it with the median offset and broadcast the
+        # consensus (TYPE_START_ACK) so every room anchors the song at the
+        # SAME start time (no per-room start jitter -> click-free bang-bang
+        # on song open).
+        self._epoch = 0               # track-start counter for the quorum
+        self._start_round = None      # {epoch, votes{ip: ms}, deadline}
 
         # Pandora radio service (server only). Constructed here — wired to the
         # server queue via the _pandora_* callbacks below — only when it is
@@ -258,6 +270,7 @@ class SyncedServer:
         self.song_start = C.ts() - self.seek
         self.local_pos = self.seek
         self.playing = True
+        self._epoch += 1              # fresh track (or restart): new start round
         self._pitch_int = 0.0      # fresh track: fresh alignment state
         self._pid_int = 0.0
         self._pid_prev = 0.0
@@ -1183,7 +1196,43 @@ class SyncedServer:
                 "duration": self.song.duration if self.song else 0.0,
                 "volume": self.volume,
                 "queue_size": len(self.queue_list()),
+                "epoch": self._epoch,
             }
+
+    def _note_start_vote(self, ip, epoch, offset_ms):
+        """Record one room's clock-offset estimate for the current track-start
+        round (the quorum). Only votes for the track that is actually starting
+        count; anything else (a stale round) is ignored."""
+        if offset_ms is None:
+            return
+        with self.lock:
+            if epoch != self._epoch:
+                return
+            if self._start_round is None \
+                    or self._start_round["epoch"] != epoch:
+                self._start_round = {
+                    "epoch": epoch,
+                    "votes": {},
+                    "deadline": C.ts() + C.START_ROUND_SEC,
+                }
+            self._start_round["votes"][ip] = float(offset_ms)
+
+    def _check_start_round(self):
+        """Close the open start round once a quorum of rooms has voted or the
+        deadline passes; returns (epoch, offset_ms) to broadcast as the
+        TYPE_START_ACK consensus, else None while still collecting."""
+        with self.lock:
+            r = self._start_round
+            if r is None:
+                return None
+            if (C.ts() < r["deadline"]
+                    and len(r["votes"]) < C.START_QUORUM):
+                return None
+            self._start_round = None
+            if not r["votes"]:
+                return None
+            return (r["epoch"],
+                    round(statistics.median(r["votes"].values()), 3))
 
     def _state_payload(self):
         with self.lock:
@@ -1262,6 +1311,15 @@ class SyncedServer:
         while not self._stop.is_set():
             try:
                 t = C.ts()
+                # Track-start quorum: once the round's quorum has voted or its
+                # deadline passes, broadcast the consensus start offset to
+                # every room (clients only use it for the matching epoch).
+                round_done = self._check_start_round()
+                if round_done:
+                    epoch, offset_ms = round_done
+                    sock.sendto(C.make_packet(C.TYPE_START_ACK,
+                                              epoch=epoch,
+                                              offset_ms=offset_ms), bcast)
                 playing = self.playing
                 # A play/pause/stop transition must reach the rooms promptly:
                 # left to the idle cadence alone, a pause would sit unseen for
@@ -1336,6 +1394,10 @@ class SyncedServer:
                     # miss it and clients would fall back to 127.0.0.1.
                     sock.sendto(C.make_packet(C.TYPE_WELCOME,
                                               **self._sync_payload()), addr)
+                elif ptype == C.TYPE_START_VOTE:
+                    # Offset vote for the current track-start quorum round.
+                    self._note_start_vote(addr[0], body.get("epoch"),
+                                          body.get("offset_ms"))
             except socket.timeout:
                 continue
             except Exception as exc:
