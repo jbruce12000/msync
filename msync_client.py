@@ -410,6 +410,15 @@ class SyncClient:
         # instead of stepping the gain mid-sample.
         self._prev_playing = False
         self._last_buffer_name = None
+        # When an anchor (adopt/resume/seek) calls _rebase() from the run-loop
+        # thread, the base is pinned at an arbitrary wall instant BETWEEN
+        # PortAudio blocks. local_pos only steps once per block, so the true
+        # server timeline pulls ahead of the frozen playhead by up to one full
+        # block (~186ms at 8192 frames/44.1k) before the next callback. The
+        # callback advances the playhead and reference forward by that gap at
+        # the next block boundary (see _realign_on_next_cb); this flag says
+        # that advance is pending.
+        self._realign_on_next_cb = False
         self._gain_env = 1.0
         # If this room's audio path (HDMI -> TV/AVR, ...) delays the output
         # by OUTPUT_LATENCY_MS, play that far ahead of the synced playhead
@@ -574,6 +583,26 @@ class SyncClient:
                 resume_fade = True
             else:
                 resume_fade = False
+            # A rebase from the run-loop thread (track adopt / resume / seek) pinned
+            # the reference at an arbitrary instant BETWEEN PortAudio blocks,
+            # and local_pos can only advance inside a block — so since that
+            # anchor, the true server timeline has pulled ahead of the frozen
+            # playhead by up to one full block (~186ms at 8192 frames/44.1k).
+            # Snap BOTH the playhead and the reference forward by that gap at
+            # this block edge: the block then reads the CURRENT track content
+            # and err starts ~0, instead of a phantom lag that bang-bang rails
+            # to MAX_PITCH and catchup grinds away over the first seconds of
+            # the song (the start-of-song 100ms+ spike / click). This also
+            # absorbs a long adopt gap (e.g. an on-demand download+decode):
+            # the timeline kept running, so the playhead catches it in one
+            # block instead of chasing for a minute.
+            if self._realign_on_next_cb:
+                self._realign_on_next_cb = False
+                dt = ((C.ts() - self._base_clock)
+                      * (1.0 + self.clock.drift * 1e-6))
+                self.local_pos += dt
+                self._base_pos += dt
+                self._base_clock = C.ts()
             # Target position: pinned to the last rebase and advanced by the
             # local clock at the (NTP-measured) server clock rate, NOT
             # re-derived from a fresh `server_now() - song_start`. This bakes
@@ -844,9 +873,22 @@ class SyncClient:
         re-estimation into a spurious 100ms+ err right after a song switch.
         The NTP feedforward (`clock.drift`) still drives the rate; only the
         error *reference* is frozen here.
+
+        The pin is re-applied at the next audio block boundary (see
+        `_realign_on_next_cb` in the callback): this method runs in the
+        run-loop thread at an arbitrary wall instant between PortAudio
+        blocks, and `local_pos` only steps once per block — so between the
+        anchor and the next block the true server timeline has pulled ahead
+        of the frozen playhead by up to one full block (~186ms at the
+        8192-frame buffer). The callback advances BOTH the playhead and the
+        reference by that gap, so the post-anchor song starts at the current
+        content with err ~0 instead of a phantom lag that bang-bang rails to
+        MAX_PITCH and catchup grinds away over the first seconds (the
+        100ms+ start-of-song spike seen after a pause across a track change).
         """
         self._base_clock = C.ts()
         self._base_pos = self.local_pos
+        self._realign_on_next_cb = True
 
     # ------------------------------------------------------------------ #
     def _apply_state(self, st):
@@ -920,6 +962,17 @@ class SyncClient:
                     self._pid_int = 0.0
                     self._pid_prev = 0.0
                     self.err_f = 0.0
+                # Keep the NEXT track on deck even when this song hasn't
+                # changed (steady play, a long pause, or just after resume).
+                # The adopt path below also prefetches, but a same_song sync
+                # is the only sync that runs while a room sits paused on the
+                # last track of an old queue: if nothing re-predicts here, the
+                # next track's prefetch goes stale and the post-pause switch
+                # falls back to an on-demand download+decode on the audio
+                # thread — the run-loop decode then starves the callback for
+                # the whole transfer (that + the phase sawtooth is the
+                # 100ms+ start-of-song error on the 2nd track after a pause).
+                self._maybe_prefetch()
             elif self._loading_name == name or self._prefetching == name:
                 return                # already fetching this track (download or prefetch)
             prev_name = self.buffer.name    # how we tell a newer state "took over"

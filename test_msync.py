@@ -1213,10 +1213,19 @@ def test_client_callback_applies_volume_and_mute(client):
     # (a hard gain step is an audible click), so the "allclose" checks look at
     # the steady tail after the ramp window.
     h = client.client
+    wait_until(lambda: h.buffer.data is not None
+               and h.buffer.duration > 1.0 and h.stream is not None)
+    with C.stream_ops_lock:
+        h.stream.stop()          # silence the real callback: no measurement race
     h.playing = True
     h._out_latency = 0.0
     h._volume = 1.0
     h._muted = False
+    # A fresh client left the post-adopt realign pending for its first real
+    # block; this test drives _cb manually with its own pinned reference, so
+    # normalize that state (the tests below all stop the stream for the same
+    # reason — the live callback would otherwise shift the sample window).
+    h._realign_on_next_cb = False
     h.local_pos = 0.2
     h.err_f = 0.0
     frames = 2048
@@ -1505,18 +1514,16 @@ def test_client_callback_offset_shift_does_not_spike_err(client, monkeypatch):
     # a heavy download/decode. The anchored reference must absorb it.
     with h.lock:
         h.clock.offset += 0.100
-    errs = []
+    # The PLL's actual error signal (err_f) must stay a few ms — not the 100ms
+    # offset jump. (A hand-rolled ``target - local_pos`` read-back between
+    # blocks would just show the block-granularity advance of the playhead;
+    # err_f is the smoothed error the controller actually acts on.)
     for _ in range(6):                       # a few audio blocks (~1.1 s)
         fake["t"] += block                   # real-time pacing
         h._cb(out, frames, None, None)
         with h.lock:
-            target = (h._base_pos
-                      + (1.0 + h.clock.drift * 1e-6) * (fake["t"] - h._base_clock))
-            errs.append(target - h.local_pos)
-    # The 100ms offset jump must NOT leak into the PLL error: err stays a few
-    # ms (just the anchor-instant quantification + drift), not ~100ms.
-    assert max(abs(e) for e in errs) < 0.05, \
-        f"offset shift leaked into err: {[f'{e*1000:.1f}ms' for e in errs]}"
+            assert abs(h.err_f) < 0.05, \
+                f"err_f grew to {h.err_f*1000:.1f}ms (offset leak)"
 
 
 def test_resolve_server_cli_priority(monkeypatch):
@@ -2385,3 +2392,99 @@ def test_start_quorum_round_trip(server, client, monkeypatch):
     # single room: the consensus is its own (rounded) NTP offset
     assert abs(c._consensus_offset_ms
                - round(c.clock.offset * 1000.0, 3)) < 5.0
+
+
+# --------------------------------------------------------------------------- #
+# Post-anchor block-edge realignment                                           #
+#                                                                              #
+# An adopt/resume/seek rebases the PLL reference from the run-loop thread at   #
+# an arbitrary wall instant BETWEEN PortAudio blocks, while local_pos only     #
+# steps once per block. Between that anchor and the next block the true server #
+# timeline pulls ahead of the frozen playhead by up to one full block (~186ms  #
+# at 8192 frames / 44.1kHz) of phantom lag — bang-bang rails MAX_PITCH and     #
+# catchup grinds it away over the song's first seconds. That phase sawtooth is #
+# what both rooms showed (~+105/+116ms) at the start of the 2nd track after a  #
+# long pause. _rebase() arms _realign_on_next_cb; the callback advances the    #
+# playhead and reference by the gap at the block boundary so err starts ~0.    #
+# --------------------------------------------------------------------------- #
+def test_client_realigns_reference_at_next_block_after_rebase(client, monkeypatch):
+    h = client.client
+    wait_until(lambda: h.buffer.data is not None
+               and h.buffer.duration > 1.0 and h.stream is not None)
+    with C.stream_ops_lock:
+        h.stream.stop()          # silence the real callback: no measurement race
+
+    import msync_common as MC
+    fake = {"t": 0.0}
+    monkeypatch.setattr(MC, "ts", lambda: fake["t"])
+
+    out = np.zeros((8192, 2), dtype=np.float32)
+    monkeypatch.setattr(config, "BANG_BANG", True)
+    monkeypatch.setattr(config, "BANG_BANG_WINDOW_MS", 10.0)
+    with h.lock:
+        h.playing = True
+        h._pitch_int = 0.0
+        h._pid_int = 0.0
+        h._pid_prev = 0.0
+        h.err_f = 0.0
+        # Control: reference pinned mid-block with no pending realign — the
+        # first block lands 100ms later and reads ~+100ms of pure phase
+        # "error", so bang-bang rails the pitch (the pre-fix spike).
+        h.local_pos = 0.3
+        h._base_pos = h.local_pos
+        h._base_clock = fake["t"] - 0.100
+    h._cb(out, 8192, None, None)
+    with h.lock:
+        assert h._mode == "BANG"
+        assert h.drift_pitch == C.MAX_PITCH         # railed to +2000ppm
+        assert h.err_f > 1e-3
+
+    # Fixed path: the adopt's _rebase() arms a realign; the FIRST block re-pins
+    # base_clock/base_pos AT the block edge, so err starts ~0 and the
+    # controller stays in the +-window PID instead of grinding a phantom gap.
+    with h.lock:
+        h.playing = True
+        h.err_f = 0.0
+        h.local_pos = 0.3
+        h._rebase()              # pins base at fake["t"]=0.0 AND arms realign
+        h._base_clock = fake["t"] - 0.100   # ... and the block boundary is, as
+                                            # in real life, 100ms away
+        assert h._realign_on_next_cb
+    fake["t"] = 0.100
+    h._cb(out, 8192, None, None)
+    block = 8192 / h.buffer.sr
+    with h.lock:
+        assert not h._realign_on_next_cb          # consumed at the block edge
+        assert h._base_clock == pytest.approx(0.100)
+        assert h._base_pos == pytest.approx(h.local_pos - block)
+        assert h._mode == "PID"                   # err ~0 -> in-window PID
+        assert abs(h.err_f) < 0.02
+
+
+def test_client_prefetches_next_track_on_same_song_sync(client):
+    """While a room stays on the current track (steady play, or paused on the
+    last track of an idle queue), same_song state syncs must keep the NEXT
+    queued track on deck. Otherwise the post-pause switch to the next track
+    falls back to an on-demand download+decode on the audio thread, and the
+    run-loop decode starves the PortAudio callback for the whole transfer —
+    the 100ms+ start-of-song error seen on the 2nd track after a pause."""
+    h = client.client
+    h._prefetch_worker = lambda *a, **k: None   # no real HTTP/decode in test
+    with h.lock:
+        h.queue = ["track_02_B494.wav"]
+        h.queue_size = 1
+        h._prefetch = None
+        h._prefetching = None
+        current = h.buffer.name
+    assert current != "track_02_B494.wav"
+    st = {
+        "name": current,
+        "playing": True,
+        "song_start": h.server_song_start,
+        "duration": h.buffer.duration,
+        "queue_size": 1,
+        "epoch": h._epoch,
+    }
+    h._apply_state(st)
+    with h.lock:
+        assert h._prefetching == "track_02_B494.wav"
