@@ -16,6 +16,9 @@ Responsibilities:
     downloads the streams into <music_dir>/"Pandora - <Station>"/, and
     queues each track as it finishes (see msync_pandora.py). Mock mode with
     no account configured.
+  * YouTube radio (optional): the same shape of daemon thread harvests a
+    search query / playlist / channel into <music_dir>/"YouTube - <Source>"
+    via yt-dlp (see msync_youtube.py). Mock mode with no yt-dlp installed.
 
 Usage:
     msync_server.py [music_dir] [--port N]
@@ -27,6 +30,7 @@ Controls (stdin/HTTP):
     add <name|glob...> : queue songs (e.g. add "Foo.mp3" or "add *.wav")
     queue      : show the queue      clear : empty the queue
     pandora [station|stations|stop] : Pandora radio control
+    youtube [source|sources|stop]   : YouTube radio control (yt-dlp)
 
 Drop-to-queue:
     Copy any audio file into <music_dir>/.queue while the server runs.
@@ -51,6 +55,7 @@ import numpy as np
 import config
 import msync_common as C
 import msync_pandora
+import msync_youtube
 import pid_tune
 from msync_catalog import (Catalog, abs_path, is_audio_name,
                            relpath_norm)
@@ -87,7 +92,7 @@ class Song:
 
 
 class SyncedServer:
-    def __init__(self, music_dir, port, db_path=None, pandora=None):
+    def __init__(self, music_dir, port, db_path=None, pandora=None, youtube=None):
         lg = C.logger()
         self.port = port
         self.lock = threading.RLock()
@@ -177,6 +182,29 @@ class SyncedServer:
                 batch=config.PANDORA_QUEUE_SIZE,
                 queued=self._pandora_queued,
                 submit=self._pandora_submit,
+            )
+
+        # YouTube radio service (server only, via yt-dlp). Same pattern as
+        # Pandora: constructed — wired to the server queue via the _youtube_*
+        # callbacks below — only when enabled in config.py
+        # (config.YOUTUBE_ENABLED); srv.youtube is None otherwise, so the HTTP
+        # API reports it unavailable and the web UI hides the YouTube tab.
+        # The main() entry point starts its thread. Without yt-dlp installed
+        # it runs in mock mode (fabricated sources), mirroring Pandora's
+        # "no credentials -> mock" fallback. A caller may inject its own
+        # instance (tests).
+        self.youtube = youtube
+        if self.youtube is None and config.YOUTUBE_ENABLED:
+            yt_ok = msync_youtube.ytdlp_available()
+            self.youtube = msync_youtube.YouTubeService(
+                music_dir,
+                mock=not yt_ok,
+                batch=config.YOUTUBE_QUEUE_SIZE,
+                sources=config.YOUTUBE_SOURCES,
+                max_duration=config.YOUTUBE_MAX_MINUTES * 60,
+                single_limit=config.YOUTUBE_SINGLE_MINUTES * 60,
+                queued=self._youtube_queued,
+                submit=self._youtube_submit,
             )
 
         # Startup playback: resume exactly where the previous run left off —
@@ -1184,6 +1212,107 @@ class SyncedServer:
             self.pandora.stop_station()
 
     # ------------------------------------------------------------------ #
+    # YouTube radio (drives the YouTubeService thread against this queue) #
+    # ------------------------------------------------------------------ #
+    def _queued_in_folder(self, folder):
+        """# of queued songs/albums whose paths live under ``folder``. A quick
+        shared-lock read for the radio services' top-up loops (called from
+        their threads, which already hold their own locks)."""
+        if not folder:
+            return 0
+        folder = os.path.abspath(folder) + os.sep
+        count = 0
+        with self.lock:
+            for e in self.queue:
+                if e.get("type") == "song":
+                    if (e.get("path") or "").startswith(folder):
+                        count += 1
+                elif e.get("type") == "album":
+                    for p in e.get("paths", []):
+                        if (p or "").startswith(folder):
+                            count += 1
+        return count
+
+    def _youtube_queued(self):
+        """# of tracks belonging to the active YouTube source that are still
+        sitting in the play queue. Called from the YouTube thread (which
+        already holds the YouTube lock) on its ~1s top-up loop."""
+        return self._queued_in_folder(
+            self.youtube.station_dir if self.youtube else None)
+
+    def _youtube_submit(self, path):
+        """Append a freshly-downloaded YouTube track to the play queue.
+        Called from the YouTube thread; per the YouTubeService callback
+        contract it hands the path to the server's queue under the server
+        lock (and never calls back into YouTube)."""
+        path = os.path.abspath(path)
+        with self.lock:
+            if path in self._queued_paths():
+                return
+            rel = self._relpath(path)
+            self.queue.append({"type": "song", "path": path, "relpath": rel})
+            C.logger().info("queued: %s", rel)
+            if self.song is None and self.queue:
+                self._start_next()     # nothing playing: start the radio now
+            self._persist_queue()
+
+    def youtube_status(self):
+        """Snapshot of the YouTube service for the API/UI. Takes only the
+        YouTube lock, so call it WITHOUT holding the server lock — the YouTube
+        thread may be blocked waiting for that same lock in _youtube_queued."""
+        if self.youtube is None:
+            return None
+        try:
+            return self.youtube.status()
+        except Exception as exc:
+            C.logger().warning("youtube: status error: %r", exc)
+            return {"error": str(exc)}
+
+    def youtube_play(self, source):
+        """Start a YouTube source (name or token). Queues a finite batch of
+        config.YOUTUBE_QUEUE_SIZE tracks and stops there; the YouTube tab's
+        "Queue more" button (youtube_more) adds another batch on demand."""
+        if self.youtube is None:
+            return {"ok": False, "error": "youtube not available"}
+        ok = self.youtube.play_source(source, want=config.YOUTUBE_QUEUE_SIZE)
+        return {"ok": ok, "source": source}
+
+    def youtube_more(self):
+        """Queue another YOUTUBE_QUEUE_SIZE batch for the active source."""
+        if self.youtube is None:
+            return {"ok": False, "error": "youtube not available"}
+        return {"ok": bool(self.youtube.fetch_more()),
+                "batch": config.YOUTUBE_QUEUE_SIZE}
+
+    def youtube_stop(self):
+        """Stop the active source; already-downloaded tracks keep playing."""
+        if self.youtube is not None:
+            self.youtube.stop_source()
+
+    def youtube_search(self, query):
+        """Create a source from a free-text query (search phrase or URL) and
+        immediately queue a finite batch of YOUTUBE_QUEUE_SIZE tracks.
+
+        Returns {"ok": True, "created": bool, "source": {...}, "batch": N}
+        on success, or {"ok": False, "error": ...} on failure."""
+        if self.youtube is None:
+            return {"ok": False, "error": "youtube not available"}
+        query = (query or "").strip()
+        if not query:
+            return {"ok": False, "error": "query required"}
+        # Derive a display name from the query: URL → domain, search → query text.
+        if "://" in query:
+            from urllib.parse import urlparse
+            parsed = urlparse(query)
+            name = (parsed.netloc or query)[:60]
+        else:
+            name = query[:60]
+        src, created = self.youtube.add_source(name, query)
+        ok = self.youtube.play_source(src["sourceToken"], want=config.YOUTUBE_QUEUE_SIZE)
+        return {"ok": ok, "created": created,
+                "source": src, "batch": config.YOUTUBE_QUEUE_SIZE}
+
+    # ------------------------------------------------------------------ #
     # UDP sync + NTP + state broadcast                                   #
     # ------------------------------------------------------------------ #
     def _sync_payload(self):
@@ -1437,6 +1566,14 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
                                     PANDORA_QUEUE_SIZE tracks then stops
       POST /api/pandora/more      -> queue another batch for the active station
       POST /api/pandora/stop      -> stop the active station (downloads halt)
+      GET  /api/youtube           -> YouTube service status
+      GET  /api/youtube/sources   -> list of YouTube sources
+      POST /api/youtube/play      -> start a source (?source= or JSON); queues
+                                    YOUTUBE_QUEUE_SIZE tracks then stops
+      POST /api/youtube/more      -> queue another batch for the active source
+      POST /api/youtube/stop      -> stop the active source (downloads halt)
+      POST /api/youtube/search    -> create a source from ?query= free text and
+                                    start it (search phrase or URL; persists)
       everything else         -> music file download (client fetches songs)
     """
 
@@ -1498,6 +1635,8 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
                 # holds its own lock while waiting on the server lock in
                 # _pandora_queued) could deadlock with this handler.
                 payload["pandora"] = srv.pandora_status()
+                # Same rule for the YouTube thread (_youtube_queued).
+                payload["youtube"] = srv.youtube_status()
                 self._json(payload)
             elif path == "/api/pandora":
                 status = srv.pandora_status()
@@ -1508,6 +1647,15 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
             elif path == "/api/pandora/stations":
                 stations = srv.pandora.stations() if srv.pandora else []
                 self._json({"stations": stations})
+            elif path == "/api/youtube":
+                status = srv.youtube_status()
+                if status is None:
+                    self._json({"error": "youtube unavailable"}, 404)
+                else:
+                    self._json(status)
+            elif path == "/api/youtube/sources":
+                sources = srv.youtube.sources() if srv.youtube else []
+                self._json({"sources": sources})
             elif path == "/api/library":
                 self._json({"songs": srv.library_list(),
                             "albums": srv.album_list_full(),
@@ -1715,6 +1863,26 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
             elif path == "/api/pandora/stop":
                 srv.pandora_stop()
                 self._json({"ok": True})
+            elif path == "/api/youtube/play":
+                source = body.get("source") if "source" in body else \
+                    body.get("station") if "station" in body else \
+                    (qs.get("source") or qs.get("name") or [None])[0]
+                if not source:
+                    self._json({"error": "source required"}, 400)
+                else:
+                    self._json(srv.youtube_play(source))
+            elif path == "/api/youtube/more":
+                self._json(srv.youtube_more())
+            elif path == "/api/youtube/stop":
+                srv.youtube_stop()
+                self._json({"ok": True})
+            elif path == "/api/youtube/search":
+                query = body.get("query") if "query" in body else \
+                    (qs.get("query") or qs.get("q") or [None])[0]
+                if not query or not str(query).strip():
+                    self._json({"error": "query required"}, 400)
+                else:
+                    self._json(srv.youtube_search(query))
             else:
                 self._json({"error": "not found"}, 404)
 
@@ -1723,7 +1891,7 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
 
 def main():
     C.setup_logging()
-    C.tune_process()          # GIL handoff + process priority (best-effort)
+    C.tune_process()          # GIL handoff interval only; nice stays at 0
     lg = C.logger()
 
     ap = argparse.ArgumentParser()
@@ -1763,10 +1931,15 @@ def main():
     # stations instantly and idles until a station is selected.
     if srv.pandora is not None:
         srv.pandora.start()
+    # YouTube radio thread. Only started when YOUTUBE_ENABLED in config.py;
+    # mock mode (no yt-dlp installed) connects instantly and idles.
+    if srv.youtube is not None:
+        srv.youtube.start()
 
     print("\nServer controls: space=play/pause  n=next  p=prev  +/-=vol  q=quit")
     print("                 add <song...> | queue | clear | drop files in .queue/")
-    print("                 pandora [station] | pandora stations | pandora stop\n")
+    print("                 pandora [station] | pandora stations | pandora stop")
+    print("                 youtube [source] | youtube sources | youtube stop\n")
     headless = args.headless
     if headless:
         try:
@@ -1841,6 +2014,49 @@ def main():
                         res = srv.pandora_play(" ".join(parts))
                         verb = "queuing" if res.get("ok") else "unknown station"
                         print(f"  pandora: {verb}: {res.get('station')}")
+            elif cmd == "youtube":
+                if srv.youtube is None:
+                    print("  youtube: disabled (set YOUTUBE_ENABLED=True in config.py)")
+                else:
+                    parts = (rest or "").strip().split()
+                    if not parts:
+                        st = srv.youtube_status() or {}
+                        print(f"  source={st.get('station') or '(none)'}"
+                              f"  connected={st.get('connected')}"
+                              f"  mock={st.get('mock')}"
+                              f"  downloaded={st.get('downloaded')}"
+                              f"  pending={st.get('pending')}"
+                              f"  error={st.get('error') or 'none'}")
+                    elif parts[0] in ("sources", "list"):
+                        for st in srv.youtube.sources():
+                            print(f"  {st['sourceToken']:<14} {st['sourceName']}"
+                                  f"  -> {st['query']}")
+                    elif parts[0] in ("stop", "off"):
+                        srv.youtube_stop()
+                        print("  youtube: stopped")
+                    elif parts[0] in ("more", "fill", "next"):
+                        res = srv.youtube_more()
+                        if res.get("ok"):
+                            print(f"  youtube: queueing {res.get('batch')} more")
+                        else:
+                            print(f"  youtube: {res.get('error', 'no source active')}")
+                    elif parts[0] in ("search", "find", "new"):
+                        query = " ".join(parts[1:]).strip()
+                        if not query:
+                            print("  youtube: search requires text (e.g. `youtube search lofi jazz hip hop`)")
+                        else:
+                            res = srv.youtube_search(query)
+                            if res.get("ok"):
+                                verb = ("created source" if res.get("created")
+                                        else "using existing source")
+                                print(f"  youtube: {verb} '{res.get('source', {}).get('sourceName')}'"
+                                      f" — queueing {res.get('batch')} tracks")
+                            else:
+                                print(f"  youtube: {res.get('error', 'search failed')}")
+                    else:
+                        res = srv.youtube_play(" ".join(parts))
+                        verb = "queuing" if res.get("ok") else "unknown source"
+                        print(f"  youtube: {verb}: {res.get('source')}")
             else:
                 print("  ?:", line)
     except (EOFError, KeyboardInterrupt):

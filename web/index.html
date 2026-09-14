@@ -191,9 +191,9 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 
 .empty { text-align: center; padding: 24px; color: var(--muted); font-size: 12px; }
 
-/* Pandora radio tab */
-.pandora { padding: 16px; overflow-y: auto; }
-.pandora h3 { font-size: 13px; margin: 16px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+/* Pandora / YouTube radio tabs (shared .pd-* component styles) */
+.pandora, .youtube { padding: 16px; overflow-y: auto; }
+.pandora h3, .youtube h3 { font-size: 13px; margin: 16px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
 .pd-status { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; }
 .pd-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
 .pd-dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
@@ -201,6 +201,11 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 .pd-meta { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; flex: 1; min-width: 120px; }
 .pd-status .head-btn { margin-left: auto; }
 .pd-banner { margin-top: 8px; padding: 8px 12px; border: 1px solid #d9a20b; background: rgba(217,162,11,0.12); border-radius: 8px; color: #e3b341; font-size: 12.5px; line-height: 1.4; }
+/* YouTube search bar: create-and-play a new source */
+.yt-search { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.yt-search input { flex: 1; min-width: 0; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 14px; outline: none; transition: border-color 0.15s; }
+.yt-search input:focus { border-color: var(--accent); }
+.yt-search .head-btn { flex: none; }
 .pd-station-list { display: flex; flex-direction: column; gap: 8px; }
 .pd-station { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; display: flex; align-items: center; gap: 12px; cursor: pointer; transition: border-color 0.15s, background 0.15s; }
 .pd-station:hover { border-color: var(--accent); }
@@ -334,6 +339,9 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
     <!-- Pandora appears only when the server has it enabled (config.PANDORA_ENABLED);
          updatePandoraTabVis() reveals it based on state.pandora. -->
     <button class="tab" id="tab-pandora" data-tab="pandora" onclick="setTab('pandora')" style="display:none;">Pandora</button>
+    <!-- YouTube appears only when the server has it enabled (config.YOUTUBE_ENABLED);
+         updateYouTubeTabVis() reveals it based on state.youtube. -->
+    <button class="tab" id="tab-youtube" data-tab="youtube" onclick="setTab('youtube')" style="display:none;">YouTube</button>
     <button class="tab" data-tab="config" onclick="setTab('config')">Configure</button>
 </div>
 
@@ -379,6 +387,22 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 <!-- Pandora view: stations + radio status -->
 <div class="main" id="view-pandora" style="display:none;">
     <div class="pandora" id="pandora"></div>
+</div>
+
+<!-- YouTube view: sources + radio status -->
+<div class="main" id="view-youtube" style="display:none;">
+    <div class="youtube">
+        <!-- Search bar: create-and-play a new source. Lives OUTSIDE the
+             re-rendered #youtube container so the 1s poll never steals focus
+             or wipes a half-typed query. -->
+        <div class="yt-search">
+            <input id="yt-search-input" type="text" spellcheck="false"
+                   placeholder="Search YouTube or paste a playlist / channel URL…"
+                   onkeydown="if(event.key==='Enter')youtubeSearch()" />
+            <button class="head-btn accent" id="yt-search-btn" onclick="youtubeSearch()">＋ Search &amp; queue</button>
+        </div>
+        <div id="youtube"></div>
+    </div>
 </div>
 
 <script src="static/sortable.min.js"></script>
@@ -440,8 +464,10 @@ function setTab(name) {
     document.getElementById('view-queue').style.display = name === 'queue' ? '' : 'none';
     document.getElementById('view-config').style.display = name === 'config' ? '' : 'none';
     document.getElementById('view-pandora').style.display = name === 'pandora' ? '' : 'none';
+    document.getElementById('view-youtube').style.display = name === 'youtube' ? '' : 'none';
     if (name === 'config') fetchClients();
     if (name === 'pandora') fetchPandora(true);
+    if (name === 'youtube') fetchYouTube(true);
 }
 
 // ── Configure: per-room latency ──────────────────────────────────────
@@ -754,6 +780,7 @@ async function fetchState() {
     updateHeader();
     updateScanStatus();
     updatePandoraTabVis();
+    updateYouTubeTabVis();
     renderQueue();
 }
 
@@ -1285,11 +1312,118 @@ async function pandoraMore() {
     await fetchPandora(true);
 }
 
+// ── YouTube tab (audio via yt-dlp) ────────────────────────────────────
+// Mirror of the Pandora tab: the tab shows only when the server runs the
+// YouTube service — state.youtube (from /api/state) is a status object when
+// config.YOUTUBE_ENABLED is on and null when it's off. Sources/status come
+// from the /api/youtube* endpoints. The 1s poll refreshes status; the source
+// list is refetched on tab open or ~every 10s.
+let youtubeStatus = null;       // last /api/youtube snapshot
+let youtubeSources = [];        // [{sourceToken, sourceName, query}]
+let youtubeSourcesAt = 0;       // last source-list fetch timestamp
+
+function updateYouTubeTabVis() {
+    const tab = document.getElementById('tab-youtube');
+    const show = !!state.youtube;
+    if (tab && tab.style.display !== (show ? '' : 'none')) {
+        tab.style.display = show ? '' : 'none';
+    }
+    // If YouTube turns off while we're looking at its tab, bail to Search.
+    if (!show && currentTab === 'youtube') setTab('search');
+}
+
+async function fetchYouTube(forceSources) {
+    const d = await api('GET', '/api/youtube');
+    if (!d.error) youtubeStatus = d;
+    if (forceSources || Date.now() - youtubeSourcesAt > 10000) {
+        youtubeSourcesAt = Date.now();
+        const s = await api('GET', '/api/youtube/sources');
+        if (!s.error) youtubeSources = s.sources || [];
+    }
+    renderYouTube();
+}
+
+function renderYouTube() {
+    const el = document.getElementById('youtube');
+    const st = youtubeStatus;
+    let html = '';
+
+    if (!st) {
+        html += '<div class="empty-state">YouTube service unavailable (not running on this server).</div>';
+    } else if (st.error) {
+        html += `<div class="empty-state">${esc(st.error)}</div>`;
+    } else {
+        const dotCls = st.connected ? ' on' : '';
+        const activeName = st.station
+            ? `<span class="pd-station-name">${esc(st.station)}</span>`
+            : `<span class="pd-station-name" style="color:var(--muted)">${st.mock ? 'Mock mode — pick a source' : 'Pick a source to queue a batch'}</span>`;
+        html += `<div class="pd-status">
+            <span class="pd-dot${dotCls}" title="${st.connected ? 'yt-dlp ready' : 'Not connected'}"></span>
+            ${activeName}
+            <span class="pd-meta">${st.mock ? 'mock · ' : ''}downloaded ${st.downloaded || 0} · queued ${st.pending ?? 0}</span>
+            ${st.station ? `<button class="head-btn accent" onclick="youtubeMore()" title="Download another batch of ${st.batch || 5} songs into the queue">＋ Queue ${st.batch || 5} more</button>` : ''}
+        </div>`;
+        if (st.warn) {
+            html += `<div class="pd-banner" title="${esc(st.warn)}">⚠ ${esc(st.warn)}</div>`;
+        }
+    }
+
+    html += '<h3>Sources</h3>';
+    if (!youtubeSources.length) {
+        html += '<div class="empty-state">No sources yet. Search above to create your first one — or add playlists/channels via config.YOUTUBE_SOURCES.</div>';
+    } else {
+        html += '<div class="pd-station-list">';
+        for (const s of youtubeSources) {
+            const active = st && st.station_token === s.sourceToken;
+            html += `<div class="pd-station${active ? ' active' : ''}" onclick="youtubePlay('${esc(s.sourceName)}')" title="Play ${esc(s.sourceName)}">
+                <span class="pd-name">${esc(s.sourceName)}</span>
+                <span class="pd-state">${active ? '▶ ON AIR' : ''}</span>
+            </div>`;
+        }
+        html += '</div>';
+    }
+
+    // Diff-guard: don't rebuild the DOM unless the content changed.
+    if (el.innerHTML !== html) el.innerHTML = html;
+}
+
+async function youtubePlay(name) {
+    const d = await api('POST', '/api/youtube/play', { source: name });
+    if (d.error) { toast(d.error, 'error'); return; }
+    if (!d.ok) { toast(`Source not found: ${name}`, 'warn'); return; }
+    toast(`Queueing a fresh batch from ${name}…`);
+    await fetchYouTube(true);
+}
+
+async function youtubeMore() {
+    const d = await api('POST', '/api/youtube/more');
+    if (d.error) { toast(d.error, 'error'); return; }
+    if (!d.ok) { toast('No source active — pick one below first', 'warn'); return; }
+    toast(`Queueing ${d.batch || 5} more — downloads stop when the batch is full`);
+    await fetchYouTube(true);
+}
+
+async function youtubeSearch() {
+    const input = document.getElementById('yt-search-input');
+    const q = (input.value || '').trim();
+    if (!q) { input.focus(); return; }
+    const d = await api('POST', '/api/youtube/search', { query: q });
+    if (d.error) { toast(d.error, 'error'); return; }
+    if (!d.ok) { toast('Search failed — try a different phrase', 'error'); return; }
+    const name = (d.source && d.source.sourceName) || q;
+    toast(d.created
+        ? `New source “${name}” — queueing ${d.batch || 5} tracks…`
+        : `“${name}” is already a source — queueing ${d.batch || 5} tracks…`);
+    input.value = '';
+    await fetchYouTube(true);
+}
+
 // ── Polling ──────────────────────────────────────────────────────────
 async function tick() {
     await fetchState();
     if (currentTab === 'config') fetchClients();
     if (currentTab === 'pandora') fetchPandora();
+    if (currentTab === 'youtube') fetchYouTube();
 }
 tick();
 setInterval(tick, 1000);

@@ -486,6 +486,105 @@ only injects two callbacks (`queued()` / `submit(path)`).
 > Note: `pandora_blowfish.py` is GPLv3 (ported from the Kodi addon); the rest
 > of the Pandora code follows msync's license.
 
+## YouTube radio (optional, via yt-dlp)
+
+Same idea as Pandora, but it harvests **YouTube** into the library using
+[`yt-dlp`](https://github.com/yt-dlp/yt-dlp): a background daemon thread
+("sources" instead of stations) downloads each video's audio into
+`MUSIC_DIR/YouTube - <Source>/`, transcodes what the server's decoder can't
+read, and queues each track the moment it lands. A source is one of the
+built-in search queries, or any playlist / channel / mix URL you add yourself.
+
+Like Pandora, it's **batch-based**: starting a source (or the YouTube tab's
+**＋ Queue N more** button) pulls exactly `YOUTUBE_QUEUE_SIZE` tracks
+(default **5**) into the queue and then stops. It never auto-refills.
+
+Each source draws its candidates from a **deep pool** (the top ~20 search
+results per refill), cached and consumed lazily — so batch after batch you
+keep getting fresh tracks instead of recycling the same handful of results.
+Long "mix"/compilation videos that carry per-song **chapters** are split into
+one song per chapter instead of being queued as a single 27-minute blob. A
+long video with *no* chapters can't be split, so it's skipped entirely (see
+`YOUTUBE_SINGLE_MINUTES` below). When a source has genuinely run out of new
+tracks the harvest winds down and the API reports it exhausted — hit **Queue
+more** later (or search something else) to try again.
+
+**Enable it** in `config.py` (server machine only): set `YOUTUBE_ENABLED = True`
+(env: `MSYNC_YOUTUBE_ENABLED=1`) and install yt-dlp (`pip install yt-dlp`) —
+it's in `requirements.txt`. YouTube needs no credentials. Without yt-dlp
+installed, the service runs in **mock mode** (fabricated sources, tiny WAVs)
+so the plumbing still works for development. The web UI's YouTube tab only
+appears while YouTube is enabled.
+
+Tuning:
+
+* `YOUTUBE_QUEUE_SIZE` (env: `MSYNC_YOUTUBE_QUEUE_SIZE`, default `5`) — songs
+  per batch (both the initial one and every "Queue N more" click).
+* `YOUTUBE_MAX_MINUTES` (env: `MSYNC_YOUTUBE_MAX_MINUTES`, default `45`) —
+  videos longer than this are skipped; live streams and Shorts are always
+  skipped.
+* `YOUTUBE_SINGLE_MINUTES` (env: `MSYNC_YOUTUBE_SINGLE_MINUTES`, default `10`) —
+  the longest a video may be to count as a *single* track. Longer videos are
+  kept only when they have per-song chapters (those get split into individual
+  songs); chapterless ones are skipped. Raised to allow long live sets,
+  lowered to keep blobs out of the queue.
+* `YOUTUBE_SOURCES` (env: `MSYNC_YOUTUBE_SOURCES`) — custom source list as
+  `"Name|query-or-url, Name|url, …"`. Blank uses the built-in search sources
+  in `msync_youtube.py`. A bare `"Name"` (no `|`) is both the display name and
+  the query.
+
+**Playback needs ffmpeg**, like Pandora: yt-dlp's best-audio picks are usually
+webm (opus) or m4a (AAC), which the server can't decode, so downloads are
+transcoded in place to FLAC the moment they land. `sudo apt install ffmpeg`;
+without it the radio still downloads but nothing decodes and the YouTube tab
+shows a warning banner.
+
+**Pick a source** from the server console or the HTTP API:
+
+```bash
+# on the server console
+youtube sources            # list sources
+youtube "Lofi Beats"       # queue a batch (default 5), then stop
+youtube search lofi jazz   # create a source from free text and queue a batch
+youtube more               # queue another batch for the current source
+youtube                    # status: source, downloaded, queued
+youtube stop               # stop fetching (already-downloaded tracks keep playing)
+
+# or over HTTP
+curl http://<server-ip>:10770/api/youtube/sources
+curl -X POST -d '{"source":"Lofi Beats"}' http://<server-ip>:10770/api/youtube/play
+curl -X POST -d '{"query":"lofi jazz hip hop"}' http://<server-ip>:10770/api/youtube/search
+curl -X POST http://<server-ip>:10770/api/youtube/more   # another batch
+curl http://<server-ip>:10770/api/youtube          # status
+curl -X POST http://<server-ip>:10770/api/youtube/stop
+```
+
+Downloads land in a folder named `YouTube - <Source>`, showing up in the web
+UI's Library as an album. The **YouTube tab** mirrors the Pandora tab: a
+status card (yt-dlp/ffmpeg readiness, downloaded / queued counts), a source
+list to click, and — on top — a **search box**. Type anything (or paste a
+playlist / channel URL) and hit **＋ Search & queue**: it creates a new source
+from your text and immediately queues a batch from it. New sources are
+persisted to `MUSIC_DIR/youtube_sources.json` (searched again later reuses the
+same source instead of duplicating it). Search-based sources draw from the top
+~20 results; playlist / channel URLs run the whole list, so those go much
+deeper. The queue and now-playing header work exactly like any other tracks.
+
+**Standalone CLI** (for testing the pipeline without the server):
+
+```bash
+./venv/bin/python msync_youtube.py --mock --list-sources
+./venv/bin/python msync_youtube.py --mock --harvest "Lofi Beats" 4
+./venv/bin/python msync_youtube.py --mock --serve "Synthwave" --duration 30
+
+# real mode (yt-dlp installed)
+./venv/bin/python msync_youtube.py --harvest "Lofi Beats" 4
+```
+
+The thread shares nothing with the audio/sync/catalog threads — the server
+only injects the same two callbacks (`queued()` / `submit(path)`) it gives
+the Pandora thread.
+
 ## The Configure tab — rooms with a slow audio path (HDMI, Bluetooth, …)
 
 If one room sounds **late** even though every client reports `err` ≈ 0ms, its
@@ -592,6 +691,7 @@ msync_common.py    shared sync protocol (you can ignore this)
 msync_pandora.py   Pandora radio thread (experimental; see the section above)
 pandora_api.py     Pandora tuner API client (ported from kodi-pandora-slim)
 pandora_blowfish.py Blowfish-ECB cipher used by pandora_api (GPLv3)
+msync_youtube.py   YouTube radio thread via yt-dlp (see the section above)
 make_test_music.py generates demo songs (--with-albums for sample albums)
 web/               the web UI (index.html + vendored sortable.min.js drag lib)
 music/             your music (config.MUSIC_DIR); sub-folders are albums

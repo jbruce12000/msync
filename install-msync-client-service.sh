@@ -199,14 +199,14 @@ ExecStart=$PYTHON $CLIENT
 Restart=on-failure
 RestartSec=3
 UMask=0077
-# Audio priority: the code also calls msync_common.tune_process()
-# (nice -10) and msync_common.boost_audio_thread() (real-time callback
-# thread), but an unprivileged service user can do neither under systemd's
-# default limits (Max nice priority 0 / Max realtime priority 0) — the
-# calls silently no-op. These two directives raise the limits up front so
-# the boosts actually take effect; do NOT set CPUSchedulingPolicy here
-# (it would make every thread real-time and could starve the box).
-Nice=-10
+# Audio priority: msync_common.boost_audio_thread() asks for real-time
+# scheduling on the callback thread, but an unprivileged service user
+# can't get it under systemd's default limits (Max realtime priority 0) —
+# the call silently no-ops. LimitRTPRIO raises that cap so the boost
+# actually takes effect. The process nice is left at 0 (the default): no
+# whole-process priority change. Do NOT set CPUSchedulingPolicy here (it
+# would make every thread real-time and could starve the box).
+Nice=0
 LimitRTPRIO=99
 
 [Install]

@@ -166,10 +166,10 @@ def parse_packet(data: bytes):
 # Music is produced by PortAudio's callback thread. It must never be starved  #
 # by a busy server: heaviest GIL users are the catalog scan (tinytag), HTTP    #
 # client downloads, the inotify watcher, and NTP/status threads. We (a) give  #
-# the callback thread real-time scheduling when permitted, (b) tighten the GIL #
-# switch interval so the callback grabs the GIL sooner under load, and        #
-# (c) raise the whole process's priority when allowed. All failures are       #
-# swallowed: unprivileged setups simply keep normal scheduling.                #
+# the callback thread real-time scheduling when permitted and (b) tighten the #
+# GIL switch interval so the callback grabs the GIL sooner under load. The    #
+# process's nice value is deliberately left at 0 (the system default). All    #
+# failures are swallowed: unprivileged setups simply keep normal scheduling.  #
 # --------------------------------------------------------------------------- #
 _AUDIO_BOOST_TRIED = set()
 _AUDIO_BOOST_LOCK = threading.Lock()
@@ -262,27 +262,15 @@ def tune_process():
     - ``sys.setswitchinterval(0.002)``: the GIL is handed off every 2 ms
       instead of 5 ms, so the audio callback thread waits less behind the
       scan/HTTP/download threads that collectively hold the GIL.
-    - Raise the process's nice value to -10 (best-effort). An unprivileged
-      service user is usually barred from this by RLIMIT_NICE (systemd's
-      default is `Max nice priority 0`), so the installed systemd units set
-      `Nice=-10` themselves and this call is just for manual runs.
+    - Leaves the process's nice value at 0 (the default): no priority boost.
     - Logs the resulting nice value and real-time rlimit, so `journalctl`
-      can confirm whether the boosts actually took effect (an rlimit of 0,
-      or a nice of 0, means the unit needs `Nice=-10` / `LimitRTPRIO=99`).
+      can confirm whether the audio RT boost (``boost_audio_thread``) will
+      apply — an rlimit of 0 means the unit needs ``LimitRTPRIO=99``.
     """
     try:
         sys.setswitchinterval(0.002)
     except Exception:
         pass
-    try:
-        if os.getpriority(os.PRIO_PROCESS, 0) > -10:
-            os.setpriority(os.PRIO_PROCESS, 0, -10)
-    except (AttributeError, OSError):
-        if hasattr(os, "nice"):
-            try:
-                os.nice(-10)
-            except OSError:
-                pass
     # Read back and report what actually took effect.
     try:
         nice = os.getpriority(os.PRIO_PROCESS, 0)

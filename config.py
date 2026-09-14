@@ -55,6 +55,35 @@ PANDORA_PASSWORD = os.environ.get("MSYNC_PANDORA_PASSWORD", "")
 # it never auto-refills. Env override: MSYNC_PANDORA_QUEUE_SIZE.
 PANDORA_QUEUE_SIZE = int(os.environ.get("MSYNC_PANDORA_QUEUE_SIZE", "10"))
 
+# YouTube audio (server only) via yt-dlp. ENV-overridable the same way as
+# Pandora:
+#   MSYNC_YOUTUBE_ENABLED=1         enable
+#   MSYNC_YOUTUBE_QUEUE_SIZE=N      songs per batch (default 5)
+#   MSYNC_YOUTUBE_MAX_MINUTES=N     skip videos longer than N minutes (default 45)
+#   MSYNC_YOUTUBE_SINGLE_MINUTES=N  longest "track" with no per-song chapters (default 10)
+#   MSYNC_YOUTUBE_SOURCES=...       custom sources, e.g.
+#                                   "Lofi Beats|lofi hip hop beats, My Mix|https://..."
+#
+# This is the radio analog of the Pandora feature: a YouTubeService daemon
+# thread (msync_youtube.py) harvests each source — a search query or a
+# playlist/channel URL — into MUSIC_DIR/"YouTube - <Source>"/, transcodes
+# whatever the server can't decode to FLAC with ffmpeg, and queues each track
+# as it finishes. When yt-dlp isn't installed it falls back to mock mode
+# (fabricated sources/tracks). The web UI's YouTube tab appears only while
+# this is enabled.
+#
+#YOUTUBE_ENABLED = os.environ.get("MSYNC_YOUTUBE_ENABLED", "0") in ("1", "true", "yes", "on")
+YOUTUBE_ENABLED = True
+YOUTUBE_QUEUE_SIZE = int(os.environ.get("MSYNC_YOUTUBE_QUEUE_SIZE", "5"))
+YOUTUBE_MAX_MINUTES = int(os.environ.get("MSYNC_YOUTUBE_MAX_MINUTES", "45"))
+# Longest video allowed to queue as a single track. Longer videos are only
+# kept when they come with per-song chapters (they're split into one song
+# per chapter); chapterless ones are mixes/ambient blobs and get skipped.
+YOUTUBE_SINGLE_MINUTES = int(os.environ.get("MSYNC_YOUTUBE_SINGLE_MINUTES", "10"))
+# Optional custom sources ("Name|query-or-url", comma-separated). Blank uses
+# msync_youtube.DEFAULT_SOURCES (a few built-in search queries).
+YOUTUBE_SOURCES = os.environ.get("MSYNC_YOUTUBE_SOURCES", "")
+
 # Client's local cache for downloaded tracks.
 CACHE_DIR = os.environ.get(
     "MSYNC_CACHE_DIR", os.path.join(tempfile.gettempdir(), "msync-cache"))

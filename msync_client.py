@@ -1452,7 +1452,7 @@ def resolve_server(cli_server=None):
 
 def main():
     C.setup_logging()
-    C.tune_process()          # GIL handoff + process priority (best-effort)
+    C.tune_process()          # GIL handoff interval only; nice stays at 0
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", default=None,
                     help="server host/IP to connect to; when omitted the "
