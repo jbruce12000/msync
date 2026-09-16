@@ -12,6 +12,7 @@ All timestamps are Unix seconds using time.time() (NTP-friendly).
 
 import json
 import logging
+import numpy as np
 import os
 import socket
 import sys
@@ -138,6 +139,41 @@ PID_P_EDGE_FRAC = 0.6       # P term at window edge, as a fraction of MAX_PITCH
 # full program level to silence (or back) is a click; a few-ms ramp is
 # inaudible and removes it.
 AUDIO_FADE_SEC = 0.010
+
+
+def interp_read(data, idx_pre, rate, frames, catchup_s=0.0):
+    """Variable-rate interpolated read from stereo audio data.
+
+    Reads *frames* output samples from *data* (N×2 float32) starting at
+    fractional content-sample position *idx_pre*, advancing by *rate*
+    content samples per output sample.  Linear interpolation eliminates the
+    block-boundary sample drops/repeats that produce clicks when *rate* ≠ 1.
+
+    When *catchup_s* is nonzero (a bounded playhead nudge applied in the
+    same block), the displacement is ramped linearly across the block so the
+    transition is click-free.
+
+    Returns (out, n_valid) — the (frames, 2) float32 output buffer and the
+    count of samples that fell inside the valid region of *data*.
+    """
+    if abs(catchup_s) > 0.5:
+        ramp = np.linspace(0.0, 1.0, frames, dtype=np.float64)
+        pos = idx_pre + np.arange(frames, dtype=np.float64) * rate + catchup_s * ramp
+    else:
+        pos = idx_pre + np.arange(frames, dtype=np.float64) * rate
+    n = len(data)
+    i = pos.astype(np.int64)
+    f = (pos - i).astype(np.float32)
+    valid_mask = (i >= 0) & (i < n)
+    i_safe = np.clip(i, 0, n - 1)
+    i1_safe = np.minimum(i_safe + 1, n - 1)
+    out = np.empty((frames, 2), dtype=np.float32)
+    f2 = f[:, None]
+    out[:, 0] = data[i_safe, 0] * (1 - f2.ravel()) + data[i1_safe, 0] * f2.ravel()
+    out[:, 1] = data[i_safe, 1] * (1 - f2.ravel()) + data[i1_safe, 1] * f2.ravel()
+    out[~valid_mask] = 0.0
+    n_valid = int(valid_mask.sum())
+    return out, n_valid
 
 
 def ts():

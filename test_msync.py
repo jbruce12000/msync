@@ -1228,14 +1228,28 @@ def test_client_callback_applies_volume_and_mute(client):
     h._realign_on_next_cb = False
     h.local_pos = 0.2
     h.err_f = 0.0
+    # Pin the drift controller fully off (zero NTP feedforward, zero integral
+    # and derivative memory) so the interpolated positional read is bit-identical
+    # across the three _cb calls below — the volume/mute comparisons rely on the
+    # pre-gain sample streams being identical, not on any particular read
+    # implementation.
+    h.clock.drift = 0.0
+    h._pitch_int = 0.0
+    h._pid_int = 0.0
+    h._pid_prev = 0.0
     frames = 2048
     ramp = min(frames, int(C.AUDIO_FADE_SEC * h.buffer.sr))
     assert ramp < frames
-    # The signal the callback reads at local_pos==0.2 (before any gain/fade).
-    i0 = int(h.local_pos * h.buffer.sr)
-    raw = np.zeros((frames, 2), dtype=np.float32)
-    k = min(i0 + frames, len(h.buffer.data))
-    raw[: k - i0] = h.buffer.data[i0:k]
+    # The reference for each call is the exact interpolated stream the read
+    # path produced for that call (same pre-catchup index, same rate the
+    # controller landed on, read back via h.drift_pitch after the call). The
+    # gain/mute checks then compare like-for-like: they prove the *gain*
+    # behaved correctly, independent of the read implementation.
+    def _expected(before):
+        rate = 1.0 + h.drift_pitch
+        idx = (before + h._out_latency) * h.buffer.sr
+        return C.interp_read(h.buffer.data, idx, rate, frames)[0]
+
     base = np.zeros((frames, 2), dtype=np.float32)
     # Pin the PLL reference to local_pos so err==0 and the catchup nudge
     # (which advances local_pos by CATCHUP_STEP) can't shift the window; the
@@ -1243,6 +1257,9 @@ def test_client_callback_applies_volume_and_mute(client):
     h._base_pos = h.local_pos
     h._base_clock = C.ts()
     h._cb(base, frames, None, None)
+    exp_base = _expected(0.2)
+    # volume 1.0 -> no gain ramp: the callback output IS the read stream
+    assert np.array_equal(base, exp_base)
 
     h.local_pos = 0.2
     h.err_f = 0.0
@@ -1251,11 +1268,13 @@ def test_client_callback_applies_volume_and_mute(client):
     h._volume = 0.5
     half = np.zeros((frames, 2), dtype=np.float32)
     h._cb(half, frames, None, None)
+    exp_half = _expected(0.2)
     # after the 10ms ramp the gain is exactly 0.5 ...
-    assert np.allclose(half[ramp:], base[ramp:] * 0.5)
-    # ... and the ramp is monotone from 1.0 down to 0.5 (no gain step)
-    assert np.all(np.abs(half[:ramp]) <= np.abs(raw[:ramp]) * 1.0 + 1e-6)
-    assert np.all(np.abs(half[:ramp]) >= np.abs(raw[:ramp]) * 0.5 - 1e-6)
+    assert np.array_equal(half[ramp:], exp_half[ramp:] * 0.5)
+    # ... and during the ramp the gain is monotone 1.0 -> 0.5 (no gain step):
+    # every ramp sample sits between 0.5x and 1.0x of the read stream.
+    assert np.all(np.abs(half[:ramp]) <= np.abs(exp_half[:ramp]) + 1e-6)
+    assert np.all(np.abs(half[:ramp]) >= np.abs(exp_half[:ramp]) * 0.5 - 1e-6)
 
     h.local_pos = 0.2
     h.err_f = 0.0
@@ -1265,8 +1284,9 @@ def test_client_callback_applies_volume_and_mute(client):
     h._muted = True              # mute = gain 0, but volume remembered
     silent = np.zeros((frames, 2), dtype=np.float32)
     h._cb(silent, frames, None, None)
-    assert np.allclose(silent[ramp:], 0)   # fully silent after the ramp
-    assert np.all(np.abs(silent[:ramp]) <= np.abs(raw[:ramp]) * 0.5 + 1e-6)
+    exp_silent = _expected(0.2)
+    assert np.all(silent[ramp:] == 0)   # fully silent after the ramp
+    assert np.all(np.abs(silent[:ramp]) <= np.abs(exp_silent[:ramp]) * 0.5 + 1e-6)
     assert h._volume == 0.5      # unmute restores the level
 
 
@@ -1435,13 +1455,84 @@ def test_client_callback_output_latency_compensation(client):
     # because the playhead starts on the target)
     assert advance > block * 0.99
     assert advance < block * 1.01 + C.CATCHUP_STEP * 2.0
-    # emitted audio starts 300 ms ahead of the raw playhead
-    i0_exp = int((before + 0.300) * h.buffer.sr)
+    # emitted audio starts 300 ms ahead of the raw playhead. The read is now
+    # linearly interpolated at the fractional content position, so compare
+    # against the interpolated expectation (block-granularity int() slicing
+    # would previously make these bit-exact; the value is what matters).
+    idx0 = (before + 0.300) * h.buffer.sr          # exact fractional position
+    i0_exp = int(idx0)
     assert i0_exp + 8 < len(h.buffer.data)
-    assert abs(float(out[0, 0]) - float(h.buffer.data[i0_exp, 0])) < 1e-6
-    assert abs(float(out[8, 0]) - float(h.buffer.data[i0_exp + 8, 0])) < 1e-6
+    rate_read = 1.0 + h.drift_pitch                # what the callback applied
+    for k in (0, 8):
+        pos = idx0 + k * rate_read
+        i = int(pos)
+        f = pos - i
+        j = min(i + 1, len(h.buffer.data) - 1)
+        expected = (h.buffer.data[i, 0] * (1 - f)
+                    + h.buffer.data[j, 0] * f)
+        assert abs(float(out[k, 0]) - expected) < 1e-4, (k, out[k, 0], expected)
     # genuinely offset: 300 ms of samples (not the raw playhead position)
     assert i0_exp - int(before * h.buffer.sr) > int(0.29 * h.buffer.sr)
+
+
+def test_client_callback_interpolated_read_is_click_free(client):
+    # The drift-correcting playhead advances the read position by a fractional
+    # rate per output sample. The OLD block-granularity read dropped or
+    # repeated ~frames*pitch raw samples at each block boundary — an audible
+    # click whenever the pitch is large (bang-bang rails at ±2000ppm on
+    # 10.0.0.4). The interpolated read must join consecutive blocks seamlessly:
+    # adjacent output samples may differ only by the tone's natural sample
+    # slope, never by a whole jump of skipped/repeated content.
+    h = client.client
+    wait_until(lambda: h.buffer.data is not None
+               and h.buffer.duration > 1.0 and h.stream is not None)
+    with C.stream_ops_lock:
+        h.stream.stop()          # silence the real callback: no measurement race
+    sr = h.buffer.sr
+    n = len(h.buffer.data)
+    # Replace the buffered track with a known 440 Hz tone so the maximum
+    # legitimate sample-to-sample delta is bounded by the tone's slope.
+    # (The live buffer is a read-only memmap; swap in a writable array and
+    # restore it afterwards so the fixture's teardown still closes the
+    # original memmap.)
+    t = np.arange(n, dtype=np.float64) / sr
+    sine = (0.5 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    orig_data = h.buffer.data
+    orig_path = h.buffer._decoded_path
+    try:
+        h.buffer.data = np.stack([sine, sine], axis=1)
+        with h.lock:
+            h.playing = True
+            h._realign_on_next_cb = False
+            h.err_f = 0.0
+            h._pitch_int = 0.0
+            h._pid_int = 0.0
+            h._pid_prev = 0.0
+            h.clock.drift = C.MAX_PITCH * 1e6      # ff = rate 1.002, one rail
+            h.local_pos = 1.5
+            h._base_pos = h.local_pos
+            h._base_clock = C.ts()
+        frames = 8192
+        out1 = np.zeros((frames, 2), dtype=np.float32)
+        out2 = np.zeros((frames, 2), dtype=np.float32)
+        h._cb(out1, frames, None, None)
+        with h.lock:
+            h._base_pos = h.local_pos               # re-pin: err stays ~0
+            h._base_clock = C.ts()
+        h._cb(out2, frames, None, None)
+        max_slope = 2 * np.pi * 440.0 / sr * 0.5    # max per-sample delta of the tone
+        # An 8192-sample block advanced at rate 1.002 skips ~16 raw samples
+        # across the seam with the old read (delta ~ 16*max_slope ~ 0.5). A
+        # seamless interpolated read differs by at most one content sample
+        # (~max_slope).
+        seam = abs(float(out2[0, 0]) - float(out1[-1, 0]))
+        assert seam < max_slope * 2.0 + 1e-6, f"click at block seam: {seam}"
+        d = np.abs(np.diff(np.concatenate([out1[:, 0], out2[:, 0]])))
+        assert d.max() < max_slope * 2.0 + 1e-6, \
+            f"click inside blocks: {d.max():.5f}"
+    finally:
+        h.buffer.data = orig_data
+        h.buffer._decoded_path = orig_path
 
 
 def test_client_callback_playhead_advances_when_buffer_exhausted(client):

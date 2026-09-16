@@ -799,6 +799,7 @@ class SyncedServer:
         # Bounded fast catch-up (same as the client): recovers from a server
         # stall or a fresh resume in a few blocks instead of a slow pitch
         # slew that would take tens of seconds. Gated on the smoothed error.
+        idx_pre = max(0.0, self.local_pos * sr) if sr else 0.0
         if abs(ef) > C.CATCHUP_THRESHOLD:
             self.local_pos += C.CATCHUP_STEP if ef > 0 else -C.CATCHUP_STEP
             err = target - self.local_pos
@@ -846,25 +847,20 @@ class SyncedServer:
         self.local_pitch = pitch
         self._mode = "idle" if not self.playing else self._mode
         rate = 1.0 + pitch
-        idx = max(0.0, self.local_pos * sr)
+        # Compute catchup displacement (in content samples) for click-free
+        # ramping across the block.
+        idx_post = max(0.0, self.local_pos * sr)
+        catchup_s = idx_post - idx_pre if sr else 0.0
         n = len(song.data)
-        i0 = int(min(idx, n))
-        i1 = min(i0 + frames, n)
-        out = np.zeros((frames, 2), dtype=np.float32)
-        valid = 0
-        if i0 < n:
-            valid = i1 - i0
-            try:
-                out[:valid] = song.data[i0:i1]
-            except ValueError:
-                valid = 0
+        out, n_valid = C.interp_read(song.data, idx_pre, rate, frames,
+                                     catchup_s=catchup_s)
         # Last audible block of this track (the read window runs past the
         # end): fade the tail so the advance to the next track is a smooth
         # cut instead of clipping whatever note was playing.
-        if valid and int(idx + frames) > n and n_fade:
-            nf = min(valid, n_fade)
-            out[valid - nf:valid] *= np.linspace(1.0, 0.0, nf,
-                                                 dtype=np.float32)[:, None]
+        if n_valid > 0 and n_valid < frames and n_fade:
+            nf = min(n_valid, n_fade)
+            out[n_valid - nf:n_valid] *= np.linspace(1.0, 0.0, nf,
+                                                    dtype=np.float32)[:, None]
         # First block of a new track: fade its head so a loud song opening
         # can't click straight out of the previous track's tail.
         if song.name != self._last_buffer_name:

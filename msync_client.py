@@ -626,12 +626,15 @@ class SyncClient:
             # smoothed error instead.
             self.err_f += C.PLL_ALPHA * (err - self.err_f)
             ef = self.err_f
+            # Read position in content samples BEFORE the catchup nudge, so
+            # the displacement can be ramped across the block for a click-
+            # free transition instead of a hard 5 ms jump.
+            idx_pre = max(0.0, (self.local_pos + self._out_latency) * sr) if sr else 0.0
             # Bounded fast re-alignment: right after a pause/resume, a busy
             # server stall, or a seek, a rate-only PLL capped at MAX_PITCH
             # would take tens of seconds to close a large gap. Nudge the
-            # playhead toward the target by a few ms per block instead (a
-            # sub-block skip/repeat that is effectively inaudible). Gated on
-            # the smoothed error so reference jitter can't trip it.
+            # playhead toward the target by a few ms per block instead.
+            # Gated on the smoothed error so reference jitter can't trip it.
             if abs(ef) > C.CATCHUP_THRESHOLD:
                 self.local_pos += C.CATCHUP_STEP if ef > 0 else -C.CATCHUP_STEP
                 err = target - self.local_pos
@@ -691,14 +694,10 @@ class SyncClient:
             # perfectly aligned.
             self.err_smooth = 0.9 * self.err_smooth + 0.1 * err
 
-            # Output index is the synced playhead plus this room's output
-            # latency: sound written now is heard OUTPUT_LATENCY_MS later,
-            # so pull the samples from that much further ahead on the timeline.
-            # (The PLL still chases the raw playhead; only what we emit is
-            # offset, so sync/control logic is unchanged.)
-            idx = max(0.0, (self.local_pos + self._out_latency) * sr)
+            # Index into the song buffer AFTER any catchup nudge.
+            idx_post = max(0.0, (self.local_pos + self._out_latency) * sr)
             n = len(buf.data)
-            if idx >= n:
+            if idx_post >= n:
                 # This track's data is exhausted. Normally the server has
                 # already moved on to the next track and we're still
                 # downloading/decoding it, so output silence — but keep
@@ -709,18 +708,19 @@ class SyncClient:
                 outdata.fill(0)
                 self.local_pos += frames / sr * rate
                 return
-            i0 = int(idx)
-            i1 = min(int(idx + frames), n)
-            out = np.zeros((frames, 2), dtype=np.float32)
-            valid = i1 - i0
-            out[:valid] = buf.data[i0:i1]
+            # Compute the catchup displacement (in content samples) that
+            # happened between idx_pre and idx_post; ramp it across the block
+            # for a click-free transition.
+            catchup_s = idx_post - idx_pre if sr else 0.0
+            out, n_valid = C.interp_read(buf.data, idx_pre, rate, frames,
+                                         catchup_s=catchup_s)
             # Last audible block of this track (the read window runs past the
             # end): fade the tail so the cut to download-gap silence is smooth
             # instead of clipping whatever note was playing.
-            if valid and int(idx + frames) > n and n_fade:
-                nf = min(valid, n_fade)
-                out[valid - nf:valid] *= np.linspace(1.0, 0.0, nf,
-                                                     dtype=np.float32)[:, None]
+            if n_valid > 0 and n_valid < frames and n_fade:
+                nf = min(n_valid, n_fade)
+                out[n_valid - nf:n_valid] *= np.linspace(1.0, 0.0, nf,
+                                                        dtype=np.float32)[:, None]
             # Per-room volume/mute (server-pushed), ramped on changes.
             self._apply_gain(out)
             # First block of a new (or restarted, sample-rate change) track:
