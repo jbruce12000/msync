@@ -142,8 +142,17 @@ OUTPUT_LATENCY_MS = float(os.environ.get("MSYNC_OUTPUT_LATENCY_MS", "0"))
 #
 #   MSYNC_BANG_BANG=0               disable the hybrid (gentle PI instead)
 #   MSYNC_BANG_BANG_WINDOW_MS=10    error window in milliseconds (default 10)
+#   MSYNC_MAX_PITCH=0.002           max drift-correction pitch (default 0.002)
 BANG_BANG = os.environ.get("MSYNC_BANG_BANG", "1") in ("1", "true", "yes", "on")
 BANG_BANG_WINDOW_MS = float(os.environ.get("MSYNC_BANG_BANG_WINDOW_MS", "10"))
+
+# Max drift-correction pitch, as a fractional rate offset (0.002 = +-0.2% =
+# +-2000ppm, i.e. the audio drifts up to 2ms/s). Bang-bang drives the actuator
+# to +-MAX_PITCH OUTSIDE the error window; the PID and PI controllers clamp
+# to it too, so this is the ceiling on every speed-correction path. Holds the
+# wobble/click costs of pitch down while still closing real drift in seconds.
+# Env-overridable: MSYNC_MAX_PITCH.
+MAX_PITCH = float(os.environ.get("MSYNC_MAX_PITCH", "0.001"))
 
 # Critically-damped PID tuning (used inside the window in test mode). The gains
 # are computed once at start-up from the bang window and the host's audio block

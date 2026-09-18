@@ -10,6 +10,7 @@ Protocol (UDP on configurable port):
 All timestamps are Unix seconds using time.time() (NTP-friendly).
 """
 
+import config
 import json
 import logging
 import numpy as np
@@ -99,7 +100,7 @@ START_VOTE_INTERVAL = 0.1   # client vote cadence while the round is open (s)
 
 # Playback tuning
 LATENCY_SEC   = 0.20        # client start latency per song (schedule ahead)
-MAX_PITCH     = 0.002       # max drift correction pitch (0.2%)
+MAX_PITCH     = config.MAX_PITCH  # max drift correction pitch (0.2%), see config.py
 PITCH_GAIN    = 0.03        # proportional gain for drift correction (1/s)
 PITCH_INT     = 0.02        # integral gain (accumulated error -> pitch)
 DRIFT_HYSTERESIS = 0.010    # deadband (s): don't respond to smaller errors
