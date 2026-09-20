@@ -1455,22 +1455,18 @@ def test_client_callback_output_latency_compensation(client):
     # because the playhead starts on the target)
     assert advance > block * 0.99
     assert advance < block * 1.01 + C.CATCHUP_STEP * 2.0
-    # emitted audio starts 300 ms ahead of the raw playhead. The read is now
-    # linearly interpolated at the fractional content position, so compare
-    # against the interpolated expectation (block-granularity int() slicing
-    # would previously make these bit-exact; the value is what matters).
+    # emitted audio starts 300 ms ahead of the raw playhead. The read
+    # emits the nearest content frame (round-half-up, no interpolation),
+    # so compare against the nearest-sample expectation.
     idx0 = (before + 0.300) * h.buffer.sr          # exact fractional position
     i0_exp = int(idx0)
     assert i0_exp + 8 < len(h.buffer.data)
     rate_read = 1.0 + h.drift_pitch                # what the callback applied
     for k in (0, 8):
         pos = idx0 + k * rate_read
-        i = int(pos)
-        f = pos - i
-        j = min(i + 1, len(h.buffer.data) - 1)
-        expected = (h.buffer.data[i, 0] * (1 - f)
-                    + h.buffer.data[j, 0] * f)
-        assert abs(float(out[k, 0]) - expected) < 1e-4, (k, out[k, 0], expected)
+        i = int(pos + 0.5)
+        expected = h.buffer.data[i, 0]
+        assert abs(float(out[k, 0]) - expected) < 1e-6, (k, out[k, 0], expected)
     # genuinely offset: 300 ms of samples (not the raw playhead position)
     assert i0_exp - int(before * h.buffer.sr) > int(0.29 * h.buffer.sr)
 
@@ -2174,6 +2170,29 @@ def test_restart_resumes_same_song(server):
             except Exception:
                 pass
         srv2.catalog.close()
+
+def test_server_prefetch_adopted_without_sync_decode(server):
+    """The end-of-song swap must adopt the background-decoded next track
+    instead of decoding on the monitor thread: that decode holds the GIL
+    for ~0.5s, starves the audio callback ~one block (~180ms of err), and
+    the PLL then grinds back at full rail + catchup for seconds (heard as
+    a sped-up stretch after every track change)."""
+    from conftest import wait_until
+    server.clear_queue()
+    server.play_song("track_02_B494.wav")
+    server.add_to_queue(["track_03_C554.wav"])
+    assert server.song.name == "track_02_B494.wav"
+    assert server.queue_list() == ["track_03_C554.wav"]
+    server.play_pause()  # freeze: the wall-clock end-of-song trip must not
+    # advance us naturally while the background decode runs.
+    assert wait_until(lambda: server._prefetch is not None
+                      and server._prefetch_path is not None, timeout=15.0)
+    ready = server._prefetch
+    assert ready.name == "track_03_C554.wav"
+    server._start_next()
+    assert server.song is ready  # adopted, not re-decoded synchronously
+    assert server._prefetch is None  # consumed
+
 
 # --------------------------------------------------------------------------- #
 # Per-host autodetected PID (pid_tune.py)                                      #

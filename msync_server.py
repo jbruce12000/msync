@@ -152,6 +152,18 @@ class SyncedServer:
         # callback's pause path fades out the current block; once it has, the
         # monitor loop clears the song. Mirrors the natural end-of-song idle.
         self._stopping_mid_song = False
+        # Next-track prefetch: the track at the queue head is decoded in a
+        # background thread right after each adoption, so the end-of-song
+        # swap is a pointer assignment under the lock instead of a ~0.5s
+        # miniaudio decode on the monitor thread. That decode holds the GIL
+        # and starves the (lock-free but GIL-bound) audio callback for ~one
+        # block (~180ms of err), which the PLL then grinds back at full
+        # rail + catchup for seconds — heard as a sped-up stretch after
+        # every track change. Decoding early moves any GIL pressure
+        # mid-song, where the error is small and the correction inaudible.
+        self._prefetch = None       # ready Song for the next queued path
+        self._prefetch_path = None  # abs path it was decoded from
+        self._prefetch_busy = None  # abs path currently being decoded
 
         # Fresh-track-start quorum. Every _play() bumps `epoch`; the epoch is
         # broadcast in every SYNC payload so clients can recognise a fresh
@@ -291,8 +303,20 @@ class SyncedServer:
             return -1
 
     def _play(self, path, seek=0.0, announce="queued"):
-        """Load + start playing `path`. Caller must hold self.lock."""
-        song = Song(path, relpath=self._relpath(path))
+        """Load + start playing `path`. Caller must hold self.lock.
+
+        If the background prefetch already decoded this path, it is adopted
+        with zero decode work on the critical path; otherwise the file is
+        decoded synchronously (manual plays / mispredicts only). Either way
+        a prefetch for the *new* next track is kicked before returning.
+        """
+        song = None
+        if self._prefetch is not None and self._prefetch_path == path:
+            song = self._prefetch
+            self._prefetch = None
+            self._prefetch_path = None
+        if song is None:
+            song = Song(path, relpath=self._relpath(path))
         self.index = max(0, self._index_of(path))
         self.seek = seek
         self.song_start = C.ts() - self.seek
@@ -315,6 +339,57 @@ class SyncedServer:
                             self.song.sr)
             self._open_stream()
         self._persist_playback()
+        # Decode the new next track now, while this one plays, so the
+        # end-of-song swap finds it ready (see _kick_prefetch).
+        self._kick_prefetch()
+
+    def _peek_next_path(self):
+        """Abs path of the track that will play next (queue head).
+        Caller must hold self.lock. None when the queue is empty."""
+        if not self.queue:
+            return None
+        entry = self.queue[0]
+        if entry.get("type") == "album":
+            paths = entry.get("paths") or []
+            return paths[0] if paths else None
+        return entry.get("path")
+
+    def _kick_prefetch(self):
+        """Start a background decode of the next queued track.
+        Caller must hold self.lock. No-op when nothing is upcoming, the
+        track is already decoded/parked, or a worker is already on it."""
+        nxt = self._peek_next_path()
+        if nxt is None or nxt == self._prefetch_path or nxt == self._prefetch_busy:
+            return
+        self._prefetch_busy = nxt
+        threading.Thread(target=self._prefetch_worker, args=(nxt,),
+                         daemon=True).start()
+
+    def _prefetch_worker(self, path):
+        """Decode `path` off the critical path, then park it for _play.
+
+        Runs WITHOUT the lock so the monitor thread and audio callback
+        are never starved by the decode. The result is installed only if
+        the queue head still wants this path; otherwise it is discarded
+        (a manual play / queue edit superseded it while decoding).
+        """
+        try:
+            song = Song(path, relpath=self._relpath(path))
+        except Exception as exc:
+            C.logger().warning("prefetch decode failed %r: %s", path, exc)
+            with self.lock:
+                if self._prefetch_busy == path:
+                    self._prefetch_busy = None
+            return
+        with self.lock:
+            if self._prefetch_busy != path:
+                return          # superseded by a newer prefetch; drop it
+            if self._peek_next_path() != path:
+                self._prefetch_busy = None
+                return          # queue moved on; drop it
+            self._prefetch = song
+            self._prefetch_path = path
+            self._prefetch_busy = None
 
     def _start_next(self):
         """Pop the next thing to play from the queue. Albums in the queue
@@ -361,6 +436,11 @@ class SyncedServer:
                     self._clear_playback()
                 self.song = None
                 self.local_pos = 0.0
+            # Queue ran dry: drop any parked prefetch (nothing upcoming).
+            # An in-flight worker notices the moved head at install time
+            # and discards its result on its own.
+            self._prefetch = None
+            self._prefetch_path = None
             return {"source": "stopped", "file": None}
 
     def _song_entries(self, files):
@@ -420,6 +500,9 @@ class SyncedServer:
                 self._start_next()
             C.logger().info("queue: %d pending", len(self.queue_list()))
             self._persist_queue()
+            # The head may be new (queued mid-song): make sure its decode
+            # is warming while the current track plays.
+            self._kick_prefetch()
             return added_display
 
     def _queued_paths(self):
@@ -452,6 +535,7 @@ class SyncedServer:
                 C.logger().info("queued: %s [%s]", self._relpath(p), album)
             C.logger().info("queue: %d pending", len(self.queue_list()))
             self._persist_queue()
+            self._kick_prefetch()
             return [self._relpath(p) for p in new_paths]
 
     def find_files(self, specs):
@@ -515,6 +599,10 @@ class SyncedServer:
                 self._clear_playback()
             self._persist_queue()
             C.logger().info("queue cleared (%d removed)", n)
+            # Head is gone: drop any parked prefetch (an in-flight worker
+            # discards itself at install time).
+            self._prefetch = None
+            self._prefetch_path = None
             return n
 
     def _find_expanded(self, index):
