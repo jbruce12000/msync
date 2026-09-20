@@ -76,10 +76,7 @@ DEFAULT_PORT = 9770
 SYNC_INTERVAL = 0.05        # server sync broadcast period (s) = 20 Hz
 STATE_INTERVAL = 1.0        # server state broadcast period (s) for queue info
 NTP_INTERVAL  = 1.0         # client NTP resync period (s)
-REGISTER_INTERVAL = 10.0    # client re-registration period (s): keeps the
-                            # web UI's room list + online status fresh across
-                            # server restarts (the server also treats every
-                            # NTP request as a heartbeat)
+REGISTER_INTERVAL = config.REGISTER_INTERVAL  # client re-registration period (s)
 
 # Idle / paused intervals – broadcast much less when nothing is moving
 IDLE_SYNC_INTERVAL  = 10.0  # server sync broadcast period when paused/stopped

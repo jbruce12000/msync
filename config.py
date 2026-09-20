@@ -108,6 +108,12 @@ HTTP_PORT_OFFSET = 1000
 # affects rooms that have genuinely gone away.
 CLIENT_STALE_AFTER = int(os.environ.get("MSYNC_CLIENT_STALE_AFTER", "86400"))
 
+# Client heartbeat cadence (seconds): how often each room re-registers,
+# reporting its current sync error (the Rooms graph plots these points, so
+# lower it temporarily — e.g. MSYNC_REGISTER_INTERVAL=1 — for a lively
+# graph). Steady default is 10 s.
+REGISTER_INTERVAL = float(os.environ.get("MSYNC_REGISTER_INTERVAL", "10.0"))
+
 
 # --------------------------------------------------------------------------- #
 # Room tuning                                                                  #
