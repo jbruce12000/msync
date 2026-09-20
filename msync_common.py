@@ -142,20 +142,11 @@ PID_P_EDGE_FRAC = 0.6       # P term at window edge, as a fraction of MAX_PITCH
 AUDIO_FADE_SEC = 0.010
 
 
-def interp_read(data, idx_pre, rate, frames, catchup_s=0.0):
-    """Variable-rate interpolated read from stereo audio data.
+def interp_read_linear(data, idx_pre, rate, frames, catchup_s=0.0):
+    """Original variable-rate interpolated read (kept for A/B reference).
 
-    Reads *frames* output samples from *data* (N×2 float32) starting at
-    fractional content-sample position *idx_pre*, advancing by *rate*
-    content samples per output sample.  Linear interpolation eliminates the
-    block-boundary sample drops/repeats that produce clicks when *rate* ≠ 1.
-
-    When *catchup_s* is nonzero (a bounded playhead nudge applied in the
-    same block), the displacement is ramped linearly across the block so the
-    transition is click-free.
-
-    Returns (out, n_valid) — the (frames, 2) float32 output buffer and the
-    count of samples that fell inside the valid region of *data*.
+    Reads *frames* output samples advancing by *rate* with linear
+    interpolation, ramping *catchup_s* linearly across the block.
     """
     if abs(catchup_s) > 0.5:
         ramp = np.linspace(0.0, 1.0, frames, dtype=np.float64)
@@ -172,6 +163,44 @@ def interp_read(data, idx_pre, rate, frames, catchup_s=0.0):
     f2 = f[:, None]
     out[:, 0] = data[i_safe, 0] * (1 - f2.ravel()) + data[i1_safe, 0] * f2.ravel()
     out[:, 1] = data[i_safe, 1] * (1 - f2.ravel()) + data[i1_safe, 1] * f2.ravel()
+    out[~valid_mask] = 0.0
+    n_valid = int(valid_mask.sum())
+    return out, n_valid
+
+
+def interp_read(data, idx_pre, rate, frames, catchup_s=0.0):
+    """Drop/repeat read: spread correction as single-frame edits.
+
+    Total input to consume over the block is
+        total = frames * rate + catchup_s
+    so the per-output step is  eff = total / frames
+                              = rate + catchup_s / frames.
+    Ideal position of output ``j`` is ``idx_pre + j * eff``; the output
+    is the NEAREST input frame (round-half-up, no interpolation).
+
+    When ``eff > 1`` this skips (deletes) ``~total - frames`` single
+    frames evenly spaced through the block; when ``eff < 1`` it repeats
+    (copies) ``~frames - total`` frames evenly spaced. Rounding a constant
+    slope is a Bresenham distribution, so the edits are as evenly spaced
+    as possible and each edit is exactly 1 frame (~0.023 ms @ 44.1 kHz).
+
+    Returns (out, n_valid) like :func:`interp_read_linear`.
+    """
+    n = len(data)
+    if frames <= 0:
+        return np.empty((0, 2), dtype=np.float32), 0
+    if frames == 1:
+        eff = float(rate) + float(catchup_s)
+    else:
+        eff = float(rate) + float(catchup_s) / float(frames)
+    j = np.arange(frames, dtype=np.float64)
+    pos = float(idx_pre) + j * eff
+    i = np.floor(pos + 0.5).astype(np.int64)
+    valid_mask = (i >= 0) & (i < n)
+    i_safe = np.clip(i, 0, n - 1)
+    out = np.empty((frames, 2), dtype=np.float32)
+    out[:, 0] = data[i_safe, 0]
+    out[:, 1] = data[i_safe, 1]
     out[~valid_mask] = 0.0
     n_valid = int(valid_mask.sum())
     return out, n_valid
