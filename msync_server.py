@@ -142,6 +142,9 @@ class SyncedServer:
         self._pid_int = 0.0         # PID integral state
         self._pid_prev = 0.0        # previous smoothed error for the D term
         self.err_f = 0.0            # low-passed PLL error (EMA of callback err)
+        self._last_cb_ts = 0.0      # wall time of the previous audio callback
+                                    # (gap detector: starved callbacks are the
+                                    # only thing that can move server err)
         self._fade_out = False      # set by close_audio -> callback fades to silence
         # Click-free state transitions (same scheme as the client): pause emits
         # one last faded block, resume fades back in, and the first block of a
@@ -311,10 +314,12 @@ class SyncedServer:
         a prefetch for the *new* next track is kicked before returning.
         """
         song = None
+        via = "decode"
         if self._prefetch is not None and self._prefetch_path == path:
             song = self._prefetch
             self._prefetch = None
             self._prefetch_path = None
+            via = "prefetch"
         if song is None:
             song = Song(path, relpath=self._relpath(path))
         self.index = max(0, self._index_of(path))
@@ -332,8 +337,8 @@ class SyncedServer:
         # lock, so it either sees the fully-updated old state or the fully-
         # updated new state (at most one torn block at a track swap).
         self.song = song
-        C.logger().info("playing: %s (%.1fs) [%s]", self.song.name,
-                        self.song.duration, announce)
+        C.logger().info("playing: %s (%.1fs) [%s/%s]", self.song.name,
+                        self.song.duration, announce, via)
         if self.stream is None or self.stream.samplerate != self.song.sr:
             C.logger().info("opening audio stream (%d Hz, stereo)",
                             self.song.sr)
@@ -842,6 +847,21 @@ class SyncedServer:
         # (see _play); a torn read is limited to at most one block right at a
         # track swap, which beats a multi-block stall by a wide margin.
         song = self.song
+        # Stall detector: the server is its own clock, so a jumping err can
+        # only mean the callback itself stopped running (GIL hog, scheduler
+        # delay, device xrun). Log the gap directly instead of inferring it
+        # from 2s status lines after the fact.
+        now = C.ts()
+        sr_hint = song.sr if song is not None else 0
+        if self._last_cb_ts and sr_hint:
+            block_dur = frames / float(sr_hint)
+            gap = now - self._last_cb_ts
+            if gap > block_dur * 2.0:
+                C.logger().warning(
+                    "audio callback gap %.0fms (~%.1f blocks) song=%s",
+                    gap * 1000.0, gap / block_dur,
+                    song.name if song is not None else None)
+        self._last_cb_ts = now
         if song is None:
             self._prev_playing = False
             self._last_buffer_name = None
@@ -1095,8 +1115,9 @@ class SyncedServer:
                         # instantaneous sample swings +/-one block of sawtooth
                         # and disagrees with mode despite perfect alignment.
                         err = self.err_f
+                        raw = (C.ts() - self.song_start) - self.local_pos
                         print(f"[server] playing song={self.song.name}  "
-                              f"err={err*1000:+7.1f}ms  "
+                              f"err={err*1000:+7.1f}ms  raw={raw*1000:+7.1f}ms  "
                               f"pitch={self.local_pitch*1e6:+.0f}ppm  "
                               f"mode={self._mode}  "
                               f"window=±{config.BANG_BANG_WINDOW_MS:.0f}ms")
