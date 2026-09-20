@@ -132,39 +132,12 @@ OUTPUT_LATENCY_MS = float(os.environ.get("MSYNC_OUTPUT_LATENCY_MS", "0"))
 
 
 # --------------------------------------------------------------------------- #
-# PID test mode (bang-bang outside the error window)                          #
+# Drift correction                                                              #
 # --------------------------------------------------------------------------- #
 
-# Drift-controller hybrid, ON BY DEFAULT. When enabled, any smoothed sync
-# error OUTSIDE a +/-BANG_BANG_WINDOW_MS window drives the actuator at FULL
-# pitch power (+/-MAX_PITCH = +/-2000ppm) bang-bang; INSIDE the window it runs
-# a critically-damped PID (see pid_tune.py). The audio paths realize pitch by
-# dropping/repeating raw samples at block boundaries (no interpolation), so
-# large pitches are AUDIBLY CLICKY — which is why the fresh-track-start quorum
-# matters: every room anchors a new song to the SAME consensus start time, so
-# the opening error is one small shared bias inside the window and bang-bang
-# never engages on song start. Set to 0 to fall back to the gentle PI
-# controller for the whole song. Env-overridable:
-#
-#   MSYNC_BANG_BANG=0               disable the hybrid (gentle PI instead)
-#   MSYNC_BANG_BANG_WINDOW_MS=10    error window in milliseconds (default 10)
-#   MSYNC_MAX_PITCH=0.002           max drift-correction pitch (default 0.002)
-BANG_BANG = os.environ.get("MSYNC_BANG_BANG", "1") in ("1", "true", "yes", "on")
-BANG_BANG_WINDOW_MS = float(os.environ.get("MSYNC_BANG_BANG_WINDOW_MS", "10"))
-
 # Max drift-correction pitch, as a fractional rate offset (0.002 = +-0.2% =
-# +-2000ppm, i.e. the audio drifts up to 2ms/s). Bang-bang drives the actuator
-# to +-MAX_PITCH OUTSIDE the error window; the PID and PI controllers clamp
-# to it too, so this is the ceiling on every speed-correction path. Holds the
-# wobble/click costs of pitch down while still closing real drift in seconds.
+# +-2000ppm, i.e. the audio drifts up to 2ms/s). This is the ceiling on the
+# gentle PI controller's speed-correction path. Holds the wobble costs of
+# pitch down while still closing real drift in seconds.
 # Env-overridable: MSYNC_MAX_PITCH.
 MAX_PITCH = float(os.environ.get("MSYNC_MAX_PITCH", "0.001"))
-
-# Critically-damped PID tuning (used inside the window in test mode). The gains
-# are computed once at start-up from the bang window and the host's audio block
-# period, and held in memory — nothing is persisted (see pid_tune.py).
-#   PID_SETTLE_MS        target 95% settling time (ms); 0 = auto, derived from
-#                        the bang window so the PID stays unsaturated inside it
-#   PID_OMEGA_MAX_FRAC   cap on wn as a fraction of the host's block/loop rate
-PID_SETTLE_MS = float(os.environ.get("MSYNC_PID_SETTLE_MS", "0"))
-PID_OMEGA_MAX_FRAC = float(os.environ.get("MSYNC_PID_OMEGA_MAX_FRAC", "0.5"))

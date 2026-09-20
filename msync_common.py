@@ -69,7 +69,7 @@ TYPE_START_VOTE = 10 # client -> server: offset vote for the fresh-track-start
 TYPE_START_ACK  = 11 # server -> all: agreed (consensus) clock offset for the
                      # epoch that just started (epoch, offset_ms): the median of
                      # the voters' estimates, used to anchor everyone to the
-                     # SAME start time so bang-bang (and the whole suite) hears
+                     # SAME start time so the whole suite hears
                      # a clean song opening instead of per-room start jitter
 
 DEFAULT_PORT = 9770
@@ -89,8 +89,7 @@ IDLE_NTP_INTERVAL   = 10.0  # client NTP resync period when paused/stopped
 # distinct rooms have voted or the deadline passes, then broadcasts
 # TYPE_START_ACK. All rooms then anchor the new track to that SAME offset, so
 # the initial playhead error right at the beginning of a song is one shared
-# bias instead of each room's own (often +-10ms+) estimate — bang-bang stays
-# inside its error window instead of slamming the pitch rail on song open.
+# bias instead of each room's own (often +-10ms+) estimate.
 START_ROUND_SEC    = 0.6    # how long the server collects offset votes (s)
 START_QUORUM       = 2      # distinct voters that close the round early
 START_VOTE_INTERVAL = 0.1   # client vote cadence while the round is open (s)
@@ -124,13 +123,6 @@ PREFETCH_PREWARM_S      = 2.0    # warm this many seconds of the next track
 PLL_ALPHA     = 0.15        # PLL error EMA weight (0..1, higher = faster)
 INT_UNWIND    = 1.0         # per-callback integrator unwind when error is tiny (1.0 = no decay; lets integral hold its drift correction)
 INT_LIMIT     = 0.02        # integrator state clip (x PITCH_INT = <=400ppm)
-
-# PID test mode (bang-bang/PID hybrid) tuning. PID_P_EDGE_FRAC is the fraction
-# of the pitch rail the critically-damped PID's P term is designed to use at the
-# bang-window edge (see pid_tune.py). Small enough to keep the PID unsaturated
-# (genuinely linear) across the +/-window instead of railing a fraction of a
-# millisecond into it; 1.0 would pin the P output at the rail at the edge.
-PID_P_EDGE_FRAC = 0.6       # P term at window edge, as a fraction of MAX_PITCH
 
 # Loud state transitions (pause/resume, mute/volume changes, track starts/ends)
 # are ramped over this many seconds in the audio callback. A hard step from

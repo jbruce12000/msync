@@ -10,7 +10,6 @@ import pytest
 
 import config
 import msync_common as C
-import pid_tune
 from conftest import (MUSIC, make_tagged_mp3, make_tagged_wav, wait_until)
 from msync_catalog import Catalog
 
@@ -1255,8 +1254,6 @@ def test_client_callback_applies_volume_and_mute(client):
     # implementation.
     h.clock.drift = 0.0
     h._pitch_int = 0.0
-    h._pid_int = 0.0
-    h._pid_prev = 0.0
     frames = 2048
     ramp = min(frames, int(C.AUDIO_FADE_SEC * h.buffer.sr))
     assert ramp < frames
@@ -1491,14 +1488,14 @@ def test_client_callback_output_latency_compensation(client):
     assert i0_exp - int(before * h.buffer.sr) > int(0.29 * h.buffer.sr)
 
 
-def test_client_callback_interpolated_read_is_click_free(client):
+def test_client_callback_read_is_click_free(client):
     # The drift-correcting playhead advances the read position by a fractional
     # rate per output sample. The OLD block-granularity read dropped or
     # repeated ~frames*pitch raw samples at each block boundary — an audible
-    # click whenever the pitch is large (bang-bang rails at ±2000ppm on
-    # 10.0.0.4). The interpolated read must join consecutive blocks seamlessly:
-    # adjacent output samples may differ only by the tone's natural sample
-    # slope, never by a whole jump of skipped/repeated content.
+    # click whenever the pitch is large. The read must join consecutive
+    # blocks seamlessly: adjacent output samples may differ only by the
+    # tone's natural sample slope, never by a whole jump of
+    # skipped/repeated content.
     h = client.client
     wait_until(lambda: h.buffer.data is not None
                and h.buffer.duration > 1.0 and h.stream is not None)
@@ -1522,8 +1519,6 @@ def test_client_callback_interpolated_read_is_click_free(client):
             h._realign_on_next_cb = False
             h.err_f = 0.0
             h._pitch_int = 0.0
-            h._pid_int = 0.0
-            h._pid_prev = 0.0
             h.clock.drift = C.MAX_PITCH * 1e6      # ff = rate 1.002, one rail
             h.local_pos = 1.5
             h._base_pos = h.local_pos
@@ -2219,83 +2214,14 @@ def test_server_prefetch_adopted_without_sync_decode(server, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Per-host autodetected PID (pid_tune.py)                                      #
-# --------------------------------------------------------------------------- #
-def test_pid_tune_critically_damped_gains():
-    g = pid_tune.compute_gains(8192 / 44100.0)
-    # critical-damping relations for the integrator+lag plant
-    assert g["kp"] == pytest.approx(3 * g["wn"] ** 2 * g["tau"])
-    assert g["ki"] == pytest.approx(g["wn"] ** 3 * g["tau"])
-    assert g["kd"] >= 0.0
-    assert 0.0 < g["kp"] and 0.0 < g["ki"]
-    # different hosts (different block periods) get different gains; the P term
-    # is window-anchored (tau-independent), so the per-host difference shows up
-    # in the integral term Ki
-    g2 = pid_tune.compute_gains(8192 / 48000.0)
-    assert g["kp"] == g2["kp"]
-    assert g["ki"] != g2["ki"]
-
-
-def test_pid_tune_startup_values_are_deterministic():
-    # Gains are computed once at start-up (compute_gains), equal across hosts
-    # with the same block period, and never read from / written to disk.
-    g1 = pid_tune.compute_gains()
-    g2 = pid_tune.compute_gains(8192 / 44100.0)
-    assert g1 == g2
-    assert set(g1) == {"kp", "ki", "kd", "wn", "tau", "block_period",
-                       "window_ms"}
-    assert g1["kp"] == pytest.approx(3 * g1["wn"] ** 2 * g1["tau"])
-    assert g1["ki"] == pytest.approx(g1["wn"] ** 3 * g1["tau"])
-    assert g1["window_ms"] == pytest.approx(config.BANG_BANG_WINDOW_MS)
-
-
-def test_client_pid_active_inside_window(client, monkeypatch):
-    # In PID test mode, the hybrid must run the critically-damped PID whenever
-    # the smoothed error is INSIDE +/-BANG_BANG_WINDOW_MS (i.e. PID active when
-    # -10ms < err < +10ms at the default window), and only apply full-power
-    # bang-bang pitch OUTSIDE that band.
-    monkeypatch.setattr(config, "BANG_BANG", True)
-    monkeypatch.setattr(config, "BANG_BANG_WINDOW_MS", 10.0)
-    h = client.client
-    wait_until(lambda: h.buffer.data is not None
-               and h.buffer.duration > 1.0 and h.stream is not None)
-    with C.stream_ops_lock:
-        h.stream.stop()          # silence the real callback: no measurement race
-    with h.lock:
-        h.playing = True
-        h._pitch_int = 0.0
-        h._pid_int = 0.0
-        h._pid_prev = 0.0
-        h.err_f = 0.0
-        target = max(0.0, h.clock.server_now() - h.server_song_start)
-        # ~5ms behind the reference: inside the +-10ms window -> PID
-        h.local_pos = max(0.0, min(target - 0.005, h.buffer.duration - 2.0))
-    out = np.zeros((8192, 2), dtype=np.float32)
-    h._cb(out, 8192, None, None)
-    with h.lock:
-        assert h._mode == "PID"
-        assert abs(h.drift_pitch) < C.MAX_PITCH     # PID, NOT railed to +-2000
-    # ~200ms behind the reference: outside the +-10ms window -> bang-bang
-    with h.lock:
-        target = max(0.0, h.clock.server_now() - h.server_song_start)
-        h.local_pos = max(0.0, min(target - 0.200, h.buffer.duration - 2.0))
-        h.err_f = 0.0
-    h._cb(out, 8192, None, None)
-    with h.lock:
-        assert h._mode == "BANG"
-        assert h.drift_pitch == C.MAX_PITCH         # railed to +2000ppm
-
-
-# --------------------------------------------------------------------------- #
 # Fresh-track-start quorum                                                     #
 #                                                                              #
 # A track (or restart) opens a short round where every room casts an "offset   #
 # vote" (its NTP estimate of the server clock). The server closes the round    #
 # once a quorum of distinct rooms has voted or the deadline passes, and        #
 # broadcasts the consensus (median offset) as TYPE_START_ACK. Every room then  #
-# anchors the new song with that SAME offset, so bang-bang never sees a big    #
-# per-room start error on the song's first blocks (the source of the           #
-# start-of-song clicks the pure-PI default was hiding).                        #
+# anchors the new song with that SAME offset, so no room starts with a big    #
+# per-room error on the song's first blocks.                                  #
 # --------------------------------------------------------------------------- #
 def _quorum_server(tmp_path, port=9937):
     """A bare SyncedServer (no udp_loop/HTTP threads) for deterministic round
@@ -2535,7 +2461,7 @@ def test_start_quorum_round_trip(server, client, monkeypatch):
 # an arbitrary wall instant BETWEEN PortAudio blocks, while local_pos only     #
 # steps once per block. Between that anchor and the next block the true server #
 # timeline pulls ahead of the frozen playhead by up to one full block (~186ms  #
-# at 8192 frames / 44.1kHz) of phantom lag — bang-bang rails MAX_PITCH and     #
+# at 8192 frames / 44.1kHz) of phantom lag — the controller rails to         #
 # catchup grinds it away over the song's first seconds. That phase sawtooth is #
 # what both rooms showed (~+105/+116ms) at the start of the 2nd track after a  #
 # long pause. _rebase() arms _realign_on_next_cb; the callback advances the    #
@@ -2553,32 +2479,30 @@ def test_client_realigns_reference_at_next_block_after_rebase(client, monkeypatc
     monkeypatch.setattr(MC, "ts", lambda: fake["t"])
 
     out = np.zeros((8192, 2), dtype=np.float32)
-    monkeypatch.setattr(config, "BANG_BANG", True)
-    monkeypatch.setattr(config, "BANG_BANG_WINDOW_MS", 10.0)
     with h.lock:
         h.playing = True
         h._pitch_int = 0.0
-        h._pid_int = 0.0
-        h._pid_prev = 0.0
         h.err_f = 0.0
         # Control: reference pinned mid-block with no pending realign — the
         # first block lands 100ms later and reads ~+100ms of pure phase
-        # "error", so bang-bang rails the pitch (the pre-fix spike).
+        # "error" (err_f pre-charged: the EMA would take several blocks to
+        # get there on its own), so the PI rails the pitch (the pre-fix spike).
         h.local_pos = 0.3
         h._base_pos = h.local_pos
         h._base_clock = fake["t"] - 0.100
+        h.err_f = 0.100
     h._cb(out, 8192, None, None)
     with h.lock:
-        assert h._mode == "BANG"
         assert h.drift_pitch == C.MAX_PITCH         # railed to +2000ppm
         assert h.err_f > 1e-3
 
     # Fixed path: the adopt's _rebase() arms a realign; the FIRST block re-pins
     # base_clock/base_pos AT the block edge, so err starts ~0 and the
-    # controller stays in the +-window PID instead of grinding a phantom gap.
+    # controller stays inside its deadband instead of grinding a phantom gap.
     with h.lock:
         h.playing = True
         h.err_f = 0.0
+        h._pitch_int = 0.0
         h.local_pos = 0.3
         h._rebase()              # pins base at fake["t"]=0.0 AND arms realign
         h._base_clock = fake["t"] - 0.100   # ... and the block boundary is, as
@@ -2591,7 +2515,7 @@ def test_client_realigns_reference_at_next_block_after_rebase(client, monkeypatc
         assert not h._realign_on_next_cb          # consumed at the block edge
         assert h._base_clock == pytest.approx(0.100)
         assert h._base_pos == pytest.approx(h.local_pos - block)
-        assert h._mode == "PID"                   # err ~0 -> in-window PID
+        assert abs(h.drift_pitch) < C.MAX_PITCH   # err ~0 -> inside deadband
         assert abs(h.err_f) < 0.02
 
 

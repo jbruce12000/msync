@@ -57,7 +57,6 @@ import config
 import msync_common as C
 import msync_pandora
 import msync_youtube
-import pid_tune
 from msync_catalog import (Catalog, abs_path, is_audio_name,
                            relpath_norm)
 from msync_inotify import MusicWatcher
@@ -145,12 +144,7 @@ class SyncedServer:
         self.stream = None          # PortAudio stream (opened in _play)
         self.local_pos = 0.0        # local playhead (seconds) in current song
         self._pitch_int = 0.0       # drift PI integrator state
-        self._mode = "idle"         # controller mode: BANG / PID / PI / idle
         self.local_pitch = 0.0      # latest applied pitch (display only)
-        self._pid = pid_tune.compute_gains()   # critical PID gains, computed
-                                               # once at start-up (test mode)
-        self._pid_int = 0.0         # PID integral state
-        self._pid_prev = 0.0        # previous smoothed error for the D term
         self.err_f = 0.0            # low-passed PLL error (EMA of callback err)
         self._last_cb_ts = 0.0      # wall time of the previous audio callback
                                     # (gap detector: starved callbacks are the
@@ -191,8 +185,7 @@ class SyncedServer:
         # (TYPE_START_VOTE); once a quorum has voted or the round deadline
         # passes we close it with the median offset and broadcast the
         # consensus (TYPE_START_ACK) so every room anchors the song at the
-        # SAME start time (no per-room start jitter -> click-free bang-bang
-        # on song open).
+        # SAME start time (no per-room start jitter).
         self._epoch = 0               # track-start counter for the quorum
         self._start_round = None      # {epoch, votes{ip: ms}, deadline}
 
@@ -346,8 +339,6 @@ class SyncedServer:
         self.playing = True
         self._epoch += 1              # fresh track (or restart): new start round
         self._pitch_int = 0.0      # fresh track: fresh alignment state
-        self._pid_int = 0.0
-        self._pid_prev = 0.0
         self.err_f = 0.0
         self._stopping_mid_song = False
         # Publish the song ref LAST: the audio callback reads it without the
@@ -1000,49 +991,22 @@ class SyncedServer:
         if abs(ef) > C.CATCHUP_THRESHOLD:
             self.local_pos += C.CATCHUP_STEP if ef > 0 else -C.CATCHUP_STEP
             err = target - self.local_pos
-        if config.BANG_BANG:
-            # PID test mode. OUTSIDE the ±window: apply FULL pitch power
-            # (±MAX_PITCH = ±2000ppm) in the direction of the error
-            # (bang-bang); drop stale windup so it can't bleed into the next
-            # in-window phase. INSIDE the window: run the host's critically-
-            # damped PID, computed once at start-up (see pid_tune.py). The
-            # server is its own clock, so there is no NTP feedforward term.
-            if abs(ef) > config.BANG_BANG_WINDOW_MS / 1000.0:
-                self._mode = "BANG"
-                self._pitch_int = 0.0
-                self._pid_int = 0.0
-                pitch = float(-C.MAX_PITCH if ef < 0 else C.MAX_PITCH)
-            else:
-                self._mode = "PID"
-                g = self._pid
-                dt = frames / sr
-                self._pid_int = float(np.clip(
-                    self._pid_int + ef * dt, -C.MAX_PITCH / g["ki"],
-                    C.MAX_PITCH / g["ki"]))
-                d = g["kd"] * (ef - self._pid_prev) / dt
-                self._pid_prev = ef
-                pitch = float(np.clip(
-                    g["kp"] * ef + g["ki"] * self._pid_int + d,
-                    -C.MAX_PITCH, C.MAX_PITCH))
+        # Gentle PI drift controller on the smoothed error (server is its
+        # own clock, so no feedforward term), with an audible deadband like
+        # the client; tight integrator clip + fast unwind so a stale windup
+        # can't keep the pitch pinned at ±MAX_PITCH.
+        ed = float(np.copysign(max(abs(ef) - C.DRIFT_HYSTERESIS, 0.0), ef))
+        if ed:
+            self._pitch_int += max(-C.INT_LIMIT, min(C.INT_LIMIT, ed))
+            # integral pulling against the error: unwind it now
+            if self._pitch_int * ef < 0.0:
+                self._pitch_int *= 0.5
         else:
-            self._mode = "PI"
-            # gentle PI drift controller on the smoothed error (server is its
-            # own clock, so no FF) with an audible deadband like the client;
-            # tight integrator clip + fast unwind so a stale windup can't keep
-            # the pitch pinned at ±MAX_PITCH
-            ed = float(np.copysign(max(abs(ef) - C.DRIFT_HYSTERESIS, 0.0), ef))
-            if ed:
-                self._pitch_int += max(-C.INT_LIMIT, min(C.INT_LIMIT, ed))
-                # integral pulling against the error: unwind it now
-                if self._pitch_int * ef < 0.0:
-                    self._pitch_int *= 0.5
-            else:
-                self._pitch_int *= C.INT_UNWIND
-            self._pitch_int = max(-C.INT_LIMIT, min(C.INT_LIMIT, self._pitch_int))
-            pitch = max(-C.MAX_PITCH, min(C.MAX_PITCH,
-                        ed * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT))
+            self._pitch_int *= C.INT_UNWIND
+        self._pitch_int = max(-C.INT_LIMIT, min(C.INT_LIMIT, self._pitch_int))
+        pitch = max(-C.MAX_PITCH, min(C.MAX_PITCH,
+                    ed * C.PITCH_GAIN + self._pitch_int * C.PITCH_INT))
         self.local_pitch = pitch
-        self._mode = "idle" if not self.playing else self._mode
         rate = 1.0 + pitch
         # Compute catchup displacement (in content samples) for click-free
         # ramping across the block.
@@ -1193,24 +1157,22 @@ class SyncedServer:
                     if self.song is not None and time.time() - last_playback >= 5.0:
                         self._persist_playback()
                         last_playback = time.time()
-                    # PID test mode: periodic live status so the DJ can see the
-                    # same err/pitch/mode the clients report (only in test mode
-                    # to keep the default console output untouched).
-                    if (config.BANG_BANG and self.song is not None and self.playing
+                    # Periodic live status so the DJ can see the same
+                    # err/pitch the clients report.
+                    if (self.song is not None and self.playing
                             and time.time() - last_status >= 2.0):
                         last_status = time.time()
-                        # Print the smoothed callback error the mode gate uses
-                        # (self.err_f), NOT a fresh ts-song_start-local_pos read:
-                        # local_pos only steps once per block, so an
-                        # instantaneous sample swings +/-one block of sawtooth
-                        # and disagrees with mode despite perfect alignment.
+                        # Print the smoothed callback error the controller
+                        # gates on (self.err_f), NOT a fresh
+                        # ts-song_start-local_pos read: local_pos only steps
+                        # once per block, so an instantaneous sample swings
+                        # +/-one block of sawtooth even when perfectly aligned.
+                        # raw= is that instantaneous read, for comparison.
                         err = self.err_f
                         raw = (C.ts() - self.song_start) - self.local_pos
                         print(f"[server] playing song={self.song.name}  "
                               f"err={err*1000:+7.1f}ms  raw={raw*1000:+7.1f}ms  "
-                              f"pitch={self.local_pitch*1e6:+.0f}ppm  "
-                              f"mode={self._mode}  "
-                              f"window=±{config.BANG_BANG_WINDOW_MS:.0f}ms")
+                              f"pitch={self.local_pitch*1e6:+.0f}ppm")
                     # Retry the next-track prefetch every pass: _play only
                     # kicks it, and the kick is deferred until the current
                     # track is PREFETCH_DELAY_S old, so the decode lands
@@ -1267,8 +1229,6 @@ class SyncedServer:
             if self.playing:
                 self.song_start = C.ts() - self.local_pos
             self._pitch_int = 0.0      # pause/resume invalidates old windup
-            self._pid_int = 0.0
-            self._pid_prev = 0.0
             self.err_f = 0.0           # (and the smoothed PLL error)
             self._persist_playback()
         return self.playing
@@ -1282,8 +1242,6 @@ class SyncedServer:
             self.song_start = C.ts()
             self.playing = False
             self._pitch_int = 0.0      # fresh alignment on the next play
-            self._pid_int = 0.0
-            self._pid_prev = 0.0
             self.err_f = 0.0
             self._persist_playback()
         return self.playing
@@ -1303,8 +1261,6 @@ class SyncedServer:
             self.song_start = C.ts()
             # A fresh restart invalidates stale drift/PLL alignment.
             self._pitch_int = 0.0
-            self._pid_int = 0.0
-            self._pid_prev = 0.0
             self.err_f = 0.0
             if self.playlist:
                 self.index = max(0, self._index_of(self._abs(self.song.name)))
