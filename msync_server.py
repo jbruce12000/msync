@@ -46,6 +46,7 @@ import statistics
 import threading
 import time
 import urllib.parse
+from collections import deque
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 import miniaudio
@@ -177,6 +178,12 @@ class SyncedServer:
         self._prefetch_path = None  # abs path it was decoded from
         self._prefetch_busy = None  # abs path currently being decoded
         self._adopt_ts = 0.0        # wall time the current track was adopted
+        # Sync-error history for the Rooms-tab graph
+        # (GET /api/rooms/history). "server" samples this room's smoothed
+        # err_f at 1 Hz; "client:<ip>" records each room's reported err_ms
+        # (REGISTER heartbeat, ~10 s cadence). Bounded: ~3 min per series.
+        self._err_hist = {}
+        self._err_hist_len = 180
 
         # Fresh-track-start quorum. Every _play() bumps `epoch`; the epoch is
         # broadcast in every SYNC payload so clients can recognise a fresh
@@ -417,6 +424,66 @@ class SyncedServer:
             self._prefetch_busy = None
             C.logger().info("prefetch decoded %s in %.2fs",
                             song.name, C.ts() - t0)
+
+    def _record_err(self, key, err_ms):
+        """Append one sync-error sample (ms) to a history series."""
+        try:
+            v = float(err_ms)
+        except (TypeError, ValueError):
+            return
+        with self.lock:
+            dq = self._err_hist.get(key)
+            if dq is None:
+                dq = self._err_hist[key] = deque(maxlen=self._err_hist_len)
+            dq.append((C.ts(), v))
+
+    def err_history(self, window_s=60, step_s=1):
+        """Downsampled err history for the Rooms-tab graph.
+
+        Returns {now, window_s, step_s, series: [{key, label, points}]},
+        where points are [t_ms, err_ms|null] on a step_s grid over the
+        last window_s seconds. Buckets take the last sample at or before
+        the bucket edge; client buckets go null when the last report is
+        older than 15 s (the room's offline threshold), so stale rooms
+        break the line instead of flatlining.
+        """
+        now = C.ts()
+        n = max(1, int(window_s // step_s))
+        t0 = now - n * step_s
+        with self.lock:
+            items = [(k, list(dq)) for k, dq in self._err_hist.items()]
+            try:
+                names = {r["ip"]: (r.get("hostname") or r["ip"])
+                         for r in self.catalog.list_clients()}
+            except Exception:
+                names = {}
+        series = []
+        for key, samples in items:
+            if key == "server":
+                label, carry = "server", 2 * step_s
+            elif key.startswith("client:"):
+                label, carry = names.get(key[7:], key[7:]), 15.0
+            else:
+                label, carry = key, 15.0
+            per_bucket = {}
+            for ts, v in samples:
+                b = int((ts - t0) // step_s)
+                if 0 <= b < n:
+                    per_bucket[b] = v
+            points, last_v, last_t = [], None, None
+            for b in range(n):
+                t_edge = t0 + (b + 1) * step_s
+                if b in per_bucket:
+                    last_v, last_t = per_bucket[b], t_edge
+                if last_v is not None and (t_edge - last_t) <= carry:
+                    points.append([int(t_edge * 1000), round(last_v, 2)])
+                else:
+                    points.append([int(t_edge * 1000), None])
+            if any(p[1] is not None for p in points):
+                series.append({"key": key, "label": label, "points": points})
+        series.sort(key=lambda s: (s["key"] != "server", s["label"]))
+        return {"now": now, "window_s": window_s, "step_s": step_s,
+                "series": series}
 
     def _start_next(self):
         """Pop the next thing to play from the queue. Albums in the queue
@@ -1088,6 +1155,7 @@ class SyncedServer:
         last_catalog = time.time()
         last_playback = 0.0
         last_status = 0.0
+        last_hist = 0.0
         last_client_prune = 0.0
         lg = C.logger()
         last_warn = 0.0
@@ -1149,6 +1217,12 @@ class SyncedServer:
                     # mid-song instead of in the opening blocks.
                     if self.playing and self.song is not None:
                         self._kick_prefetch()
+                    # Sample this room's smoothed error for the history
+                    # graph (1 Hz; the endpoint carries it onto its grid).
+                    if (self.song is not None and self.playing
+                            and time.time() - last_hist >= 1.0):
+                        last_hist = time.time()
+                        self._record_err("server", self.err_f * 1000.0)
                 self._absorb_drops()
                 # Refresh the catalog periodically so freshly added albums and
                 # tracks (e.g. via the drop folder) become browsable/skippable.
@@ -1645,6 +1719,8 @@ class SyncedServer:
                         except (TypeError, ValueError):
                             err = None
                     self.catalog.upsert_client(ip, hostname, err_ms=err)
+                    if err is not None:
+                        self._record_err("client:" + ip, err)
                     sock.sendto(C.make_packet(C.TYPE_WELCOME,
                                               **self._sync_payload()), addr)
                     # Push this room's stored output-latency offset (0 if
@@ -1694,6 +1770,7 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
       GET  /api/state         -> full server state + queue
       GET  /api/library       -> list of available songs
       GET  /api/queue         -> queue + now playing
+      GET  /api/rooms/history -> sync-error history for the Rooms graph
       POST /api/queue/add     -> add song(s) to queue  (?name= or JSON)
       POST /api/queue/move    -> reorder (?from=N&to=M or JSON)
       POST /api/queue/remove  -> remove by index (?index=N) or name
@@ -1815,6 +1892,8 @@ def build_handler(srv, music_dir, web_dir=WEB_DIR):
             elif path == "/api/queue":
                 self._json({"queue": srv.queue_list(),
                             "now_playing": srv.song.name if srv.song else ""})
+            elif path == "/api/rooms/history":
+                self._json(srv.err_history())
             elif path == "/api/clients":
                 # Forget rooms unseen for config.CLIENT_STALE_AFTER so the
                 # Configure tab only ever shows rooms that are still around

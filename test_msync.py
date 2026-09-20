@@ -817,6 +817,26 @@ def test_http_state(server):
     assert d["elapsed"] >= 0
 
 
+def test_http_rooms_history(server):
+    """GET /api/rooms/history serves downsampled err series for the Rooms
+    graph: server samples plus per-room reports, on a 1 s grid over the
+    last minute, with nulls where a room went stale."""
+    server._record_err("server", 1.5)
+    server._record_err("server", -2.5)
+    server.catalog.upsert_client("10.9.9.9", "testroom", err_ms=12.0)
+    server._record_err("client:10.9.9.9", 12.0)
+    d = _http(server.port + 1000, "GET", "/api/rooms/history")
+    assert d["window_s"] == 60 and d["step_s"] == 1
+    by_key = {s["key"]: s for s in d["series"]}
+    assert by_key["server"]["label"] == "server"
+    assert by_key["client:10.9.9.9"]["label"] == "testroom"
+    for s in by_key.values():
+        assert len(s["points"]) == 60
+        assert s["points"][-1][1] is not None  # just-recorded: no staleness
+    vals = [p[1] for p in by_key["server"]["points"] if p[1] is not None]
+    assert vals[-1] == -2.5  # last sample wins its bucket
+
+
 def test_http_queue_add_and_clear(server):
     from urllib.parse import quote
     d = _http(server.port + 1000, "POST",

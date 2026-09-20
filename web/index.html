@@ -50,6 +50,12 @@ body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: va
 .client-row .client-status.online { color: var(--green); }
 .client-row .client-status.offline { color: var(--red); }
 .client-row .client-err { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; cursor: help; }
+.err-graph-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin: 4px 0 12px; }
+.err-graph-wrap h3 { margin-top: 0; }
+.err-graph-wrap canvas { width: 100%; display: block; }
+.err-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 8px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.err-chip { display: inline-flex; align-items: center; gap: 6px; }
+.err-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
 .client-row .client-head .vol-row { flex: 1; justify-content: center; margin: 0; }
 .slider-row { display: flex; align-items: center; gap: 14px; }
 .slider-row input[type=range] { flex: 1; -webkit-appearance: none; height: 4px; border-radius: 2px; background: var(--border); outline: none; }
@@ -465,7 +471,7 @@ function setTab(name) {
     document.getElementById('view-config').style.display = name === 'config' ? '' : 'none';
     document.getElementById('view-pandora').style.display = name === 'pandora' ? '' : 'none';
     document.getElementById('view-youtube').style.display = name === 'youtube' ? '' : 'none';
-    if (name === 'config') fetchClients();
+    if (name === 'config') { fetchClients(); fetchErrHistory(); }
     if (name === 'pandora') fetchPandora(true);
     if (name === 'youtube') fetchYouTube(true);
 }
@@ -540,7 +546,9 @@ function errText(c, status) {
 function renderClients() {
     const el = document.getElementById('configure');
     if (!clients.length) {
-        el.innerHTML = '<div class="empty-state">No clients have connected yet. Start the msync client on a room and it will appear here.</div>';
+        el.innerHTML = '<div class="empty-state">No clients have connected yet. Start the msync client on a room and it will appear here.</div>' +
+            errGraphHtml();
+        drawErrGraph();
         return;
     }
     let html = '<h3>Rooms / latency &amp; volume</h3>' +
@@ -604,8 +612,98 @@ function renderClients() {
             <div class="slider-centre"><span>← plays late · plays ahead →</span><span class="lat-unit">offset (ms)</span></div>
         </div>`;
     }
-    el.innerHTML = html;
+    el.innerHTML = html + errGraphHtml();
     updateClientRows();
+    drawErrGraph();
+}
+
+// Sync-error history graph (bottom of the Rooms tab): err over the last
+// 10 minutes for the server and every room, from /api/rooms/history.
+// Client rooms report every ~10 s (staircase with breaks when stale); the
+// server samples at 1 Hz. Redrawn on each fetch; the canvas element comes
+// and goes with renderClients, so every entry point guards for null.
+let errHist = null;
+let errHistTick = 0;
+
+function errGraphHtml() {
+    return '<div class="err-graph-wrap"><h3>Sync error over time</h3>' +
+        '<div class="empty-state" style="padding:0 0 8px;">Milliseconds, last minute. ' +
+        'Flat at zero is locked; repeated rail-to-rail swings are the loop chasing a stall.</div>' +
+        '<canvas id="errgraph"></canvas>' +
+        '<div class="err-legend" id="errlegend"></div></div>';
+}
+
+async function fetchErrHistory() {
+    const d = await api('GET', '/api/rooms/history');
+    if (d.error || !d.series) return;
+    errHist = d;
+    drawErrGraph();
+}
+
+function errColor(i) {
+    if (i === 0) return '#7fd4ff';
+    return 'hsl(' + ((i * 137) % 360) + ' 70% 60%)';
+}
+
+function drawErrGraph() {
+    const cv = document.getElementById('errgraph');
+    if (!cv || !errHist || !errHist.series) return;
+    const W = cv.clientWidth || cv.parentElement.clientWidth || 600;
+    if (W < 10) return;             // tab hidden: try again on the next fetch
+    const H = 180, dpr = window.devicePixelRatio || 1;
+    cv.width = W * dpr; cv.height = H * dpr;
+    cv.style.height = H + 'px';
+    const g = cv.getContext('2d');
+    g.scale(dpr, dpr);
+    g.clearRect(0, 0, W, H);
+    const padL = 44, padR = 8, padT = 8, padB = 16;
+    const iw = W - padL - padR, ih = H - padT - padB;
+    let maxAbs = 5;
+    for (const s of errHist.series)
+        for (const p of s.points)
+            if (p[1] !== null && p[1] !== undefined)
+                maxAbs = Math.max(maxAbs, Math.abs(p[1]));
+    maxAbs = Math.ceil(maxAbs);
+    const t1 = errHist.now * 1000, t0 = t1 - errHist.window_s * 1000;
+    const X = t => padL + (t - t0) / (t1 - t0) * iw;
+    const Y = v => padT + (1 - (v + maxAbs) / (2 * maxAbs)) * ih;
+    g.strokeStyle = '#444'; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(padL, Y(0)); g.lineTo(W - padR, Y(0)); g.stroke();
+    g.fillStyle = '#888'; g.font = '10px sans-serif';
+    g.fillText('+' + maxAbs + ' ms', 2, padT + 8);
+    g.fillText('-' + maxAbs + ' ms', 2, padT + ih);
+    g.fillText('−1m', padL, H - 3);
+    const nowTxt = 'now';
+    g.fillText(nowTxt, W - padR - g.measureText(nowTxt).width, H - 3);
+    errHist.series.forEach((s, i) => {
+        g.strokeStyle = errColor(i); g.lineWidth = 1.5;
+        g.beginPath();
+        let pen = false;
+        for (const p of s.points) {
+            if (p[1] === null || p[1] === undefined) { pen = false; continue; }
+            const x = X(p[0]), y = Y(Math.max(-maxAbs, Math.min(maxAbs, p[1])));
+            if (!pen) { g.moveTo(x, y); pen = true; }
+            else g.lineTo(x, y);
+        }
+        g.stroke();
+    });
+    const leg = document.getElementById('errlegend');
+    if (leg) {
+        let html = '';
+        errHist.series.forEach((s, i) => {
+            let last = null;
+            for (let k = s.points.length - 1; k >= 0; k--) {
+                if (s.points[k][1] !== null && s.points[k][1] !== undefined) {
+                    last = s.points[k][1]; break;
+                }
+            }
+            const txt = (last === null) ? '–'
+                : (last >= 0 ? '+' : '') + last.toFixed(1) + ' ms';
+            html += '<span class="err-chip"><span class="err-dot" style="background:' +
+                errColor(i) + '"></span>' + esc(s.label) + ' ' + txt + '</span>';
+        });
+        leg.innerHTML = html;
+    }
 }
 
 // Refresh each row in place (status + values of idle controls) without
@@ -1421,7 +1519,10 @@ async function youtubeSearch() {
 // ── Polling ──────────────────────────────────────────────────────────
 async function tick() {
     await fetchState();
-    if (currentTab === 'config') fetchClients();
+    if (currentTab === 'config') {
+        fetchClients();
+        if (++errHistTick % 2 === 0) fetchErrHistory();
+    }
     if (currentTab === 'pandora') fetchPandora();
     if (currentTab === 'youtube') fetchYouTube();
 }
