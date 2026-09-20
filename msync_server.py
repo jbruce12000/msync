@@ -397,6 +397,7 @@ class SyncedServer:
         the queue head still wants this path; otherwise it is discarded
         (a manual play / queue edit superseded it while decoding).
         """
+        t0 = C.ts()
         try:
             song = Song(path, relpath=self._relpath(path))
         except Exception as exc:
@@ -414,6 +415,8 @@ class SyncedServer:
             self._prefetch = song
             self._prefetch_path = path
             self._prefetch_busy = None
+            C.logger().info("prefetch decoded %s in %.2fs",
+                            song.name, C.ts() - t0)
 
     def _start_next(self):
         """Pop the next thing to play from the queue. Albums in the queue
@@ -1147,13 +1150,21 @@ class SyncedServer:
                     if self.playing and self.song is not None:
                         self._kick_prefetch()
                 self._absorb_drops()
-                # refresh the catalog periodically so freshly added albums and
+                # Refresh the catalog periodically so freshly added albums and
                 # tracks (e.g. via the drop folder) become browsable/skippable.
-                # Skip while the initial background scan is still populating the
-                # DB so we don't pile redundant full scans on top of it.
-                if (time.time() - last_catalog >= 5.0
+                # Slow safety net only: the inotify watcher picks up changes
+                # within ~2s; a full walk+stat over ~6k files holds the GIL
+                # ~0.2-0.3s and starves the audio callback into an err spike
+                # + railed recovery every time it runs. Skip while the
+                # initial background scan is still populating the DB so we
+                # don't pile redundant full scans on top of it.
+                if (time.time() - last_catalog >= 120.0
                         and self._scan_done.is_set()):
+                    t_scan = time.time()
                     self.catalog.scan()
+                    dt_scan = time.time() - t_scan
+                    if dt_scan > 0.05:
+                        lg.warning("monitor: catalog scan took %.2fs", dt_scan)
                     self._refresh_playlist()
                     last_catalog = time.time()
                 # Forget rooms that haven't been heard from in a long time (see
