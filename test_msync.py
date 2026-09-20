@@ -2171,13 +2171,17 @@ def test_restart_resumes_same_song(server):
                 pass
         srv2.catalog.close()
 
-def test_server_prefetch_adopted_without_sync_decode(server):
+def test_server_prefetch_adopted_without_sync_decode(server, monkeypatch):
     """The end-of-song swap must adopt the background-decoded next track
     instead of decoding on the monitor thread: that decode holds the GIL
     for ~0.5s, starves the audio callback ~one block (~180ms of err), and
     the PLL then grinds back at full rail + catchup for seconds (heard as
     a sped-up stretch after every track change)."""
+    import msync_server as MS
     from conftest import wait_until
+    monkeypatch.setattr(MS, "PREFETCH_DELAY_S", 0)  # warm immediately here;
+    # in production the kick waits until the track is stable so the decode
+    # never contends with the opening blocks.
     server.clear_queue()
     server.play_song("track_02_B494.wav")
     server.add_to_queue(["track_03_C554.wav"])

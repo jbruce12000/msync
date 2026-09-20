@@ -65,6 +65,15 @@ from msync_inotify import MusicWatcher
 # --------------------------------------------------------------------------- #
 # Audio cache: decoded current track as float32 numpy array, mono-mixed       #
 # --------------------------------------------------------------------------- #
+# Prefetch delay: the background decode of the next track starts this long
+# after the current track is adopted — never during its opening blocks (or
+# right after a restart, when the stream, scan, and reconnecting clients
+# already contend for the GIL). For normal-length tracks the decode still
+# finishes minutes before the boundary; short tracks fall back to a
+# synchronous decode at the swap, exactly as before prefetch existed.
+PREFETCH_DELAY_S = 10.0
+
+
 class Song:
     __slots__ = ("name", "path", "data", "sr", "nchannels", "duration")
 
@@ -167,6 +176,7 @@ class SyncedServer:
         self._prefetch = None       # ready Song for the next queued path
         self._prefetch_path = None  # abs path it was decoded from
         self._prefetch_busy = None  # abs path currently being decoded
+        self._adopt_ts = 0.0        # wall time the current track was adopted
 
         # Fresh-track-start quorum. Every _play() bumps `epoch`; the epoch is
         # broadcast in every SYNC payload so clients can recognise a fresh
@@ -344,8 +354,12 @@ class SyncedServer:
                             self.song.sr)
             self._open_stream()
         self._persist_playback()
-        # Decode the new next track now, while this one plays, so the
-        # end-of-song swap finds it ready (see _kick_prefetch).
+        # Decode the new next track once this one is stable (see
+        # _kick_prefetch): never during the opening blocks, when the
+        # stream, scan, and reconnecting clients already contend for the
+        # GIL and any extra pressure shows up as an err spike + railed
+        # recovery right at the track start.
+        self._adopt_ts = C.ts()
         self._kick_prefetch()
 
     def _peek_next_path(self):
@@ -362,9 +376,14 @@ class SyncedServer:
     def _kick_prefetch(self):
         """Start a background decode of the next queued track.
         Caller must hold self.lock. No-op when nothing is upcoming, the
-        track is already decoded/parked, or a worker is already on it."""
+        track is already decoded/parked, a worker is already on it, or the
+        current track was adopted less than PREFETCH_DELAY_S ago (the
+        monitor loop retries every pass, so the decode still lands
+        mid-song, far from both the opening blocks and the boundary)."""
         nxt = self._peek_next_path()
         if nxt is None or nxt == self._prefetch_path or nxt == self._prefetch_busy:
+            return
+        if C.ts() - self._adopt_ts < PREFETCH_DELAY_S:
             return
         self._prefetch_busy = nxt
         threading.Thread(target=self._prefetch_worker, args=(nxt,),
@@ -1121,6 +1140,12 @@ class SyncedServer:
                               f"pitch={self.local_pitch*1e6:+.0f}ppm  "
                               f"mode={self._mode}  "
                               f"window=±{config.BANG_BANG_WINDOW_MS:.0f}ms")
+                    # Retry the next-track prefetch every pass: _play only
+                    # kicks it, and the kick is deferred until the current
+                    # track is PREFETCH_DELAY_S old, so the decode lands
+                    # mid-song instead of in the opening blocks.
+                    if self.playing and self.song is not None:
+                        self._kick_prefetch()
                 self._absorb_drops()
                 # refresh the catalog periodically so freshly added albums and
                 # tracks (e.g. via the drop folder) become browsable/skippable.
