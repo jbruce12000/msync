@@ -131,11 +131,23 @@ INT_LIMIT     = 0.02        # integrator state clip (x PITCH_INT = <=400ppm)
 AUDIO_FADE_SEC = 0.010
 
 
-def interp_read_linear(data, idx_pre, rate, frames, catchup_s=0.0):
-    """Original variable-rate interpolated read (kept for A/B reference).
+def interp_read(data, idx_pre, rate, frames, catchup_s=0.0):
+    """Variable-rate interpolated read from stereo audio data (default path).
 
-    Reads *frames* output samples advancing by *rate* with linear
-    interpolation, ramping *catchup_s* linearly across the block.
+    Reads *frames* output samples from *data* (N×2 float32) starting at
+    fractional content-sample position *idx_pre*, advancing by *rate*
+    content samples per output sample. Linear interpolation keeps the
+    output continuous at any nonzero pitch: measured ~50x lower error vs
+    an ideal pitch-shifted 440 Hz tone than the drop/repeat variant
+    (rms 0.00025 vs 0.0127 at rate 1.002), where every single-frame
+    skip/repeat is a phase discontinuity in the tone.
+
+    When *catchup_s* is nonzero (a bounded playhead nudge applied in the
+    same block), the displacement is ramped linearly across the block so
+    the transition stays continuous.
+
+    Returns (out, n_valid) — the (frames, 2) float32 output buffer and
+    the count of samples that fell inside the valid region of *data*.
     """
     if abs(catchup_s) > 0.5:
         ramp = np.linspace(0.0, 1.0, frames, dtype=np.float64)
@@ -157,13 +169,18 @@ def interp_read_linear(data, idx_pre, rate, frames, catchup_s=0.0):
     return out, n_valid
 
 
-def interp_read(data, idx_pre, rate, frames, catchup_s=0.0):
-    """Drop/repeat read: spread correction as single-frame edits.
+# Back-compat alias (the linear read's original name); new code uses
+# interp_read. interp_read_drop_repeat holds the nearest-neighbor variant.
+interp_read_linear = interp_read
+
+
+def interp_read_drop_repeat(data, idx_pre, rate, frames, catchup_s=0.0):
+    """Drop/repeat read: spread correction as single-frame edits (A/B only).
 
     Total input to consume over the block is
         total = frames * rate + catchup_s
     so the per-output step is  eff = total / frames
-                              = rate + catchup_s / frames.
+                               = rate + catchup_s / frames.
     Ideal position of output ``j`` is ``idx_pre + j * eff``; the output
     is the NEAREST input frame (round-half-up, no interpolation).
 
@@ -173,7 +190,11 @@ def interp_read(data, idx_pre, rate, frames, catchup_s=0.0):
     slope is a Bresenham distribution, so the edits are as evenly spaced
     as possible and each edit is exactly 1 frame (~0.023 ms @ 44.1 kHz).
 
-    Returns (out, n_valid) like :func:`interp_read_linear`.
+    Not the default: on pure tones each edit is an audible phase
+    discontinuity (~50x the error of the linear read at rate 1.002),
+    heard as roughness/wobble whenever the drift loop is active.
+
+    Returns (out, n_valid) like :func:`interp_read`.
     """
     n = len(data)
     if frames <= 0:

@@ -1473,16 +1473,17 @@ def test_client_callback_output_latency_compensation(client):
     assert advance > block * 0.99
     assert advance < block * 1.01 + C.CATCHUP_STEP * 2.0
     # emitted audio starts 300 ms ahead of the raw playhead. The read
-    # emits the nearest content frame (round-half-up, no interpolation),
-    # so compare against the nearest-sample expectation.
+    # is linearly interpolated, so compare against the lerp expectation.
     idx0 = (before + 0.300) * h.buffer.sr          # exact fractional position
     i0_exp = int(idx0)
     assert i0_exp + 8 < len(h.buffer.data)
     rate_read = 1.0 + h.drift_pitch                # what the callback applied
     for k in (0, 8):
         pos = idx0 + k * rate_read
-        i = int(pos + 0.5)
-        expected = h.buffer.data[i, 0]
+        i = int(pos)
+        f = pos - i
+        expected = (h.buffer.data[i, 0] * (1 - f)
+                    + h.buffer.data[min(i + 1, len(h.buffer.data) - 1), 0] * f)
         assert abs(float(out[k, 0]) - expected) < 1e-6, (k, out[k, 0], expected)
     # genuinely offset: 300 ms of samples (not the raw playhead position)
     assert i0_exp - int(before * h.buffer.sr) > int(0.29 * h.buffer.sr)
